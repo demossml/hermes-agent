@@ -5,6 +5,10 @@ Each sub-agent is defined by a YAML config and registered with the session DB.
 Agents run as independent asyncio.Tasks, each with their own model, system prompt,
 tools, token budget, and context memory.
 
+Uses Hermes' built-in provider resolution (resolve_runtime_provider) so NO
+manual API key management is needed — OAuth, Claude Max, OpenRouter, direct
+keys are all handled transparently through AIAgent.
+
 Usage:
     from agent_registry import AgentRegistry
     from hermes_state import SessionDB
@@ -36,7 +40,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Optional
 
 import yaml
 
@@ -49,8 +53,8 @@ class AgentRegistry:
     """Registry and orchestrator for sub-agents.
 
     Each agent is a YAML config + a record in SessionDB.
-    Does NOT rewrite the agent loop — wraps it via asyncio.Task.
-    Uses native anthropic.AsyncAnthropic client (not a custom provider class).
+    Uses Hermes' AIAgent and runtime provider resolution — no manual
+    API keys or AnthropicProvider imports needed.
     """
 
     def __init__(self, db=None, config_dir: Path | None = None):
@@ -58,7 +62,7 @@ class AgentRegistry:
         self._config_dir = config_dir or DEFAULT_CONFIG_DIR
         self._agents: dict[str, dict] = {}         # agent_id -> config
         self._tasks: dict[str, asyncio.Task] = {}  # agent_id -> running task
-        self._providers: dict[str, dict] = {}      # agent_id -> {client, model, max_tokens}
+        self._instances: dict[str, Any] = {}       # agent_id -> AIAgent
 
     def set_db(self, db):
         """Set SessionDB after init (avoids circular imports)."""
@@ -95,7 +99,7 @@ class AgentRegistry:
         config.setdefault("system_prompt", "You are a helpful assistant.")
         config.setdefault("tools", [])
         config.setdefault("max_context_tokens", 8000)
-        config.setdefault("provider", "anthropic")
+        config.setdefault("provider", "")
         self._agents[agent_id] = config
         logger.info(f"Registered agent: {agent_id} ({config['model']})")
 
@@ -103,7 +107,7 @@ class AgentRegistry:
         """Remove an agent from the registry."""
         self._agents.pop(agent_id, None)
         self._tasks.pop(agent_id, None)
-        self._providers.pop(agent_id, None)
+        self._instances.pop(agent_id, None)
 
     def list(self) -> list[dict]:
         """List all registered agents with status."""
@@ -169,69 +173,28 @@ class AgentRegistry:
         message: str,
         injected_context: str | None = None,
     ) -> str:
-        """Direct call to a sub-agent. Returns text response.
+        """Direct call to a sub-agent using Hermes' AIAgent.
 
-        Uses native anthropic.AsyncAnthropic with the agent's configured model,
-        system prompt, and conversation history from SessionDB.
-        History is loaded with a sliding token window to respect max_context_tokens.
+        No API key needed — uses Hermes' built-in provider resolution
+        (OAuth, Claude Max, OpenRouter, direct keys).
+
+        Returns the agent's text response.
         """
         cfg = self._agents.get(agent_id)
         if not cfg:
             return f"Error: unknown agent '{agent_id}'"
 
-        provider = self._get_provider(agent_id, cfg)
-        client = provider["client"]
-
-        # Load conversation history from SessionDB (sliding token window)
-        history: list[dict] = []
-        if self._db:
-            try:
-                msgs = self._db.get_messages_as_conversation(session_id)
-                max_tokens = cfg.get("max_context_tokens", 8000)
-                total = 0
-                trimmed = []
-                # Walk backwards, trim when token budget exhausted
-                for m in reversed(msgs or []):
-                    t = len((m.get("content") or "")) // 4  # rough token estimate
-                    if total + t > max_tokens:
-                        break
-                    trimmed.insert(0, {"role": m["role"], "content": m["content"]})
-                    total += t
-                history = trimmed
-            except Exception as e:
-                logger.warning(f"Failed to load history for {agent_id}/{session_id}: {e}")
-
-        # System prompt + optional injected context from orchestrator
-        system = cfg.get("system_prompt", "You are a helpful assistant.")
-        if injected_context:
-            system += f"\n\n[Context from orchestrator]:\n{injected_context}"
-
-        messages = history + [{"role": "user", "content": message}]
-
         try:
-            response = await client.messages.create(
-                model=provider["model"],
-                max_tokens=provider["max_tokens"],
-                system=system,
-                messages=messages,
-            )
-            reply = response.content[0].text
+            agent = self._get_agent(agent_id, cfg)
 
-            # Store turn in SessionDB
-            if self._db:
-                try:
-                    if not self._db.get_session(session_id):
-                        self._db.create_session(
-                            session_id=session_id,
-                            source=f"agent:{agent_id}",
-                            model=provider["model"],
-                        )
-                    self._db.append_message(session_id, "user", message)
-                    self._db.append_message(session_id, "assistant", reply)
-                except Exception as e:
-                    logger.warning(f"Failed to save turn for {agent_id}/{session_id}: {e}")
+            # Inject context from orchestrator into system prompt
+            if injected_context:
+                system = cfg.get("system_prompt", "You are a helpful assistant.")
+                system += f"\n\n[Context from orchestrator]:\n{injected_context}"
+                agent.ephemeral_system_prompt = system
 
-            return reply
+            reply = agent.chat(message)
+            return reply if isinstance(reply, str) else str(reply)
 
         except Exception as e:
             logger.error(f"Agent {agent_id} call failed: {e}", exc_info=True)
@@ -243,60 +206,43 @@ class AgentRegistry:
         session_id: str,
         message: str,
     ) -> AsyncIterator[str]:
-        """Stream response from a sub-agent chunk by chunk.
+        """Stream response from a sub-agent.
 
-        Yields text tokens as they arrive. Saves full response to SessionDB
-        once the stream completes.
+        Uses Hermes' AIAgent with stream_callback to yield chunks.
         """
         cfg = self._agents.get(agent_id)
         if not cfg:
             yield f"Error: unknown agent '{agent_id}'"
             return
 
-        import anthropic
-        provider = self._get_provider(agent_id, cfg)
-        client: anthropic.AsyncAnthropic = provider["client"]
-
-        # Load conversation history
-        history: list[dict] = []
-        if self._db:
-            try:
-                msgs = self._db.get_messages_as_conversation(session_id)
-                history = [{"role": m["role"], "content": m["content"]} for m in (msgs or [])]
-            except Exception as e:
-                logger.warning(f"stream: failed to load history for {agent_id}/{session_id}: {e}")
-
-        messages = history + [{"role": "user", "content": message}]
-        full_reply: list[str] = []
-
         try:
-            async with client.messages.stream(
-                model=provider["model"],
-                max_tokens=provider["max_tokens"],
-                system=cfg.get("system_prompt", "You are a helpful assistant."),
-                messages=messages,
-            ) as s:
-                async for chunk in s.text_stream:
-                    full_reply.append(chunk)
+            agent = self._get_agent(agent_id, cfg)
+
+            # Collect chunks via stream_callback, yield through a queue
+            chunk_queue: asyncio.Queue = asyncio.Queue()
+
+            def on_stream(chunk: str):
+                chunk_queue.put_nowait(chunk)
+
+            # Fire off chat in a background task
+            chat_task = asyncio.create_task(
+                asyncio.to_thread(agent.chat, message, on_stream)
+            )
+
+            # Yield chunks as they arrive
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(chunk_queue.get(), timeout=0.5)
                     yield chunk
+                except asyncio.TimeoutError:
+                    if chat_task.done():
+                        break
+
+            await chat_task
+
         except Exception as e:
             logger.error(f"Agent {agent_id} stream failed: {e}", exc_info=True)
             yield f"\n[Error: {e}]"
-
-        # Save full reply after stream completes
-        reply_text = "".join(full_reply)
-        if self._db and reply_text:
-            try:
-                if not self._db.get_session(session_id):
-                    self._db.create_session(
-                        session_id=session_id,
-                        source=f"agent:{agent_id}",
-                        model=provider["model"],
-                    )
-                self._db.append_message(session_id, "user", message)
-                self._db.append_message(session_id, "assistant", reply_text)
-            except Exception as e:
-                logger.warning(f"stream: failed to save turn for {agent_id}/{session_id}: {e}")
 
     async def orchestrate(
         self,
@@ -321,7 +267,8 @@ class AgentRegistry:
 
         # Prepare orchestrator system prompt with agent list
         orch_cfg = self._agents["orchestrator"]
-        orch_system = orch_cfg.get("system_prompt", "") + f"""
+        orig_system = orch_cfg.get("system_prompt", "")
+        orch_cfg["system_prompt"] = orig_system + f"""
 
 Available sub-agents:
 {agents_info}
@@ -334,11 +281,15 @@ Rules:
 - Multiple DELEGATE lines = run agents in parallel
 - If no delegation needed, answer directly
 """
-        # Temporarily patch orchestrator system prompt
-        original_system = orch_cfg.get("system_prompt", "")
-        orch_cfg["system_prompt"] = orch_system
+
+        # Reset cached agent so the new system_prompt is picked up
+        self._instances.pop("orchestrator", None)
+
         orch_reply = await self.call("orchestrator", session_id, message)
-        orch_cfg["system_prompt"] = original_system  # restore
+
+        # Restore original system prompt + reset cache
+        orch_cfg["system_prompt"] = orig_system
+        self._instances.pop("orchestrator", None)
 
         # Parse delegation directives
         delegates = []
@@ -374,22 +325,16 @@ Rules:
         return await self.call("orchestrator", session_id, synthesis_prompt)
 
     def broadcast_context(self, session_id: str, context: str):
-        """Inject context into all sub-agents' memory (except orchestrator).
+        """Inject context into all sub-agents' SessionDB memory (except orchestrator).
 
         Useful for sharing environment info or task goals across agents.
         """
         if not self._db:
             return
-        for agent_id, cfg in self._agents.items():
+        for agent_id in self._agents:
             if agent_id == "orchestrator":
                 continue
             try:
-                if not self._db.get_session(session_id):
-                    self._db.create_session(
-                        session_id=session_id,
-                        source=f"agent:{agent_id}",
-                        model=cfg.get("model", ""),
-                    )
                 self._db.append_message(
                     session_id, "user",
                     f"[Broadcast context]: {context}",
@@ -423,12 +368,6 @@ Rules:
             if not rows:
                 return 0
             context_text = "\n".join(f"{r[0]}: {r[1][:200]}" for r in rows)
-            if not self._db.get_session(session_id):
-                self._db.create_session(
-                    session_id=session_id,
-                    source=f"agent:{to_agent}",
-                    model=self._agents.get(to_agent, {}).get("model", ""),
-                )
             self._db.append_message(
                 session_id, "user",
                 f"[Context from agent '{from_agent}' about '{query}']:\n{context_text}",
@@ -440,21 +379,46 @@ Rules:
 
     # ── Internal ─────────────────────────────────────────────
 
-    def _get_provider(self, agent_id: str, cfg: dict) -> dict:
-        """Get or create a native Anthropic client for this agent.
+    def _get_agent(self, agent_id: str, cfg: dict):
+        """Get or create an AIAgent using Hermes' built-in provider resolution.
 
-        Returns a dict with 'client' (anthropic.AsyncAnthropic), 'model',
-        and 'max_tokens'. Does NOT use a custom provider class — calls the
-        Anthropic SDK directly so we don't depend on Hermes provider plumbing.
+        Uses resolve_runtime_provider() so NO manual API key is needed —
+        OAuth, Claude Max, OpenRouter, direct keys are all handled transparently.
         """
-        if agent_id not in self._providers:
-            import anthropic
-            self._providers[agent_id] = {
-                "client": anthropic.AsyncAnthropic(),
-                "model": cfg.get("model", "claude-sonnet-4-20250514"),
-                "max_tokens": cfg.get("max_tokens", 8096),
-            }
-        return self._providers[agent_id]
+        if agent_id not in self._instances:
+            from run_agent import AIAgent
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            # Resolve provider through Hermes' existing mechanism
+            try:
+                requested = cfg.get("provider") or None
+                target_model = cfg.get("model") or None
+                runtime = resolve_runtime_provider(
+                    requested=requested,
+                    target_model=target_model,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Provider resolution failed for {agent_id}: {e}, "
+                    f"using defaults"
+                )
+                runtime = {}
+
+            self._instances[agent_id] = AIAgent(
+                model=runtime.get("model") or cfg.get("model", "claude-sonnet-4-20250514"),
+                provider=runtime.get("provider", "anthropic"),
+                api_key=runtime.get("api_key", ""),
+                base_url=runtime.get("base_url", ""),
+                api_mode=runtime.get("api_mode", "anthropic_messages"),
+                ephemeral_system_prompt=cfg.get(
+                    "system_prompt", "You are a helpful assistant."
+                ),
+                session_db=self._db,
+                session_id=cfg.get("session_id", f"agent-{agent_id}"),
+                max_iterations=1,  # sub-agents: single-turn, no tool loop
+            )
+
+        return self._instances[agent_id]
 
     def _count_sessions(self, agent_id: str) -> int:
         """Count sessions for an agent."""
@@ -471,46 +435,17 @@ Rules:
             return 0
 
     async def _run_agent(self, agent_id: str, cfg: dict, initial_message: str = ""):
-        """Run agent as asyncio.Task. Minimal loop — exits after response.
+        """Run agent as asyncio.Task via AIAgent (uses Hermes provider resolution).
 
-        Uses native anthropic.AsyncAnthropic for the API call.
-        Stores turn in SessionDB via append_message().
+        Single-turn response — no conversation loop.
         """
-        provider = self._get_provider(agent_id, cfg)
-        client = provider["client"]
-        session_id = cfg.get("session_id", f"agent-{agent_id}-task")
-
-        messages: list[dict] = []
-        if initial_message:
-            messages.append({"role": "user", "content": initial_message})
+        if not initial_message:
+            return
 
         try:
-            if not messages:
-                return  # nothing to do
-
-            response = await client.messages.create(
-                model=provider["model"],
-                max_tokens=provider["max_tokens"],
-                system=cfg.get("system_prompt", "You are a helpful assistant."),
-                messages=messages,
-            )
-            reply = response.content[0].text
-            logger.info(f"[{agent_id}] {reply[:120]}...")
-
-            # Store in SessionDB
-            if self._db:
-                try:
-                    if not self._db.get_session(session_id):
-                        self._db.create_session(
-                            session_id=session_id,
-                            source=f"agent:{agent_id}",
-                            model=provider["model"],
-                        )
-                    self._db.append_message(session_id, "user", initial_message)
-                    self._db.append_message(session_id, "assistant", reply)
-                except Exception as e:
-                    logger.warning(f"Failed to store message for {agent_id}: {e}")
-
+            agent = self._get_agent(agent_id, cfg)
+            reply = agent.chat(initial_message)
+            logger.info(f"[{agent_id}] {str(reply)[:120]}...")
         except asyncio.CancelledError:
             logger.info(f"Agent {agent_id} task cancelled")
             raise
