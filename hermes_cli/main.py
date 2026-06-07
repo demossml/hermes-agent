@@ -6116,6 +6116,149 @@ def cmd_cron(args):
     cron_command(args)
 
 
+def cmd_agents(args):
+    """Multi-agent management: list, spawn, call, stop."""
+    from agent_registry import get_registry
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    registry = get_registry(db)
+
+    action = getattr(args, "agents_action", "list")
+
+    if action == "list":
+        agents = registry.list()
+        if not agents:
+            print("No agents registered. Add YAML configs to agent_configs/")
+            return
+        print(f"{'AGENT':<14} {'MODEL':<28} {'STATUS':<10} {'SESSIONS':<10}")
+        print("-" * 64)
+        for a in agents:
+            print(
+                f"{a['agent_id']:<14} {a['model']:<28} "
+                f"{a['status']:<10} {a.get('sessions_count', 0):<10}"
+            )
+
+    elif action == "spawn":
+        agent_id = args.agent_id
+        message = getattr(args, "message", "") or ""
+        cfg = registry.get(agent_id)
+        if not cfg:
+            print(f"Unknown agent: {agent_id}")
+            print(f"Available: {[a['agent_id'] for a in registry.list()]}")
+            return
+        print(f"Spawning agent: {agent_id} ({cfg['model']})")
+        # Note: asyncio.run() is used for simplicity — in production
+        # the agent would be spawned inside the gateway's event loop.
+        import asyncio
+        asyncio.run(registry.spawn(agent_id, message))
+        print(f"Agent {agent_id} spawned")
+
+    elif action == "call":
+        agent_id = args.agent_id
+        message = args.message
+        cfg = registry.get(agent_id)
+        if not cfg:
+            print(f"Unknown agent: {agent_id}")
+            return
+        print(f"Calling {agent_id}...")
+        import asyncio
+        session_id = f"agent-{agent_id}-cli"
+        response = asyncio.run(
+            registry.call(agent_id, session_id, message)
+        )
+        print(f"\n[{agent_id}]: {response}")
+
+    elif action == "stop":
+        agent_id = args.agent_id
+        import asyncio
+        asyncio.run(registry.stop(agent_id))
+        print(f"Agent {agent_id} stopped")
+
+    elif action == "remove" or action == "rm":
+        agent_id = args.agent_id
+        from subagent_manager import get_subagent_manager
+        mgr = get_subagent_manager()
+        result = mgr.remove_agent(agent_id)
+        if "error" in result:
+            print(f"Error: {result['error']}")
+        else:
+            print(f"Agent {agent_id} removed")
+
+    elif action == "setup":
+        _cmd_agents_setup()
+
+    else:
+        print("Usage: hermes agents {list|spawn|call|stop|remove|setup} [...]")
+
+
+def _cmd_agents_setup():
+    """Install multi-agent dependencies and run DB migration."""
+    import subprocess
+    import sys
+
+    print("=" * 56)
+    print("  Hermes Multi-Agent Setup")
+    print("=" * 56)
+
+    # 1. Check Python deps
+    print("\n[1/3] Checking Python dependencies...")
+    deps = {"anthropic": "anthropic", "yaml": "PyYAML", "tiktoken": "tiktoken"}
+    missing = []
+    for mod, pkg in deps.items():
+        try:
+            __import__(mod)
+            print(f"  ✅ {pkg}")
+        except ImportError:
+            print(f"  ❌ {pkg} — installing...")
+            missing.append(pkg)
+
+    if missing:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet"] + missing
+        )
+        print("  ✅ All dependencies installed")
+
+    # 2. Run DB migration (add agent_id column)
+    print("\n[2/3] Running DB migration...")
+    from hermes_state import SessionDB
+    db = SessionDB()
+    # Column will be auto-added by _reconcile_columns on next Hermes start
+    # Force it now:
+    try:
+        with db._lock:
+            cursor = db._conn.cursor()
+            db._reconcile_columns(cursor)
+            db._conn.commit()
+        print("  ✅ Schema up to date (agent_id column present)")
+    except Exception as e:
+        print(f"  ⚠️  Migration note: {e}")
+        print(f"  (column will be auto-added on next hermes start)")
+
+    # 3. Verify agent configs
+    print("\n[3/3] Verifying agent configs...")
+    from pathlib import Path
+    config_dir = Path(__file__).parent.parent / "agent_configs"
+    if config_dir.exists():
+        yamls = list(config_dir.glob("*.yaml"))
+        print(f"  ✅ {len(yamls)} agent config(s) found:")
+        import yaml
+        for yf in sorted(yamls):
+            with open(yf) as f:
+                cfg = yaml.safe_load(f)
+            print(f"     • {cfg.get('agent_id', yf.stem)} ({cfg.get('model', '?')})")
+    else:
+        print("  ⚠️  No agent_configs/ directory — creating...")
+        config_dir.mkdir(parents=True, exist_ok=True)
+
+    # 4. Final check
+    print(f"\n{'=' * 56}")
+    print("  Setup complete!")
+    print(f"  Restart Hermes for changes to take effect.")
+    print(f"  Run: hermes agents list")
+    print(f"{'=' * 56}")
+
+
 def cmd_webhook(args):
     """Webhook subscription management."""
     from hermes_cli.webhook import webhook_command
@@ -11833,6 +11976,56 @@ def main():
     _add_accept_hooks_flag(cron_tick)
     _add_accept_hooks_flag(cron_parser)
     cron_parser.set_defaults(func=cmd_cron)
+
+    # =========================================================================
+    # agents command
+    # =========================================================================
+    agents_parser = subparsers.add_parser(
+        "agents",
+        help="Multi-agent management",
+        description="Manage sub-agents: list, spawn, call, and stop",
+    )
+    agents_subparsers = agents_parser.add_subparsers(dest="agents_action")
+
+    # agents list
+    agents_list = agents_subparsers.add_parser(
+        "list", help="List registered sub-agents"
+    )
+
+    # agents spawn
+    agents_spawn = agents_subparsers.add_parser(
+        "spawn", help="Spawn a sub-agent"
+    )
+    agents_spawn.add_argument("agent_id", help="Agent ID to spawn")
+    agents_spawn.add_argument(
+        "message", nargs="?", help="Optional initial message"
+    )
+
+    # agents call
+    agents_call = agents_subparsers.add_parser(
+        "call", help="Send a message to a sub-agent"
+    )
+    agents_call.add_argument("agent_id", help="Agent ID to call")
+    agents_call.add_argument("message", help="Message to send")
+
+    # agents stop
+    agents_stop = agents_subparsers.add_parser(
+        "stop", help="Stop a running sub-agent"
+    )
+    agents_stop.add_argument("agent_id", help="Agent ID to stop")
+
+    # agents remove
+    agents_remove = agents_subparsers.add_parser(
+        "remove", aliases=["rm"], help="Remove a sub-agent"
+    )
+    agents_remove.add_argument("agent_id", help="Agent ID to remove")
+
+    # agents setup — install dependencies and run migration
+    agents_setup = agents_subparsers.add_parser(
+        "setup", help="Install multi-agent dependencies and migrate DB"
+    )
+
+    agents_parser.set_defaults(func=cmd_agents)
 
     # =========================================================================
     # webhook command

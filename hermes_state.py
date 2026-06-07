@@ -214,6 +214,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     cost_source TEXT,
     pricing_version TEXT,
     title TEXT,
+    agent_id TEXT DEFAULT 'main',
     api_call_count INTEGER DEFAULT 0,
     handoff_state TEXT,
     handoff_platform TEXT,
@@ -1073,6 +1074,35 @@ class SessionDB:
             )
             row = cursor.fetchone()
         return dict(row) if row else None
+
+    def get_sessions_by_agent(
+        self, agent_id: str, limit: int = 20
+    ) -> list[dict]:
+        """Get recent sessions for a specific sub-agent."""
+        # Lazy index creation
+        self._ensure_agent_index()
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM sessions WHERE agent_id = ? "
+                "ORDER BY started_at DESC LIMIT ?",
+                (agent_id, limit),
+            )
+            rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def _ensure_agent_index(self):
+        """Create agent_id index if it doesn't exist."""
+        if getattr(self, "_agent_index_ensured", False):
+            return
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_sessions_agent "
+                    "ON sessions(agent_id)"
+                )
+        except Exception:
+            pass
+        self._agent_index_ensured = True
 
     def resolve_session_by_title(self, title: str) -> Optional[str]:
         """Resolve a title to a session ID, preferring the latest in a lineage.

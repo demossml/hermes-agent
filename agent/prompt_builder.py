@@ -742,6 +742,37 @@ def _clear_backend_probe_cache() -> None:
     _BACKEND_PROBE_CACHE.clear()
 
 
+def build_subagent_hints() -> str:
+    """Return sub-agent availability hints for the system prompt.
+
+    Injects information about available sub-agents so the main agent
+    knows it can delegate tasks to them via the delegate_to_agent tool.
+    """
+    try:
+        from subagent_manager import get_subagent_manager
+        manager = get_subagent_manager()
+        agents = manager.list_agents()
+    except Exception:
+        return ""
+
+    if not agents:
+        return ""
+
+    lines = [
+        "Available sub-agents (use delegate_to_agent tool to delegate tasks):",
+    ]
+    for a in agents:
+        lines.append(
+            f"  • {a['agent_id']} ({a['model']}, {a['max_tokens']} tok): "
+            f"{a['description']}"
+        )
+    lines.append(
+        "Each sub-agent has its own isolated memory and context window. "
+        "They remember their conversation history across calls."
+    )
+    return "\n".join(lines)
+
+
 def build_environment_hints() -> str:
     """Return environment-specific guidance for the system prompt.
 

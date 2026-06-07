@@ -389,6 +389,8 @@ def get_env_path() -> Path:
 
 # ─── Network Preferences ─────────────────────────────────────────────────────
 
+ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
+
 
 def apply_ipv4_preference(force: bool = False) -> None:
     """Monkey-patch ``socket.getaddrinfo`` to prefer IPv4 connections.

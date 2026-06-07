@@ -205,6 +205,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if _env_hints:
         stable_parts.append(_env_hints)
 
+    # Sub-agent hints — tell the main agent about available sub-agents
+    # it can delegate tasks to.
+    _subagent_hints = _r.build_subagent_hints()
+    if _subagent_hints:
+        stable_parts.append(_subagent_hints)
+
     # Active-profile hint — names the Hermes profile the agent is running
     # under so it doesn't conflate ~/.hermes/skills/ (default profile) with
     # ~/.hermes/profiles/<active>/skills/ (this profile's). Deterministic
