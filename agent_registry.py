@@ -302,20 +302,87 @@ class AgentRegistry:
         """Route message through orchestrator agent.
 
         Orchestrator can delegate to sub-agents via:
-            DELEGATE: <agent_id> | <task>
+            DELEGATE: <agent_id> | <task description>
         Multiple DELEGATE lines = parallel execution.
+        DAG chaining via:
+            DELEGATE: <agent_id> | <task> | -> <next_agent_id>
+        (next_agent receives previous agent's output as context)
+
         Returns synthesized final answer.
         """
         if "orchestrator" not in self._agents:
             return "Error: orchestrator agent not registered. Add agent_configs/orchestrator.yaml"
 
+        orch_reply = await self._ask_orchestrator(session_id, message)
+
+        # Parse delegation directives
+        stages = self._parse_delegates(orch_reply)
+        if not stages:
+            return orch_reply  # orchestrator answered directly
+
+        # Execute stages (supports DAG chaining)
+        all_results = await self._execute_stages(session_id, stages)
+
+        # Synthesize final answer
+        results_text = "\n\n".join(
+            f"[{aid}]: {res}" if not isinstance(res, Exception) else f"[{aid}]: ERROR: {res}"
+            for aid, res in all_results.items()
+        )
+        return await self._ask_orchestrator(
+            session_id,
+            f"Sub-agents completed their tasks:\n\n{results_text}\n\n"
+            "Synthesize a final answer. Combine results, don't mention internal steps.",
+        )
+
+    async def stream_orchestrate(
+        self,
+        session_id: str,
+        message: str,
+    ) -> AsyncIterator[str]:
+        """Streaming version of orchestrate — yields text as orchestrator works.
+
+        Yields status updates during delegation, then final synthesized answer.
+        """
+        if "orchestrator" not in self._agents:
+            yield "Error: orchestrator agent not registered."
+            return
+
+        yield "[orchestrator] analysing request...\n"
+        orch_reply = await self._ask_orchestrator(session_id, message)
+
+        stages = self._parse_delegates(orch_reply)
+        if not stages:
+            yield orch_reply
+            return
+
+        yield f"[orchestrator] delegating to: {', '.join(stages.keys())}\n"
+
+        all_results = await self._execute_stages(session_id, stages)
+        for aid, res in all_results.items():
+            status = "✓" if not isinstance(res, Exception) else "✗"
+            yield f"  {status} {aid}: {str(res)[:100]}...\n"
+
+        yield "\n[orchestrator] synthesizing...\n"
+        results_text = "\n\n".join(
+            f"[{aid}]: {res}" if not isinstance(res, Exception) else f"[{aid}]: ERROR: {res}"
+            for aid, res in all_results.items()
+        )
+        final = await self._ask_orchestrator(
+            session_id,
+            f"Sub-agents completed:\n\n{results_text}\n\nSynthesize a final answer.",
+        )
+        yield final
+
+    # ── Orchestration helpers ────────────────────────────────
+
+    async def _ask_orchestrator(self, session_id: str, message: str) -> str:
+        """Call orchestrator agent with sub-agent list injected into system prompt."""
         agents_info = json.dumps(
             [{"id": a["agent_id"], "description": a.get("description", "")}
              for a in self._agents.values() if a["agent_id"] != "orchestrator"],
             ensure_ascii=False, indent=2,
         )
 
-        # Prepare orchestrator system prompt with agent list
         orch_cfg = self._agents["orchestrator"]
         orig_system = orch_cfg.get("system_prompt", "")
         orch_cfg["system_prompt"] = orig_system + f"""
@@ -323,56 +390,97 @@ class AgentRegistry:
 Available sub-agents:
 {agents_info}
 
-To delegate tasks use this format (one line per agent):
-DELEGATE: <agent_id> | <task description>
-
-Rules:
-- Delegate only when specialized expertise is needed
-- Multiple DELEGATE lines = run agents in parallel
-- If no delegation needed, answer directly
+Delegation format (use ONLY when task requires specialization):
+  DELEGATE: <agent_id> | <task description>
+  For chaining: DELEGATE: <agent_id> | <task> | -> <next_agent_id>
+Multiple lines = parallel. Chain with -> for sequential (output feeds to next).
+If no delegation needed, answer directly.
 """
-
-        # Reset cached agent so the new system_prompt is picked up
         self._instances.pop("orchestrator", None)
-
-        orch_reply = await self.call("orchestrator", session_id, message)
-
-        # Restore original system prompt + reset cache
+        reply = await self.call("orchestrator", session_id, message)
         orch_cfg["system_prompt"] = orig_system
         self._instances.pop("orchestrator", None)
+        return reply
 
-        # Parse delegation directives
-        delegates = []
-        for line in orch_reply.split("\n"):
+    def _parse_delegates(self, reply: str) -> Dict[str, List[tuple]]:
+        """Parse DELEGATE directives into execution stages.
+
+        Returns: {agent_id: [(task, next_agent_id|None), ...]}
+        Stages with next_agent_id=None are parallel (same level).
+        Stages with next_agent_id set form a chain.
+        """
+        stages: Dict[str, List[tuple]] = {}
+        for line in reply.split("\n"):
             line = line.strip()
-            if line.startswith("DELEGATE:"):
-                parts = line[9:].split("|", 1)
-                if len(parts) == 2:
-                    aid = parts[0].strip()
-                    task = parts[1].strip()
-                    if aid in self._agents and aid != "orchestrator":
-                        delegates.append((aid, task))
+            if not line.startswith("DELEGATE:"):
+                continue
+            body = line[9:].strip()
+            # Parse: agent_id | task [| -> next_agent_id]
+            if "| ->" in body:
+                main_part, chain_target = body.split("| ->", 1)
+                next_agent = chain_target.strip() if chain_target.strip() in self._agents else None
+            elif "|->" in body:
+                main_part, chain_target = body.split("|->", 1)
+                next_agent = chain_target.strip() if chain_target.strip() in self._agents else None
+            else:
+                main_part = body
+                next_agent = None
 
-        if not delegates:
-            return orch_reply  # orchestrator answered directly
+            parts = main_part.split("|", 1)
+            if len(parts) != 2:
+                logger.warning(f"Invalid DELEGATE format: {line}")
+                continue
+            aid = parts[0].strip()
+            task = parts[1].strip()
+            if aid not in self._agents or aid == "orchestrator":
+                logger.warning(f"Unknown agent in DELEGATE: {aid}")
+                continue
+            stages.setdefault(aid, []).append((task, next_agent))
+        return stages
 
-        # Parallel execution of delegated tasks
-        results = await asyncio.gather(
-            *[self.call(aid, session_id, task) for aid, task in delegates],
-            return_exceptions=True,
-        )
+    async def _execute_stages(
+        self, session_id: str, stages: Dict[str, List[tuple]]
+    ) -> Dict[str, str]:
+        """Execute delegation stages with DAG support.
 
-        # Synthesize final answer
-        results_text = "\n\n".join(
-            f"[{aid}]: {res}" if not isinstance(res, Exception) else f"[{aid}]: ERROR: {res}"
-            for (aid, _), res in zip(delegates, results)
-        )
-        synthesis_prompt = (
-            f"Sub-agents completed their tasks:\n\n{results_text}\n\n"
-            "Synthesize a final answer for the user. "
-            "Combine results into a coherent response without mentioning internal steps."
-        )
-        return await self.call("orchestrator", session_id, synthesis_prompt)
+        Parallel agents run via asyncio.gather.
+        Chained agents run sequentially (output of A → input of B).
+        """
+        all_results: dict[str, str] = {}
+
+        # Collect all tasks: parallel + chain starters
+        parallel_tasks = {}
+        chain_tasks = []  # [(agent_id, task, next_agent_id)]
+
+        for aid, tasks in stages.items():
+            for task, next_agent in tasks:
+                if next_agent:
+                    chain_tasks.append((aid, task, next_agent))
+                else:
+                    parallel_tasks.setdefault(aid, []).append(task)
+
+        # Run parallel agents
+        if parallel_tasks:
+            combined = {}
+            for aid, task_list in parallel_tasks.items():
+                combined[aid] = "; ".join(task_list)
+            parallel_results = await asyncio.gather(
+                *[self.call(aid, session_id, task) for aid, task in combined.items()],
+                return_exceptions=True,
+            )
+            for (aid, _), res in zip(combined.items(), parallel_results):
+                all_results[aid] = str(res) if not isinstance(res, Exception) else f"ERROR: {res}"
+
+        # Run chains sequentially
+        for aid, task, next_agent in chain_tasks:
+            result = await self.call(aid, session_id, task)
+            all_results[aid] = result
+            if next_agent and not isinstance(result, Exception):
+                chain_task = f"Based on previous agent's output:\n\n{result}\n\nYour task: analyse and provide your expertise."
+                chain_result = await self.call(next_agent, session_id, chain_task)
+                all_results[next_agent] = chain_result
+
+        return all_results
 
     def broadcast_context(self, session_id: str, context: str):
         """Inject context into all sub-agents' SessionDB memory (except orchestrator).
