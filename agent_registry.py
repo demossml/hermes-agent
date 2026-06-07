@@ -99,9 +99,9 @@ class AgentRegistry:
         config.setdefault("system_prompt", "You are a helpful assistant.")
         config.setdefault("tools", [])
         config.setdefault("max_context_tokens", 8000)
-        config.setdefault("provider", "")
+        config.setdefault("provider", "current")  # "current" = use Hermes' active provider
         self._agents[agent_id] = config
-        logger.info(f"Registered agent: {agent_id} ({config['model']})")
+        logger.info(f"Registered agent: {agent_id} ({config['model']}, provider={config['provider']})")
 
     def unregister(self, agent_id: str):
         """Remove an agent from the registry."""
@@ -382,34 +382,57 @@ Rules:
     def _get_agent(self, agent_id: str, cfg: dict):
         """Get or create an AIAgent using Hermes' built-in provider resolution.
 
-        Uses resolve_runtime_provider() so NO manual API key is needed —
-        OAuth, Claude Max, OpenRouter, direct keys are all handled transparently.
+        provider: current (default) → use whatever Hermes is configured with,
+                                      ignore model: in config
+        provider: anthropic / deepseek / openrouter / etc. → use that provider
+                                                              with the specified model
         """
         if agent_id not in self._instances:
             from run_agent import AIAgent
             from hermes_cli.runtime_provider import resolve_runtime_provider
 
-            # Resolve provider through Hermes' existing mechanism
+            provider_cfg = cfg.get("provider") or "current"
+            use_current = provider_cfg in ("current", "")
+
             try:
-                requested = cfg.get("provider") or None
-                target_model = cfg.get("model") or None
-                runtime = resolve_runtime_provider(
-                    requested=requested,
-                    target_model=target_model,
-                )
+                if use_current:
+                    runtime = resolve_runtime_provider(
+                        requested=None,
+                        target_model=None,
+                    )
+                    logger.info(
+                        f"Agent '{agent_id}' using current Hermes provider: "
+                        f"{runtime.get('provider')} / {runtime.get('model')}"
+                    )
+                else:
+                    runtime = resolve_runtime_provider(
+                        requested=provider_cfg,
+                        target_model=cfg.get("model"),
+                    )
+                    logger.info(
+                        f"Agent '{agent_id}' using explicit provider: "
+                        f"{provider_cfg} / {cfg.get('model')}"
+                    )
             except Exception as e:
                 logger.warning(
-                    f"Provider resolution failed for {agent_id}: {e}, "
-                    f"using defaults"
+                    f"Provider resolution failed for '{agent_id}': {e}. "
+                    f"Falling back to current Hermes provider."
                 )
-                runtime = {}
+                try:
+                    runtime = resolve_runtime_provider(
+                        requested=None,
+                        target_model=None,
+                    )
+                except Exception as e2:
+                    logger.error(f"Fallback also failed for '{agent_id}': {e2}")
+                    runtime = {}
 
             self._instances[agent_id] = AIAgent(
-                model=runtime.get("model") or cfg.get("model", "claude-sonnet-4-20250514"),
-                provider=runtime.get("provider", "anthropic"),
+                model=runtime.get("model") or cfg.get("model", ""),
+                provider=runtime.get("provider", ""),
                 api_key=runtime.get("api_key", ""),
                 base_url=runtime.get("base_url", ""),
-                api_mode=runtime.get("api_mode", "anthropic_messages"),
+                api_mode=runtime.get("api_mode", "chat_completions"),
                 ephemeral_system_prompt=cfg.get(
                     "system_prompt", "You are a helpful assistant."
                 ),
