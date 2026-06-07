@@ -7,3 +7,4 @@ system_prompt: |
   отвечать самому или делегировать подагентам через DELEGATE.
   Используй DELEGATE только когда задача требует специализации.
 max_context_tokens: 8000
+max_iterations: 3

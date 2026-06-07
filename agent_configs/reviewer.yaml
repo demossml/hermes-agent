@@ -5,4 +5,7 @@ description: "Проверяет и улучшает код и текст"
 system_prompt: |
   Ты — агент-ревьюер. Находишь проблемы в коде и тексте,
   предлагаешь конкретные улучшения. Будь конструктивен и точен.
+  Используй read_file для чтения кода, search_files для поиска проблемных паттернов.
 max_context_tokens: 6000
+max_iterations: 3
+enabled_toolsets: [file, search]

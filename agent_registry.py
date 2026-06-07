@@ -40,7 +40,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 import yaml
 
@@ -99,9 +99,10 @@ class AgentRegistry:
         config.setdefault("system_prompt", "You are a helpful assistant.")
         config.setdefault("tools", [])
         config.setdefault("max_context_tokens", 8000)
+        config.setdefault("max_iterations", 3)  # default: 3-turn tool loop
         config.setdefault("provider", "current")  # "current" = use Hermes' active provider
         self._agents[agent_id] = config
-        logger.info(f"Registered agent: {agent_id} ({config['model']}, provider={config['provider']})")
+        logger.info(f"Registered agent: {agent_id} ({config['model']}, provider={config['provider']}, max_iter={config['max_iterations']})")
 
     def unregister(self, agent_id: str):
         """Remove an agent from the registry."""
@@ -109,7 +110,7 @@ class AgentRegistry:
         self._tasks.pop(agent_id, None)
         self._instances.pop(agent_id, None)
 
-    def list(self) -> list[dict]:
+    def list(self) -> List[Dict]:
         """List all registered agents with status."""
         result = []
         for agent_id, cfg in self._agents.items():
@@ -178,14 +179,15 @@ class AgentRegistry:
         No API key needed — uses Hermes' built-in provider resolution
         (OAuth, Claude Max, OpenRouter, direct keys).
 
-        Returns the agent's text response.
+        Loads conversation history from SessionDB and persists responses
+        so agents remember context across multiple calls to the same session.
         """
         cfg = self._agents.get(agent_id)
         if not cfg:
             return f"Error: unknown agent '{agent_id}'"
 
         try:
-            agent = self._get_agent(agent_id, cfg)
+            agent = self._get_agent(agent_id, cfg, session_id)
 
             # Inject context from orchestrator into system prompt
             if injected_context:
@@ -193,12 +195,60 @@ class AgentRegistry:
                 system += f"\n\n[Context from orchestrator]:\n{injected_context}"
                 agent.ephemeral_system_prompt = system
 
-            reply = agent.chat(message)
-            return reply if isinstance(reply, str) else str(reply)
+            # Load conversation history from SessionDB
+            conversation_history = self._load_history(session_id, cfg)
+
+            result = agent.run_conversation(
+                message,
+                conversation_history=conversation_history,
+            )
+            reply = result.get("final_response", "") if isinstance(result, dict) else str(result)
+
+            # Persist turn to SessionDB
+            self._save_turn(session_id, agent_id, message, reply, agent.model)
+
+            return reply
 
         except Exception as e:
             logger.error(f"Agent {agent_id} call failed: {e}", exc_info=True)
             return f"Error from agent '{agent_id}': {e}"
+
+    def _load_history(self, session_id: str, cfg: dict) -> List[Dict]:
+        """Load conversation history from SessionDB with sliding token window."""
+        history: List[Dict] = []
+        if not self._db:
+            return history
+        try:
+            msgs = self._db.get_messages_as_conversation(session_id)
+            max_tokens = cfg.get("max_context_tokens", 8000)
+            total = 0
+            trimmed = []
+            for m in reversed(msgs or []):
+                t = len((m.get("content") or "")) // 4
+                if total + t > max_tokens:
+                    break
+                trimmed.insert(0, {"role": m["role"], "content": m["content"]})
+                total += t
+            history = trimmed
+        except Exception as e:
+            logger.warning(f"Failed to load history for {session_id}: {e}")
+        return history
+
+    def _save_turn(self, session_id: str, agent_id: str, user_msg: str, reply: str, model: str):
+        """Persist user message + assistant reply to SessionDB."""
+        if not self._db or not reply:
+            return
+        try:
+            if not self._db.get_session(session_id):
+                self._db.create_session(
+                    session_id=session_id,
+                    source=f"agent:{agent_id}",
+                    model=model,
+                )
+            self._db.append_message(session_id, "user", user_msg)
+            self._db.append_message(session_id, "assistant", reply)
+        except Exception as e:
+            logger.warning(f"Failed to save turn for {session_id}: {e}")
 
     async def stream(
         self,
@@ -379,7 +429,7 @@ Rules:
 
     # ── Internal ─────────────────────────────────────────────
 
-    def _get_agent(self, agent_id: str, cfg: dict):
+    def _get_agent(self, agent_id: str, cfg: dict, session_id: str = ""):
         """Get or create an AIAgent using Hermes' built-in provider resolution.
 
         provider: current (default) → use whatever Hermes is configured with,
@@ -437,8 +487,9 @@ Rules:
                     "system_prompt", "You are a helpful assistant."
                 ),
                 session_db=self._db,
-                session_id=cfg.get("session_id", f"agent-{agent_id}"),
-                max_iterations=1,  # sub-agents: single-turn, no tool loop
+                session_id=session_id or cfg.get("session_id", f"agent-{agent_id}"),
+                max_iterations=cfg.get("max_iterations", 3),
+                enabled_toolsets=cfg.get("enabled_toolsets") or None,
             )
 
         return self._instances[agent_id]
@@ -460,15 +511,23 @@ Rules:
     async def _run_agent(self, agent_id: str, cfg: dict, initial_message: str = ""):
         """Run agent as asyncio.Task via AIAgent (uses Hermes provider resolution).
 
-        Single-turn response — no conversation loop.
+        Uses run_conversation with history from SessionDB for persistent context.
         """
         if not initial_message:
             return
 
+        session_id = cfg.get("session_id", f"agent-{agent_id}-task")
+
         try:
-            agent = self._get_agent(agent_id, cfg)
-            reply = agent.chat(initial_message)
+            agent = self._get_agent(agent_id, cfg, session_id)
+            conversation_history = self._load_history(session_id, cfg)
+            result = agent.run_conversation(
+                initial_message,
+                conversation_history=conversation_history,
+            )
+            reply = result.get("final_response", "") if isinstance(result, dict) else str(result)
             logger.info(f"[{agent_id}] {str(reply)[:120]}...")
+            self._save_turn(session_id, agent_id, initial_message, reply, agent.model)
         except asyncio.CancelledError:
             logger.info(f"Agent {agent_id} task cancelled")
             raise

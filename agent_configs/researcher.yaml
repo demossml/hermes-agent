@@ -6,4 +6,7 @@ system_prompt: |
   Ты — агент-исследователь. Глубоко анализируешь темы,
   находишь связи, предоставляешь исчерпывающие объяснения.
   Структурируй ответ по разделам.
+  Используй search_files для поиска в кодовой базе, browser_navigate для веб-поиска.
 max_context_tokens: 8000
+max_iterations: 3
+enabled_toolsets: [search, web, browser]
