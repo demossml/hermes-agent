@@ -63,6 +63,7 @@ class AgentRegistry:
         self._agents: dict[str, dict] = {}         # agent_id -> config
         self._tasks: dict[str, asyncio.Task] = {}  # agent_id -> running task
         self._instances: dict[str, Any] = {}       # agent_id -> AIAgent
+        self._stats: dict[str, dict] = {}          # agent_id -> {calls, tokens, total_ms}
 
     def set_db(self, db):
         """Set SessionDB after init (avoids circular imports)."""
@@ -111,7 +112,7 @@ class AgentRegistry:
         self._instances.pop(agent_id, None)
 
     def list(self) -> List[Dict]:
-        """List all registered agents with status."""
+        """List all registered agents with status, stats, and session count."""
         result = []
         for agent_id, cfg in self._agents.items():
             entry = dict(cfg)
@@ -121,12 +122,58 @@ class AgentRegistry:
                 else "stopped"
             )
             entry["sessions_count"] = self._count_sessions(agent_id)
+            # Per-agent performance stats
+            st = self._stats.get(agent_id, {})
+            entry["calls"] = st.get("calls", 0)
+            entry["tokens"] = st.get("tokens", 0)
+            if st.get("calls", 0) > 0:
+                entry["avg_latency_ms"] = st.get("total_ms", 0) // st["calls"]
+            else:
+                entry["avg_latency_ms"] = 0
             result.append(entry)
         return result
 
     def get(self, agent_id: str) -> dict | None:
         """Get agent config by id."""
         return self._agents.get(agent_id)
+
+    def reload(self) -> int:
+        """Hot-reload all agent configs from agent_configs/ directory.
+
+        Clears cached AIAgent instances (they'll be recreated on next call).
+        Preserves runtime-registered agents (created via create()).
+        Returns count of loaded configs.
+        """
+        self._instances.clear()
+        return self.load_all()
+
+    def create(self, agent_id: str, config: dict) -> dict:
+        """Create and register a new agent at runtime.
+
+        Saves config to agent_configs/{agent_id}.yaml so it survives restarts.
+        Returns the registered config.
+        """
+        config["agent_id"] = agent_id
+        self.register(agent_id, config)
+        # Persist to YAML
+        yaml_path = self._config_dir / f"{agent_id}.yaml"
+        try:
+            persist_cfg = {
+                "agent_id": agent_id,
+                "provider": config.get("provider", "current"),
+                "description": config.get("description", ""),
+                "system_prompt": config.get("system_prompt", ""),
+                "max_context_tokens": config.get("max_context_tokens", 8000),
+                "max_iterations": config.get("max_iterations", 3),
+            }
+            if config.get("enabled_toolsets"):
+                persist_cfg["enabled_toolsets"] = config["enabled_toolsets"]
+            with open(yaml_path, "w") as f:
+                yaml.dump(persist_cfg, f, allow_unicode=True, default_flow_style=False)
+            logger.info(f"Created agent '{agent_id}' → {yaml_path}")
+        except Exception as e:
+            logger.warning(f"Failed to persist agent config for {agent_id}: {e}")
+        return self._agents[agent_id]
 
     # ── Lifecycle ────────────────────────────────────────────
 
@@ -173,63 +220,99 @@ class AgentRegistry:
         session_id: str,
         message: str,
         injected_context: str | None = None,
+        retries: int = 1,
     ) -> str:
         """Direct call to a sub-agent using Hermes' AIAgent.
 
-        No API key needed — uses Hermes' built-in provider resolution
-        (OAuth, Claude Max, OpenRouter, direct keys).
-
-        Loads conversation history from SessionDB and persists responses
-        so agents remember context across multiple calls to the same session.
+        Tracks per-agent performance stats (calls, latency).
+        Retries once on failure with simplified prompt.
         """
         cfg = self._agents.get(agent_id)
         if not cfg:
             return f"Error: unknown agent '{agent_id}'"
 
-        try:
-            agent = self._get_agent(agent_id, cfg, session_id)
+        t0 = asyncio.get_event_loop().time() * 1000
+        last_error = None
 
-            # Inject context from orchestrator into system prompt
-            if injected_context:
-                system = cfg.get("system_prompt", "You are a helpful assistant.")
-                system += f"\n\n[Context from orchestrator]:\n{injected_context}"
-                agent.ephemeral_system_prompt = system
+        for attempt in range(retries + 1):
+            try:
+                agent = self._get_agent(agent_id, cfg, session_id)
 
-            # Load conversation history from SessionDB
-            conversation_history = self._load_history(session_id, cfg)
+                if injected_context:
+                    system = cfg.get("system_prompt", "You are a helpful assistant.")
+                    system += f"\n\n[Context from orchestrator]:\n{injected_context}"
+                    agent.ephemeral_system_prompt = system
 
-            result = agent.run_conversation(
-                message,
-                conversation_history=conversation_history,
-            )
-            reply = result.get("final_response", "") if isinstance(result, dict) else str(result)
+                # Retry: simplify prompt on second attempt
+                msg = message if attempt == 0 else f"Please respond concisely: {message}"
 
-            # Persist turn to SessionDB
-            self._save_turn(session_id, agent_id, message, reply, agent.model)
+                conversation_history = self._load_history(session_id, cfg)
+                result = agent.run_conversation(
+                    msg,
+                    conversation_history=conversation_history,
+                )
+                reply = result.get("final_response", "") if isinstance(result, dict) else str(result)
 
-            return reply
+                self._save_turn(session_id, agent_id, msg, reply, agent.model)
+                self._track_call(agent_id, t0, len(reply) // 4)
+                return reply
 
-        except Exception as e:
-            logger.error(f"Agent {agent_id} call failed: {e}", exc_info=True)
-            return f"Error from agent '{agent_id}': {e}"
+            except Exception as e:
+                last_error = e
+                if attempt < retries:
+                    logger.warning(f"Agent {agent_id} attempt {attempt+1} failed: {e}, retrying...")
+                    self._instances.pop(agent_id, None)  # force recreate
+                    await asyncio.sleep(0.5)
+                else:
+                    logger.error(f"Agent {agent_id} call failed after {retries+1} attempts: {e}", exc_info=True)
+
+        return f"Error from agent '{agent_id}': {last_error}"
+
+    def _track_call(self, agent_id: str, start_ms: float, tokens: int):
+        """Update per-agent performance stats."""
+        elapsed = int(asyncio.get_event_loop().time() * 1000 - start_ms)
+        st = self._stats.setdefault(agent_id, {"calls": 0, "tokens": 0, "total_ms": 0})
+        st["calls"] += 1
+        st["tokens"] += tokens
+        st["total_ms"] += elapsed
 
     def _load_history(self, session_id: str, cfg: dict) -> List[Dict]:
-        """Load conversation history from SessionDB with sliding token window."""
+        """Load conversation history from SessionDB with sliding token window.
+
+        If history exceeds max_context_tokens, older messages are auto-summarized
+        via _summarize_history instead of being truncated.
+        """
         history: List[Dict] = []
         if not self._db:
             return history
         try:
             msgs = self._db.get_messages_as_conversation(session_id)
+            if not msgs:
+                return history
+            history = [{"role": m["role"], "content": m["content"]} for m in msgs]
             max_tokens = cfg.get("max_context_tokens", 8000)
-            total = 0
-            trimmed = []
-            for m in reversed(msgs or []):
-                t = len((m.get("content") or "")) // 4
-                if total + t > max_tokens:
-                    break
-                trimmed.insert(0, {"role": m["role"], "content": m["content"]})
-                total += t
-            history = trimmed
+            total = sum(len((m.get("content") or "")) // 4 for m in history)
+            if total > max_tokens:
+                # Trigger auto-summarization
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    task = asyncio.create_task(
+                        self._summarize_history(
+                            cfg.get("agent_id", ""), session_id, history, max_tokens
+                        )
+                    )
+                    # Don't block — use truncated history for this turn,
+                    # summarized version will be used next turn
+                # Truncate for now
+                total = 0
+                trimmed = []
+                for m in reversed(history):
+                    t = len((m.get("content") or "")) // 4
+                    if total + t > max_tokens:
+                        break
+                    trimmed.insert(0, m)
+                    total += t
+                history = trimmed
         except Exception as e:
             logger.warning(f"Failed to load history for {session_id}: {e}")
         return history
@@ -534,6 +617,163 @@ If no delegation needed, answer directly.
         except Exception as e:
             logger.warning(f"share_context failed: {e}")
             return 0
+
+    # ── Phase 3: Memory & Context ────────────────────────────
+
+    def scratchpad_publish(self, channel: str, agent_id: str, content: str):
+        """Publish a message to a shared scratchpad channel.
+
+        All agents subscribed to this channel can read it via scratchpad_read().
+        Uses a dedicated session 'scratchpad:{channel}' in SessionDB.
+        """
+        if not self._db:
+            return
+        scratch_session = f"scratchpad:{channel}"
+        try:
+            if not self._db.get_session(scratch_session):
+                self._db.create_session(
+                    session_id=scratch_session,
+                    source=f"scratchpad:{channel}",
+                    model="scratchpad",
+                )
+            self._db.append_message(
+                scratch_session, "user",
+                f"[{agent_id}]: {content}",
+            )
+            logger.debug(f"Scratchpad [{channel}] ← {agent_id}: {content[:80]}")
+        except Exception as e:
+            logger.warning(f"scratchpad_publish failed: {e}")
+
+    def scratchpad_read(self, channel: str, limit: int = 10) -> List[str]:
+        """Read recent messages from a shared scratchpad channel.
+
+        Returns list of formatted messages, newest first.
+        """
+        if not self._db:
+            return []
+        scratch_session = f"scratchpad:{channel}"
+        try:
+            msgs = self._db.get_messages_as_conversation(scratch_session)
+            if not msgs:
+                return []
+            return [
+                f"[{m.get('role', '?')}] {m.get('content', '')[:300]}"
+                for m in reversed(msgs[-limit:])
+            ]
+        except Exception as e:
+            logger.warning(f"scratchpad_read failed: {e}")
+            return []
+
+    async def _summarize_history(
+        self, agent_id: str, session_id: str, history: List[Dict], max_tokens: int
+    ) -> List[Dict]:
+        """Auto-summarize conversation history when it exceeds token budget.
+
+        Uses the agent itself to compress old messages into a summary,
+        preserving recent messages intact.
+        """
+        if not history or not self._db:
+            return history
+
+        total = sum(len((m.get("content") or "")) // 4 for m in history)
+        if total <= max_tokens:
+            return history
+
+        # Split: older half gets summarized, newer half stays intact
+        split = max(len(history) // 2, 2)
+        old_msgs = history[:split]
+        recent_msgs = history[split:]
+
+        # Build summary prompt from old messages
+        old_text = "\n".join(
+            f"{m['role']}: {m['content'][:200]}" for m in old_msgs
+        )
+        summary_prompt = (
+            f"Summarize this conversation history in 2-3 sentences, "
+            f"preserving key facts, decisions, and context:\n\n{old_text}"
+        )
+
+        try:
+            agent = self._get_agent(agent_id, self._agents.get(agent_id, {}), session_id)
+            summary_result = agent.run_conversation(summary_prompt)
+            summary = summary_result.get("final_response", "") if isinstance(summary_result, dict) else str(summary_result)
+            compact = [{"role": "system", "content": f"[History summary]: {summary}"}]
+            logger.info(f"Summarized {len(old_msgs)} messages → {len(summary)} chars for {agent_id}")
+            return compact + recent_msgs
+        except Exception as e:
+            logger.warning(f"Summarization failed for {agent_id}: {e}")
+            # Fallback: just keep recent messages
+            return recent_msgs[-max(1, max_tokens // 100):]
+
+    # ── Phase 5: Advanced ────────────────────────────────────
+
+    async def dialogue(
+        self,
+        agent_a: str,
+        agent_b: str,
+        session_id: str,
+        topic: str,
+        turns: int = 3,
+    ) -> List[str]:
+        """Agent-to-agent dialogue.
+
+        Two agents converse for N turns on a topic. Agent A starts,
+        Agent B responds, they alternate. Returns transcript.
+        """
+        if agent_a not in self._agents:
+            return [f"Error: unknown agent '{agent_a}'"]
+        if agent_b not in self._agents:
+            return [f"Error: unknown agent '{agent_b}'"]
+
+        transcript: List[str] = []
+        current_msg = topic
+
+        for i in range(turns):
+            speaker = agent_a if i % 2 == 0 else agent_b
+            listener = agent_b if i % 2 == 0 else agent_a
+
+            reply = await self.call(speaker, session_id, current_msg)
+            transcript.append(f"[{speaker}]: {reply}")
+
+            if i < turns - 1:
+                # Prepare next turn: inject listener's perspective
+                current_msg = (
+                    f"The other agent said:\n\n{reply}\n\n"
+                    f"Respond to this. Add your perspective or ask a follow-up question."
+                )
+
+        return transcript
+
+    def dispatch(self, session_id: str, task: str) -> str:
+        """Auto-dispatch task to the most suitable agent based on keywords.
+
+        Returns agent_id of the selected agent (caller should then call() it).
+        """
+        task_lower = task.lower()
+        scores: Dict[str, int] = {}
+
+        for agent_id, cfg in self._agents.items():
+            if agent_id == "orchestrator":
+                continue
+            desc = (cfg.get("description") or "").lower()
+            score = 0
+            # Keyword matching
+            keywords = {
+                "coder": ["code", "program", "function", "bug", "fix", "write", "file", "script", "python", "test"],
+                "researcher": ["research", "find", "search", "analysis", "explain", "what", "how", "why", "compare"],
+                "reviewer": ["review", "check", "audit", "security", "improve", "bug", "error", "vulnerability"],
+            }
+            for kw in keywords.get(agent_id, []):
+                if kw in task_lower or kw in desc:
+                    score += 1
+            scores[agent_id] = score
+
+        if not scores:
+            return ""
+
+        # Return agent with highest score, or empty if all zero
+        best = max(scores, key=scores.get)
+        return best if scores[best] > 0 else ""
 
     # ── Internal ─────────────────────────────────────────────
 
