@@ -1,0 +1,6 @@
+name: agent-mention
+description: Route @mention messages to sub-agents (e.g. @coder write a sort function)
+version: "1.0"
+events:
+  - pre_gateway_dispatch
+enabled: true

@@ -7156,6 +7156,14 @@ class GatewayRunner:
             # which is read by _run_agent. Removed to prevent unbounded growth.
             return None
 
+        # ── @mention routing ─────────────────────────────────────────────────
+        _text = (event.text or "").strip()
+        if _text.startswith("@"):
+            from gateway.agent_mention import handle_mention
+            _reply = await handle_mention(_text, _quick_key)
+            if _reply is not None:
+                return _reply
+
         # Check for commands
         command = event.get_command()
 
