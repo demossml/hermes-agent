@@ -9519,9 +9519,23 @@ class HermesCLI:
 
     # ── Multi-agent handlers ────────────────────────────────────────────────
 
+    @staticmethod
+    def _run_async(coro, timeout: int = 180):
+        """Safely run a coroutine — works both inside and outside event loops."""
+        import asyncio
+        try:
+            loop = asyncio.get_running_loop()
+            # Already in async context (Textual / TUI) — use thread
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, coro)
+                return future.result(timeout=timeout)
+        except RuntimeError:
+            # No running loop — safe to use asyncio.run()
+            return asyncio.run(coro)
+
     def _handle_agent_call(self, cmd: str):
         """/agent <agent_id> [message] — call a sub-agent directly."""
-        import asyncio
         from agent_registry import get_registry
 
         parts = cmd.strip().split(None, 2)
@@ -9548,7 +9562,7 @@ class HermesCLI:
         _cprint(f"  [{agent_id}] thinking...")
 
         try:
-            reply = asyncio.run(
+            reply = self._run_async(
                 registry.call(agent_id, session_id, message)
             )
             _cprint(f"  [{agent_id}] {reply}")
@@ -9557,7 +9571,6 @@ class HermesCLI:
 
     def _handle_orchestrate(self, cmd: str):
         """/orchestrate <message> — auto-delegation through orchestrator."""
-        import asyncio
         from agent_registry import get_registry
 
         parts = cmd.strip().split(None, 1)
@@ -9570,8 +9583,9 @@ class HermesCLI:
         _cprint(f"  [orchestrator] analysing...")
 
         try:
-            reply = asyncio.run(
-                get_registry().orchestrate(session_id, message)
+            reply = self._run_async(
+                get_registry().orchestrate(session_id, message),
+                timeout=300,
             )
             _cprint(f"  [orchestrator] {reply}")
         except Exception as e:
