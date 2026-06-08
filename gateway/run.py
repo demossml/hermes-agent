@@ -7417,6 +7417,12 @@ class GatewayRunner:
         if canonical == "voice":
             return await self._handle_voice_command(event)
 
+        # ── Multi-agent commands ──────────────────────────────────────────
+        if canonical == "agent":
+            return await self._handle_agent_call(event)
+        if canonical == "orchestrate":
+            return await self._handle_orchestrate(event)
+
         if self._draining:
             return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
 
@@ -10922,6 +10928,39 @@ class GatewayRunner:
                 if adapter:
                     self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
                 return t("gateway.voice.disabled_short")
+
+    # ── Multi-agent gateway handlers ───────────────────────────────────────
+
+    async def _handle_agent_call(self, event: MessageEvent) -> str:
+        """/agent <agent_id> <message> — call a sub-agent directly."""
+        from agent_registry import get_registry
+
+        args = event.get_command_args().strip()
+        parts = args.split(None, 1)
+        if len(parts) < 2:
+            return "Usage: /agent <agent_id> <message>\nAvailable agents: /agents"
+
+        agent_id, message = parts[0], parts[1]
+        registry = get_registry()
+        if not registry.get(agent_id):
+            available = [a["agent_id"] for a in registry.list()]
+            return f"Agent '{agent_id}' not found.\nAvailable: {', '.join(available)}"
+
+        session_id = getattr(event, "session_id", "gw-agent")
+        reply = await registry.call(agent_id, session_id, message)
+        return f"[{agent_id}]\n{reply}"
+
+    async def _handle_orchestrate(self, event: MessageEvent) -> str:
+        """/orchestrate <message> — auto-delegation through orchestrator."""
+        from agent_registry import get_registry
+
+        message = event.get_command_args().strip()
+        if not message:
+            return "Usage: /orchestrate <message>"
+
+        session_id = getattr(event, "session_id", "gw-orch")
+        reply = await get_registry().orchestrate(session_id, message)
+        return reply
 
     async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
         """Join the user's current Discord voice channel."""

@@ -5483,7 +5483,7 @@ class HermesCLI:
         print(f"  ✅ Stopped {killed} process(es).")
 
     def _handle_agents_command(self):
-        """Handle /agents — show background processes and agent status."""
+        """Handle /agents — show background processes and multi-agent registry."""
         from tools.process_registry import format_uptime_short, process_registry
 
         processes = process_registry.list_sessions()
@@ -5501,6 +5501,24 @@ class HermesCLI:
 
         agent_running = getattr(self, "_agent_running", False)
         _cprint(f"  Agent: {'running' if agent_running else 'idle'}")
+
+        # ── Multi-agent registry ──────────────────────────────────────
+        try:
+            from agent_registry import get_registry
+            registry = get_registry()
+            agents = registry.list()
+            if agents:
+                _cprint(f"\n  Sub-agents ({len(agents)} registered):")
+                _cprint(f"  {'ID':<16} {'Calls':>6} {'Avg ms':>8}  Description")
+                for a in agents:
+                    _cprint(
+                        f"  {a['agent_id']:<16} "
+                        f"{a.get('calls',0):>6} "
+                        f"{a.get('avg_latency_ms',0):>8}  "
+                        f"{a.get('description','')[:40]}"
+                    )
+        except Exception as e:
+            _cprint(f"  [sub-agents: {e}]")
 
     def _handle_paste_command(self):
         """Handle /paste — explicitly check clipboard for an image.
@@ -8402,6 +8420,17 @@ class HermesCLI:
             self._handle_voice_command(cmd_original)
         elif canonical == "busy":
             self._handle_busy_command(cmd_original)
+
+        # ── Multi-agent commands ──────────────────────────────────────────
+        elif canonical == "agent":
+            self._handle_agent_call(cmd_original)
+        elif canonical == "orchestrate":
+            self._handle_orchestrate(cmd_original)
+        elif canonical == "agents-reload":
+            self._handle_agents_reload()
+        elif canonical == "agents-create":
+            self._handle_agents_create(cmd_original)
+
         else:
             # Check for user-defined quick commands (bypass agent loop, no LLM call)
             base_cmd = cmd_lower.split()[0]
@@ -9487,6 +9516,103 @@ class HermesCLI:
             _cprint(f"  {_DIM}{behavior}{_RST}")
         else:
             _cprint(f"  {_ACCENT}✓ Busy input mode set to '{arg}' (session only){_RST}")
+
+    # ── Multi-agent handlers ────────────────────────────────────────────────
+
+    def _handle_agent_call(self, cmd: str):
+        """/agent <agent_id> [message] — call a sub-agent directly."""
+        import asyncio
+        from agent_registry import get_registry
+
+        parts = cmd.strip().split(None, 2)
+        if len(parts) < 2:
+            _cprint(f"  Usage: /agent <agent_id> [message]")
+            _cprint(f"  Available: /agents")
+            return
+
+        agent_id = parts[1]
+        message = parts[2] if len(parts) > 2 else ""
+
+        if not message:
+            _cprint(f"  Usage: /agent {agent_id} <message>")
+            return
+
+        registry = get_registry()
+        if not registry.get(agent_id):
+            available = [a["agent_id"] for a in registry.list()]
+            _cprint(f"  Unknown agent: {agent_id}")
+            _cprint(f"  Available: {', '.join(available)}")
+            return
+
+        session_id = getattr(self, "session_id", "cli-agent")
+        _cprint(f"  [{agent_id}] thinking...")
+
+        try:
+            reply = asyncio.run(
+                registry.call(agent_id, session_id, message)
+            )
+            _cprint(f"  [{agent_id}] {reply}")
+        except Exception as e:
+            _cprint(f"  [bold red]Agent call failed: {e}[/]")
+
+    def _handle_orchestrate(self, cmd: str):
+        """/orchestrate <message> — auto-delegation through orchestrator."""
+        import asyncio
+        from agent_registry import get_registry
+
+        parts = cmd.strip().split(None, 1)
+        if len(parts) < 2:
+            _cprint(f"  Usage: /orchestrate <message>")
+            return
+
+        message = parts[1]
+        session_id = getattr(self, "session_id", "cli-orch")
+        _cprint(f"  [orchestrator] analysing...")
+
+        try:
+            reply = asyncio.run(
+                get_registry().orchestrate(session_id, message)
+            )
+            _cprint(f"  [orchestrator] {reply}")
+        except Exception as e:
+            _cprint(f"  [bold red]Orchestrate failed: {e}[/]")
+
+    def _handle_agents_reload(self):
+        """/agents-reload — hot-reload agent configs."""
+        from agent_registry import get_registry
+
+        try:
+            count = get_registry().reload()
+            _cprint(f"  Reloaded {count} agents from agent_configs/")
+        except Exception as e:
+            _cprint(f"  [bold red]Reload failed: {e}[/]")
+
+    def _handle_agents_create(self, cmd: str):
+        """/agents-create <agent_id> <system_prompt> — create agent at runtime."""
+        from agent_registry import get_registry
+
+        parts = cmd.strip().split(None, 2)
+        if len(parts) < 3:
+            _cprint(f"  Usage: /agents-create <agent_id> <system_prompt>")
+            _cprint(f"  Example: /agents-create translator Translate to English")
+            return
+
+        agent_id = parts[1]
+        system_prompt = parts[2]
+
+        try:
+            registry = get_registry()
+            registry.create(agent_id, {
+                "provider": "current",
+                "system_prompt": system_prompt,
+                "description": f"Created via /agents-create",
+                "max_context_tokens": 8000,
+                "max_iterations": 3,
+            })
+            _cprint(f"  Agent '{agent_id}' created → agent_configs/{agent_id}.yaml")
+            _cprint(f"  Prompt: {system_prompt[:100]}...")
+        except Exception as e:
+            _cprint(f"  [bold red]Create failed: {e}[/]")
 
     def _handle_fast_command(self, cmd: str):
         """Handle /fast — toggle fast mode (OpenAI Priority Processing / Anthropic Fast Mode)."""

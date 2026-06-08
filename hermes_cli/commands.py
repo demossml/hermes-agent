@@ -218,6 +218,38 @@ COMMAND_REGISTRY: list[CommandDef] = [
     # Exit
     CommandDef("quit", "Exit the CLI (use --delete to also remove session history)", "Exit",
                cli_only=True, aliases=("exit",), args_hint="[--delete]"),
+
+    # ── Multi-agent commands ────────────────────────────────────────────────────
+    CommandDef(
+        "agent",
+        "Call a sub-agent directly: /agent <id> <message>",
+        "Agents",
+        aliases=("a",),
+        args_hint="<agent_id> [message]",
+    ),
+    CommandDef(
+        "orchestrate",
+        "Route message through orchestrator (auto-delegation): /orchestrate <message>",
+        "Agents",
+        aliases=("orch",),
+        args_hint="<message>",
+    ),
+    CommandDef(
+        "agents-reload",
+        "Hot-reload all agent configs from agent_configs/ directory",
+        "Agents",
+        aliases=("agr",),
+        args_hint="",
+        cli_only=True,
+    ),
+    CommandDef(
+        "agents-create",
+        "Create a new agent at runtime: /agents-create <id> <system_prompt>",
+        "Agents",
+        aliases=("agc",),
+        args_hint="<agent_id> <system_prompt>",
+        cli_only=True,
+    ),
 ]
 
 
