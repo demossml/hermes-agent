@@ -384,38 +384,47 @@ class AgentRegistry:
     ) -> str:
         """Route message through orchestrator agent.
 
-        Orchestrator can delegate to sub-agents via:
-            DELEGATE: <agent_id> | <task description>
-        Multiple DELEGATE lines = parallel execution.
-        DAG chaining via:
-            DELEGATE: <agent_id> | <task> | -> <next_agent_id>
-        (next_agent receives previous agent's output as context)
-
-        Returns synthesized final answer.
+        Two-phase: Phase 1 asks for delegation plan (DELEGATE lines or NONE).
+        Phase 2: if delegation happened, gather results and synthesize.
+        If NONE, ask orchestrator to answer directly.
         """
         if "orchestrator" not in self._agents:
             return "Error: orchestrator agent not registered. Add agent_configs/orchestrator.yaml"
 
-        orch_reply = await self._ask_orchestrator(session_id, message)
+        plan = await self._ask_orchestrator(session_id, message)
 
         # Parse delegation directives
-        stages = self._parse_delegates(orch_reply)
+        stages = self._parse_delegates(plan)
         if not stages:
-            return orch_reply  # orchestrator answered directly
+            # NONE or no valid DELEGATE — ask orchestrator to answer directly
+            if "NONE" in plan.upper():
+                return await self._ask_orchestrator_direct(session_id, message)
+            return plan  # orchestrator answered something (fallback)
 
         # Execute stages (supports DAG chaining)
         all_results = await self._execute_stages(session_id, stages)
 
-        # Synthesize final answer
+        # Phase 2: ask orchestrator to synthesize
         results_text = "\n\n".join(
             f"[{aid}]: {res}" if not isinstance(res, Exception) else f"[{aid}]: ERROR: {res}"
             for aid, res in all_results.items()
         )
-        return await self._ask_orchestrator(
+        return await self._ask_orchestrator_direct(
             session_id,
             f"Sub-agents completed their tasks:\n\n{results_text}\n\n"
             "Synthesize a final answer. Combine results, don't mention internal steps.",
         )
+
+    async def _ask_orchestrator_direct(self, session_id: str, message: str) -> str:
+        """Ask orchestrator to answer directly (no delegation format)."""
+        orch_cfg = self._agents["orchestrator"]
+        orig_system = orch_cfg.get("system_prompt", "")
+        orch_cfg["system_prompt"] = orig_system + "\n\nAnswer the user's request directly. Be concise."
+        self._instances.pop("orchestrator", None)
+        reply = await self.call("orchestrator", session_id, message)
+        orch_cfg["system_prompt"] = orig_system
+        self._instances.pop("orchestrator", None)
+        return reply
 
     async def stream_orchestrate(
         self,
@@ -459,7 +468,10 @@ class AgentRegistry:
     # ── Orchestration helpers ────────────────────────────────
 
     async def _ask_orchestrator(self, session_id: str, message: str) -> str:
-        """Call orchestrator agent with sub-agent list injected into system prompt."""
+        """Call orchestrator agent with sub-agent list injected into system prompt.
+
+        Two-phase: first ask for delegation plan, then synthesize after results.
+        """
         agents_info = json.dumps(
             [{"id": a["agent_id"], "description": a.get("description", "")}
              for a in self._agents.values() if a["agent_id"] != "orchestrator"],
@@ -468,22 +480,28 @@ class AgentRegistry:
 
         orch_cfg = self._agents["orchestrator"]
         orig_system = orch_cfg.get("system_prompt", "")
+
+        # Phase 1: delegation plan ONLY — no code, no answers
         orch_cfg["system_prompt"] = orig_system + f"""
 
 Available sub-agents:
 {agents_info}
 
-Delegation format (use ONLY when task requires specialization):
-  DELEGATE: <agent_id> | <task description>
-  For chaining: DELEGATE: <agent_id> | <task> | -> <next_agent_id>
-Multiple lines = parallel. Chain with -> for sequential (output feeds to next).
-If no delegation needed, answer directly.
+CRITICAL: You must ONLY output delegation directives. DO NOT write code. DO NOT answer questions.
+If delegation is needed, output EXACTLY:
+DELEGATE: <agent_id> | <task description>
+(one per line, multiple lines = parallel)
+
+If NO delegation is needed, output EXACTLY:
+NONE
+
+Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
 """
         self._instances.pop("orchestrator", None)
-        reply = await self.call("orchestrator", session_id, message)
+        plan = await self.call("orchestrator", session_id, message)
         orch_cfg["system_prompt"] = orig_system
         self._instances.pop("orchestrator", None)
-        return reply
+        return plan
 
     def _parse_delegates(self, reply: str) -> Dict[str, List[tuple]]:
         """Parse DELEGATE directives into execution stages.
