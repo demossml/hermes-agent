@@ -102,8 +102,14 @@ class AgentRegistry:
         config.setdefault("max_context_tokens", 8000)
         config.setdefault("max_iterations", 3)  # default: 3-turn tool loop
         config.setdefault("provider", "current")  # "current" = use Hermes' active provider
+        config.setdefault("level", 1)           # 0 = orchestrator, 1 = sub-agent, 2+ = grandchild
+        config.setdefault("parent_id", "orchestrator")
         self._agents[agent_id] = config
-        logger.info(f"Registered agent: {agent_id} ({config['model']}, provider={config['provider']}, max_iter={config['max_iterations']})")
+        logger.info(
+            f"Registered agent: {agent_id} "
+            f"(level={config['level']}, parent={config['parent_id']}, "
+            f"provider={config['provider']}, max_iter={config['max_iterations']})"
+        )
 
     def unregister(self, agent_id: str):
         """Remove an agent from the registry."""
@@ -112,7 +118,7 @@ class AgentRegistry:
         self._instances.pop(agent_id, None)
 
     def list(self) -> List[Dict]:
-        """List all registered agents with status, stats, and session count."""
+        """List all registered agents with status, stats, level, and hierarchy."""
         result = []
         for agent_id, cfg in self._agents.items():
             entry = dict(cfg)
@@ -122,7 +128,6 @@ class AgentRegistry:
                 else "stopped"
             )
             entry["sessions_count"] = self._count_sessions(agent_id)
-            # Per-agent performance stats
             st = self._stats.get(agent_id, {})
             entry["calls"] = st.get("calls", 0)
             entry["tokens"] = st.get("tokens", 0)
@@ -131,11 +136,59 @@ class AgentRegistry:
             else:
                 entry["avg_latency_ms"] = 0
             result.append(entry)
+        # Sort by level, then agent_id
+        result.sort(key=lambda a: (a.get("level", 1), a["agent_id"]))
         return result
 
     def get(self, agent_id: str) -> dict | None:
         """Get agent config by id."""
         return self._agents.get(agent_id)
+
+    def get_children(self, parent_id: str) -> List[Dict]:
+        """Return all direct children of an agent."""
+        return [
+            cfg for cfg in self._agents.values()
+            if cfg.get("parent_id") == parent_id
+        ]
+
+    def get_tree(self, root_id: str = "orchestrator", indent: int = 0) -> str:
+        """Return ASCII tree of agent hierarchy with levels and stats."""
+        lines = []
+        cfg = self._agents.get(root_id, {})
+        if not cfg:
+            return f"Agent '{root_id}' not found."
+        prefix = "  " * indent + ("└─ " if indent > 0 else "")
+        calls = self._stats.get(root_id, {}).get("calls", 0)
+        lines.append(
+            f"{prefix}{root_id} "
+            f"[level={cfg.get('level', 0)}] "
+            f"calls={calls}"
+        )
+        for child in self.get_children(root_id):
+            child_id = child["agent_id"]
+            if child_id != root_id:
+                lines.append(self.get_tree(child_id, indent + 1))
+        return "\n".join(lines)
+
+    def update_tools(
+        self, agent_id: str, tools: list, caller_id: str = "orchestrator"
+    ) -> None:
+        """Update agent's toolset. Only orchestrator can change tools.
+
+        Sub-agents cannot expand their own permissions.
+        The orchestrator decides what each agent is allowed to do.
+        """
+        if caller_id != "orchestrator":
+            raise PermissionError(
+                f"Only orchestrator can modify agent tools. "
+                f"Caller '{caller_id}' attempted to change tools of '{agent_id}'."
+            )
+        if agent_id not in self._agents:
+            raise KeyError(f"Agent '{agent_id}' not found.")
+
+        self._agents[agent_id]["tools"] = tools
+        self._instances.pop(agent_id, None)  # force recreate with new tools
+        logger.info(f"Tools updated for '{agent_id}' by '{caller_id}'")
 
     def reload(self) -> int:
         """Hot-reload all agent configs from agent_configs/ directory.
@@ -150,16 +203,27 @@ class AgentRegistry:
     def create(self, agent_id: str, config: dict) -> dict:
         """Create and register a new agent at runtime.
 
+        Auto-computes level from parent_id. Only orchestrator creates level-1 agents.
         Saves config to agent_configs/{agent_id}.yaml so it survives restarts.
-        Returns the registered config.
         """
+        parent_id = config.get("parent_id", "orchestrator")
+
+        # Auto-compute level from parent
+        if "level" not in config and parent_id in self._agents:
+            parent_level = self._agents[parent_id].get("level", 0)
+            config["level"] = parent_level + 1
+
         config["agent_id"] = agent_id
+        config["parent_id"] = parent_id
         self.register(agent_id, config)
+
         # Persist to YAML
         yaml_path = self._config_dir / f"{agent_id}.yaml"
         try:
             persist_cfg = {
                 "agent_id": agent_id,
+                "parent_id": parent_id,
+                "level": config.get("level", 1),
                 "provider": config.get("provider", "current"),
                 "description": config.get("description", ""),
                 "system_prompt": config.get("system_prompt", ""),
@@ -170,7 +234,7 @@ class AgentRegistry:
                 persist_cfg["enabled_toolsets"] = config["enabled_toolsets"]
             with open(yaml_path, "w") as f:
                 yaml.dump(persist_cfg, f, allow_unicode=True, default_flow_style=False)
-            logger.info(f"Created agent '{agent_id}' → {yaml_path}")
+            logger.info(f"Created agent '{agent_id}' (level={config.get('level')}) → {yaml_path}")
         except Exception as e:
             logger.warning(f"Failed to persist agent config for {agent_id}: {e}")
         return self._agents[agent_id]
@@ -221,8 +285,14 @@ class AgentRegistry:
         message: str,
         injected_context: str | None = None,
         retries: int = 1,
+        caller_id: str = "orchestrator",
     ) -> str:
         """Direct call to a sub-agent using Hermes' AIAgent.
+
+        Isolation rules:
+        - orchestrator can call any agent (level 0 → any)
+        - sub-agent can only call its own children (caller.level < target.level)
+        - sub-agent CANNOT call sibling agents (same level = horizontal call)
 
         Tracks per-agent performance stats (calls, latency).
         Retries once on failure with simplified prompt.
@@ -230,6 +300,11 @@ class AgentRegistry:
         cfg = self._agents.get(agent_id)
         if not cfg:
             return f"Error: unknown agent '{agent_id}'"
+
+        # ── Isolation check ──────────────────────────────────────────────
+        isolation_error = self._check_isolation(caller_id, agent_id, cfg)
+        if isolation_error:
+            return isolation_error
 
         t0 = asyncio.get_event_loop().time() * 1000
         last_error = None
@@ -243,17 +318,16 @@ class AgentRegistry:
                     system += f"\n\n[Context from orchestrator]:\n{injected_context}"
                     agent.ephemeral_system_prompt = system
 
-                # Retry: simplify prompt on second attempt
                 msg = message if attempt == 0 else f"Please respond concisely: {message}"
 
-                conversation_history = self._load_history(session_id, cfg)
+                conversation_history = self._load_history(agent_id, session_id)
                 result = agent.run_conversation(
                     msg,
                     conversation_history=conversation_history,
                 )
                 reply = result.get("final_response", "") if isinstance(result, dict) else str(result)
 
-                self._save_turn(session_id, agent_id, msg, reply, agent.model)
+                self._save_turn(agent_id, session_id, msg, reply)
                 self._track_call(agent_id, t0, len(reply) // 4)
                 return reply
 
@@ -261,12 +335,46 @@ class AgentRegistry:
                 last_error = e
                 if attempt < retries:
                     logger.warning(f"Agent {agent_id} attempt {attempt+1} failed: {e}, retrying...")
-                    self._instances.pop(agent_id, None)  # force recreate
+                    self._instances.pop(agent_id, None)
                     await asyncio.sleep(0.5)
                 else:
                     logger.error(f"Agent {agent_id} call failed after {retries+1} attempts: {e}", exc_info=True)
 
         return f"Error from agent '{agent_id}': {last_error}"
+
+    def _check_isolation(self, caller_id: str, agent_id: str, target_cfg: dict) -> str | None:
+        """Check if caller is allowed to call target. Returns error string or None."""
+        if caller_id == "orchestrator" or caller_id not in self._agents:
+            return None  # orchestrator can call anyone
+
+        caller_cfg = self._agents.get(caller_id)
+        if not caller_cfg:
+            return None
+
+        caller_level = caller_cfg.get("level", 1)
+        target_level = target_cfg.get("level", 1)
+        target_parent = target_cfg.get("parent_id", "orchestrator")
+
+        # Horizontal call — same level = siblings, forbidden
+        if target_level <= caller_level:
+            error_msg = (
+                f"[ISOLATION VIOLATION] Agent '{caller_id}' (level {caller_level}) "
+                f"attempted to call '{agent_id}' (level {target_level}). "
+                f"Sub-agents can only call their own children."
+            )
+            logger.error(error_msg)
+            return f"Error: {error_msg}"
+
+        # Calling another agent's child — forbidden
+        if target_parent != caller_id:
+            error_msg = (
+                f"[ISOLATION VIOLATION] Agent '{caller_id}' attempted to call "
+                f"'{agent_id}' which belongs to '{target_parent}', not to '{caller_id}'."
+            )
+            logger.error(error_msg)
+            return f"Error: {error_msg}"
+
+        return None
 
     def _track_call(self, agent_id: str, start_ms: float, tokens: int):
         """Update per-agent performance stats."""
@@ -276,34 +384,39 @@ class AgentRegistry:
         st["tokens"] += tokens
         st["total_ms"] += elapsed
 
-    def _load_history(self, session_id: str, cfg: dict) -> List[Dict]:
-        """Load conversation history from SessionDB with sliding token window.
+    @staticmethod
+    def get_agent_session_id(session_id: str, agent_id: str) -> str:
+        """Return the isolated session namespace for an agent.
 
-        If history exceeds max_context_tokens, older messages are auto-summarized
-        via _summarize_history instead of being truncated.
+        Format: "{user_session_id}:{agent_id}"
+        Use this everywhere instead of raw session_id when accessing agent memory.
+        """
+        return f"{session_id}:{agent_id}"
+
+    def _load_history(self, agent_id: str, session_id: str) -> List[Dict]:
+        """Load conversation history from agent's isolated memory namespace.
+
+        Memory isolation: each agent has its own namespace "{session_id}:{agent_id}".
+        No agent can access another agent's history through this method.
         """
         history: List[Dict] = []
         if not self._db:
             return history
         try:
-            msgs = self._db.get_messages_as_conversation(session_id)
+            agent_session = self.get_agent_session_id(session_id, agent_id)
+            msgs = self._db.get_messages_as_conversation(agent_session)
             if not msgs:
                 return history
             history = [{"role": m["role"], "content": m["content"]} for m in msgs]
+            cfg = self._agents.get(agent_id, {})
             max_tokens = cfg.get("max_context_tokens", 8000)
             total = sum(len((m.get("content") or "")) // 4 for m in history)
             if total > max_tokens:
-                # Trigger auto-summarization
                 loop = asyncio.get_event_loop()
                 if loop.is_running():
-                    task = asyncio.create_task(
-                        self._summarize_history(
-                            cfg.get("agent_id", ""), session_id, history, max_tokens
-                        )
+                    asyncio.create_task(
+                        self._summarize_history(agent_id, session_id, history, max_tokens)
                     )
-                    # Don't block — use truncated history for this turn,
-                    # summarized version will be used next turn
-                # Truncate for now
                 total = 0
                 trimmed = []
                 for m in reversed(history):
@@ -314,24 +427,25 @@ class AgentRegistry:
                     total += t
                 history = trimmed
         except Exception as e:
-            logger.warning(f"Failed to load history for {session_id}: {e}")
+            logger.warning(f"Failed to load history for {agent_id}/{session_id}: {e}")
         return history
 
-    def _save_turn(self, session_id: str, agent_id: str, user_msg: str, reply: str, model: str):
-        """Persist user message + assistant reply to SessionDB."""
+    def _save_turn(self, agent_id: str, session_id: str, user_msg: str, reply: str):
+        """Persist user message + assistant reply to agent's isolated namespace."""
         if not self._db or not reply:
             return
         try:
-            if not self._db.get_session(session_id):
+            agent_session = self.get_agent_session_id(session_id, agent_id)
+            if not self._db.get_session(agent_session):
                 self._db.create_session(
-                    session_id=session_id,
+                    session_id=agent_session,
                     source=f"agent:{agent_id}",
-                    model=model,
+                    model=self._agents.get(agent_id, {}).get("model", ""),
                 )
-            self._db.append_message(session_id, "user", user_msg)
-            self._db.append_message(session_id, "assistant", reply)
+            self._db.append_message(agent_session, "user", user_msg)
+            self._db.append_message(agent_session, "assistant", reply)
         except Exception as e:
-            logger.warning(f"Failed to save turn for {session_id}: {e}")
+            logger.warning(f"Failed to save turn for {agent_id}/{session_id}: {e}")
 
     async def stream(
         self,
@@ -936,14 +1050,14 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
 
         try:
             agent = self._get_agent(agent_id, cfg, session_id)
-            conversation_history = self._load_history(session_id, cfg)
+            conversation_history = self._load_history(agent_id, session_id)
             result = agent.run_conversation(
                 initial_message,
                 conversation_history=conversation_history,
             )
             reply = result.get("final_response", "") if isinstance(result, dict) else str(result)
             logger.info(f"[{agent_id}] {str(reply)[:120]}...")
-            self._save_turn(session_id, agent_id, initial_message, reply, agent.model)
+            self._save_turn(agent_id, session_id, initial_message, reply)
         except asyncio.CancelledError:
             logger.info(f"Agent {agent_id} task cancelled")
             raise

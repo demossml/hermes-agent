@@ -1,6 +1,8 @@
 # Coder — пишет чистый, документированный код
 agent_id: coder
 provider: current
+level: 1
+parent_id: orchestrator
 description: "Пишет чистый, документированный код"
 system_prompt: |
   Ты — агент-программист. Пишешь чистый, документированный Python-код.

@@ -1,6 +1,8 @@
 # Researcher — исследует и анализирует информацию
 agent_id: researcher
 provider: current
+level: 1
+parent_id: orchestrator
 description: "Исследует и анализирует информацию"
 system_prompt: |
   Ты — агент-исследователь. Глубоко анализируешь темы,

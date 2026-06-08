@@ -1,6 +1,8 @@
 # Reviewer — проверяет код написанный coder
 agent_id: reviewer
 provider: current
+level: 1
+parent_id: orchestrator
 description: "Проверяет код написанный coder"
 system_prompt: |
   Ты — агент code reviewer. Ты получаешь код от другого агента.

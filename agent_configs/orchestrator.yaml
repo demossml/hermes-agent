@@ -1,6 +1,8 @@
 # Orchestrator — главный агент, маршрутизация и синтез
 agent_id: orchestrator
 provider: current
+level: 0
+parent_id: orchestrator
 description: "Главный агент — маршрутизация и синтез"
 system_prompt: |
   Ты — главный оркестратор Hermes. Твоя роль: маршрутизация задач, не выполнение.
