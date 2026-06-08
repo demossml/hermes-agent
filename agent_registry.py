@@ -384,27 +384,33 @@ class AgentRegistry:
     ) -> str:
         """Route message through orchestrator agent.
 
-        Two-phase: Phase 1 asks for delegation plan (DELEGATE lines or NONE).
+        Adaptive: Phase 0 classifies task complexity with ultra-cheap prompt.
+        Simple tasks → direct answer (1 call, ~300 tokens).
+        Complex tasks → full delegation pipeline (3-4 calls).
+
+        Phase 1 asks for delegation plan (DELEGATE lines or NONE).
         Phase 2: if delegation happened, gather results and synthesize.
-        If NONE, ask orchestrator to answer directly.
         """
         if "orchestrator" not in self._agents:
             return "Error: orchestrator agent not registered. Add agent_configs/orchestrator.yaml"
+
+        # ── Phase 0: classify complexity (cheap) ──────────────────────
+        is_complex = await self._classify_complexity(message)
+        if not is_complex:
+            # Simple task — direct answer, 1 API call
+            return await self._ask_orchestrator_direct(session_id, message)
 
         plan = await self._ask_orchestrator(session_id, message)
 
         # Parse delegation directives
         stages = self._parse_delegates(plan)
         if not stages:
-            # NONE or no valid DELEGATE — ask orchestrator to answer directly
             if "NONE" in plan.upper():
                 return await self._ask_orchestrator_direct(session_id, message)
-            return plan  # orchestrator answered something (fallback)
+            return plan
 
-        # Execute stages (supports DAG chaining)
         all_results = await self._execute_stages(session_id, stages)
 
-        # Phase 2: ask orchestrator to synthesize
         results_text = "\n\n".join(
             f"[{aid}]: {res}" if not isinstance(res, Exception) else f"[{aid}]: ERROR: {res}"
             for aid, res in all_results.items()
@@ -414,6 +420,37 @@ class AgentRegistry:
             f"Sub-agents completed their tasks:\n\n{results_text}\n\n"
             "Synthesize a final answer. Combine results, don't mention internal steps.",
         )
+
+    async def _classify_complexity(self, message: str) -> bool:
+        """Ultra-cheap classification: ~100 input + 1 output token.
+
+        Asks the model: SIMPLE (one-step, one-domain, no code) or COMPLEX?
+        Returns True for COMPLEX, False for SIMPLE.
+        """
+        # Use orchestrator's model for classification
+        cfg = self._agents.get("orchestrator", {})
+        provider = self._get_agent("orchestrator", cfg, "classify")
+
+        classify_prompt = (
+            "Classify this task: reply ONLY \"SIMPLE\" or \"COMPLEX\".\n"
+            "SIMPLE = one domain, no code, answerable in one step.\n"
+            "COMPLEX = multiple steps, requires code, research, or 2+ domains.\n\n"
+            f"Task: {message[:300]}"
+        )
+
+        try:
+            result = provider.run_conversation(classify_prompt)
+            reply = result.get("final_response", "") if isinstance(result, dict) else str(result)
+            is_complex = "COMPLEX" in reply.upper() and "SIMPLE" not in reply.upper()
+            logger.debug(
+                f"Complexity classifier: '{message[:60]}...' → "
+                f"{'COMPLEX' if is_complex else 'SIMPLE'} "
+                f"(raw: {reply[:50]})"
+            )
+            return is_complex
+        except Exception as e:
+            logger.warning(f"Classifier failed, defaulting to COMPLEX: {e}")
+            return True  # Safe default: if classifier fails, delegate
 
     async def _ask_orchestrator_direct(self, session_id: str, message: str) -> str:
         """Ask orchestrator to answer directly (no delegation format)."""
