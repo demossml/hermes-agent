@@ -503,83 +503,96 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
         self._instances.pop("orchestrator", None)
         return plan
 
-    def _parse_delegates(self, reply: str) -> Dict[str, List[tuple]]:
-        """Parse DELEGATE directives into execution stages.
+    def _parse_delegates(self, reply: str) -> Dict[str, dict]:
+        """Parse DELEGATE directives from orchestrator response.
 
-        Returns: {agent_id: [(task, next_agent_id|None), ...]}
-        Stages with next_agent_id=None are parallel (same level).
-        Stages with next_agent_id set form a chain.
+        Format:
+            DELEGATE: coder | write sort function | -> reviewer
+            DELEGATE: researcher | explain RAG
+
+        Returns: {agent_id: {"task": str, "next_agent": str|None}}
         """
-        stages: Dict[str, List[tuple]] = {}
+        stages: Dict[str, dict] = {}
         for line in reply.split("\n"):
             line = line.strip()
             if not line.startswith("DELEGATE:"):
                 continue
             body = line[9:].strip()
-            # Parse: agent_id | task [| -> next_agent_id]
-            if "| ->" in body:
-                main_part, chain_target = body.split("| ->", 1)
-                next_agent = chain_target.strip() if chain_target.strip() in self._agents else None
-            elif "|->" in body:
-                main_part, chain_target = body.split("|->", 1)
-                next_agent = chain_target.strip() if chain_target.strip() in self._agents else None
-            else:
-                main_part = body
-                next_agent = None
-
-            parts = main_part.split("|", 1)
-            if len(parts) != 2:
+            # Parse three parts: agent_id | task | -> next_agent (optional)
+            parts = [p.strip() for p in body.split("|")]
+            if len(parts) < 2:
                 logger.warning(f"Invalid DELEGATE format: {line}")
                 continue
-            aid = parts[0].strip()
-            task = parts[1].strip()
-            if aid not in self._agents or aid == "orchestrator":
-                logger.warning(f"Unknown agent in DELEGATE: {aid}")
+            agent_id = parts[0]
+            task = parts[1]
+            next_agent = None
+            if len(parts) >= 3:
+                third = parts[2]
+                if third.startswith("->"):
+                    next_agent = third[2:].strip()
+                    if next_agent not in self._agents:
+                        logger.warning(f"Unknown next_agent in DELEGATE: {next_agent}")
+                        next_agent = None
+            if agent_id not in self._agents or agent_id == "orchestrator":
+                logger.warning(f"Unknown agent in DELEGATE: {agent_id}")
                 continue
-            stages.setdefault(aid, []).append((task, next_agent))
+            stages[agent_id] = {"task": task, "next_agent": next_agent}
         return stages
 
     async def _execute_stages(
-        self, session_id: str, stages: Dict[str, List[tuple]]
+        self, session_id: str, stages: Dict[str, dict]
     ) -> Dict[str, str]:
         """Execute delegation stages with DAG support.
 
-        Parallel agents run via asyncio.gather.
-        Chained agents run sequentially (output of A → input of B).
+        For chains like DELEGATE: coder | task | -> reviewer:
+        - coder receives the original task
+        - reviewer receives coder's OUTPUT as context in their task
+
+        Error guard: if a stage fails, downstream agents are skipped.
         """
         all_results: dict[str, str] = {}
-
-        # Collect all tasks: parallel + chain starters
-        parallel_tasks = {}
+        # Separate into parallel (no next_agent) and chains (with next_agent)
         chain_tasks = []  # [(agent_id, task, next_agent_id)]
 
-        for aid, tasks in stages.items():
-            for task, next_agent in tasks:
-                if next_agent:
-                    chain_tasks.append((aid, task, next_agent))
-                else:
-                    parallel_tasks.setdefault(aid, []).append(task)
+        for agent_id, stage in stages.items():
+            task = stage["task"]
+            next_agent = stage.get("next_agent")
+            if next_agent:
+                chain_tasks.append((agent_id, task, next_agent))
+            else:
+                # Parallel — no downstream dependency
+                all_results[agent_id] = task  # placeholder, resolved below
 
         # Run parallel agents
-        if parallel_tasks:
-            combined = {}
-            for aid, task_list in parallel_tasks.items():
-                combined[aid] = "; ".join(task_list)
+        parallel = {aid: t for aid, t in all_results.items() if isinstance(t, str)}
+        if parallel:
             parallel_results = await asyncio.gather(
-                *[self.call(aid, session_id, task) for aid, task in combined.items()],
+                *[self.call(aid, session_id, task) for aid, task in parallel.items()],
                 return_exceptions=True,
             )
-            for (aid, _), res in zip(combined.items(), parallel_results):
+            for (aid, _), res in zip(parallel.items(), parallel_results):
                 all_results[aid] = str(res) if not isinstance(res, Exception) else f"ERROR: {res}"
 
-        # Run chains sequentially
+        # Run chains sequentially — downstream gets upstream OUTPUT
         for aid, task, next_agent in chain_tasks:
             result = await self.call(aid, session_id, task)
             all_results[aid] = result
-            if next_agent and not isinstance(result, Exception):
-                chain_task = f"Based on previous agent's output:\n\n{result}\n\nYour task: analyse and provide your expertise."
-                chain_result = await self.call(next_agent, session_id, chain_task)
-                all_results[next_agent] = chain_result
+
+            # Skip downstream if upstream failed
+            if isinstance(result, str) and (result.startswith("Error:") or result.startswith("ERROR:")):
+                all_results[f"{aid}→{next_agent}"] = f"[{next_agent} skipped: {aid} failed]"
+                continue
+
+            if next_agent and next_agent in self._agents:
+                # Pass upstream OUTPUT as context to downstream agent
+                downstream_task = (
+                    f"{task}\n\n"
+                    f"---\n"
+                    f"Output from [{aid}]:\n\n"
+                    f"{result}"
+                )
+                downstream_result = await self.call(next_agent, session_id, downstream_task)
+                all_results[f"{aid}→{next_agent}"] = downstream_result
 
         return all_results
 
