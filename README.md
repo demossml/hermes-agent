@@ -37,7 +37,14 @@
 - **Цветная иерархия** — level 0 (синий), level 1 (зелёный), level 2+ (жёлтый)
 - **@mention роутинг** — `@coder напиши сортировку` в Telegram/Discord
 - **Slash-команды** — `/agent`, `/orchestrate`, `/subagents`, `/agent-off`
-- **provider: current** — подагенты используют тот же провайдер что и главный Hermes
+
+### Per-Agent LLM Config
+- **Индивидуальный провайдер** — каждый агент на своём провайдере (anthropic/deepseek/openai)
+- **Наследование** — подагенты наследуют provider, model, temperature от родителя
+- **Smart fallback** — автоматическое переключение на следующую модель из `fallback_models`
+- **Auto-select** — cheapest/fastest/balanced выбор модели из доступных
+- **Propagation** — изменение настроек родителя → вся ветка
+- **CLI управление** — `/subagents provider` для просмотра и настройки
 
 ## Архитектура
 
@@ -130,6 +137,14 @@ python install_hooks.py
 
 # Оркестратор
 /orchestrate исследуй и напиши бенчмарк
+
+# ── Per-agent LLM config ─────────────────────
+/subagents provider coder                     # показать настройки LLM
+/subagents provider coder set anthropic claude-3-opus
+/subagents provider coder set-param temperature 0.3
+/subagents provider coder fallback             # fallback-модели
+/subagents provider coder reset                # сброс к дефолтам
+/subagents provider list                       # список провайдеров
 ```
 
 ## Gateway (Telegram / Discord)
@@ -153,6 +168,20 @@ subtree_session_id: subtree-coder
 description: "Пишет код"
 system_prompt: |
   Ты — агент-программист.
+
+# ── LLM Config ──────
+provider: anthropic
+model: claude-3-5-sonnet-20240620
+temperature: 0.7
+max_tokens: 8192
+top_p: 0.95
+fallback_models:
+  - claude-3-opus-20240229
+  - claude-3-haiku-20240307
+priority: 2
+auto_select: balanced
+reasoning_effort: medium
+inherit_from_parent: true
 
 # ── RuleEngine ──────
 critical_rules:
@@ -207,6 +236,13 @@ async def main():
     # Дерево иерархии
     print(r.get_tree())
 
+    # ── LLM Config ──────────────────────────
+    r.update_provider("coder", "anthropic", "claude-opus", caller_id="orchestrator")
+    r.update_config_param("coder", "temperature", 0.3, caller_id="orchestrator")
+    r.propagate_to_subtree("coder", {"temperature": 0.5}, caller_id="orchestrator")
+    effective = r.get_effective_config("coder")
+    print(f"Effective: {effective['provider']}/{effective['model']} t={effective['temperature']}")
+
 asyncio.run(main())
 ```
 
@@ -217,6 +253,7 @@ asyncio.run(main())
 | Создать агента | под любым parent | только parent=self |
 | Вызвать агента | любого | только потомков |
 | Менять tools | любому | себе и потомкам |
+| Менять LLM config | любому | себе и потомкам |
 | Читать память | любой ветки | только своей |
 | Удалить агента | любого | только своих детей |
 
