@@ -465,6 +465,36 @@ class AgentRegistry:
                 )
                 reply = result.get("final_response", "") if isinstance(result, dict) else str(result)
 
+                # ── RuleChecker: self-correction loop ─────────────────
+                cfg_for_check = cfg
+                rules = cfg_for_check.get("critical_rules", [])
+                if rules:
+                    for correction_attempt in range(2):
+                        violations = self._check_violations(agent_id, reply)
+                        if not violations:
+                            break
+                        # Increment violation counter
+                        self._stats.setdefault(agent_id, {}).setdefault("violations", 0)
+                        self._stats[agent_id]["violations"] += 1
+                        logger.warning(
+                            f"Agent '{agent_id}' violated rules "
+                            f"(attempt {correction_attempt+1}/2): {violations}"
+                        )
+                        # Send correction
+                        correction_msg = (
+                            f"[VIOLATION] You violated critical rules: {', '.join(violations)}. "
+                            f"Re-read [CRITICAL RULES] and answer again."
+                        )
+                        result = agent.run_conversation(
+                            correction_msg,
+                            conversation_history=conversation_history,
+                        )
+                        reply = result.get("final_response", "") if isinstance(result, dict) else str(result)
+                    else:
+                        # After 2 failed attempts — mark as violation
+                        reply = f"[⚠ Нарушение правил: {', '.join(violations[:2])}]\n\n{reply}"
+                # ───────────────────────────────────────────────────────
+
                 self._save_turn(agent_id, session_id, msg, reply)
                 self._track_call(agent_id, t0, len(reply) // 4)
                 return reply
@@ -480,14 +510,37 @@ class AgentRegistry:
 
         return f"Error from agent '{agent_id}': {last_error}"
 
-    def _check_isolation(self, caller_id: str, agent_id: str, target_cfg: dict) -> str | None:
-        """Check if caller is allowed to call target. Returns error string or None.
+    def _check_violations(self, agent_id: str, reply: str) -> "list[str]":
+        """Check agent reply against its critical_rules. Returns list of violated rules.
 
-        Rules:
-        - orchestrator (level 0) → any agent
-        - sub-agent → its direct and indirect descendants (via _is_descendant)
-        - Forbidden: horizontal (same level), upward (parent), cross-branch (unrelated)
+        Uses keyword matching for speed (no LLM call).
         """
+        cfg = self._agents.get(agent_id, {})
+        rules = cfg.get("critical_rules", [])
+        if not rules or not reply:
+            return []
+
+        # Keyword patterns that indicate rule violations
+        # Each rule is checked with simple substring matching
+        violations = []
+        reply_lower = reply.lower()
+
+        for rule in rules:
+            r = rule.lower()
+            # Rule: "НЕ пиши код" → check for code blocks
+            if ("не пиши код" in r or "не пиши код" in r) and ("```" in reply or "def " in reply):
+                violations.append(rule)
+            # Rule: "DELEGATE" → check for missing delegate when code present
+            if "delegate" in r and ("```" in reply or "def " in reply) and "delegate:" not in reply_lower:
+                violations.append(rule)
+            # Rule: "НЕ используй terminal" → check for execute/terminal
+            if "не используй terminal" in r or "не используй execute" in r:
+                if "execute_code" in reply or "subprocess" in reply or "terminal(" in reply:
+                    violations.append(rule)
+
+        return list(set(violations))  # deduplicate
+
+    def _check_isolation(self, caller_id: str, agent_id: str, target_cfg: dict) -> str | None:
         if caller_id == "orchestrator" or caller_id not in self._agents:
             return None  # orchestrator can call anyone
 
