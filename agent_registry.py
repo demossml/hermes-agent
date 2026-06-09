@@ -1090,7 +1090,16 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
             agent = self._get_agent(agent_id, self._agents.get(agent_id, {}), session_id)
             summary_result = agent.run_conversation(summary_prompt)
             summary = summary_result.get("final_response", "") if isinstance(summary_result, dict) else str(summary_result)
-            compact = [{"role": "system", "content": f"[History summary]: {summary}"}]
+
+            # Preserve critical rules in the compressed context
+            cfg = self._agents.get(agent_id, {})
+            rules = cfg.get("critical_rules", [])
+            rules_block = ""
+            if rules:
+                rules_brief = "; ".join(r[:60] for r in rules[:5])
+                rules_block = f"\n[RULES STILL APPLY: {rules_brief}]"
+
+            compact = [{"role": "system", "content": f"[History summary]: {summary}{rules_block}"}]
             logger.info(f"Summarized {len(old_msgs)} messages → {len(summary)} chars for {agent_id}")
             return compact + recent_msgs
         except Exception as e:
