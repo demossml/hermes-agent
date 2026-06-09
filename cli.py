@@ -9739,8 +9739,65 @@ class HermesCLI:
                     "description": f"Created by {caller}",
                     "max_iterations": 5,
                 }, caller_id=caller)
+
+                # ── Build a rich success message ──────────────────
                 level = created.get("level", 1)
-                _cprint(f"  ✅ Субагент '{agent_id}' создан (level {level}, parent: {parent_id})")
+                provider = created.get("provider", "?")
+                model = created.get("model", "") or created.get("_fallback_model", "")
+                subtree = created.get("subtree_session_id", "?")
+                inherit_from = created.get("inherit_from_parent", True)
+                parent_name = created.get("parent_id", "?")
+
+                # Provider display
+                if provider == "current":
+                    # Resolve what "current" actually means
+                    from hermes_cli.runtime_provider import resolve_runtime_provider
+                    try:
+                        rt = resolve_runtime_provider(requested=None, target_model=None)
+                        provider_display = rt.get("provider", provider)
+                        model_display = rt.get("model", model) or model
+                    except Exception:
+                        provider_display = provider
+                        model_display = model
+                else:
+                    provider_display = provider
+                    model_display = model
+
+                provider_line = f"{provider_display}"
+                if model_display:
+                    # Shorten long model names
+                    short_model = model_display.split("/")[-1] if "/" in model_display else model_display
+                    provider_line += f" ({short_model})"
+                if inherit_from:
+                    provider_line += " — унаследован"
+
+                # Tools description
+                ets = created.get("enabled_toolsets")
+                if ets is None:
+                    tools_line = "ALL (полный клон Гермеса)"
+                elif len(ets) == 0:
+                    tools_line = "none (sandboxed — без инструментов)"
+                else:
+                    tools_line = ", ".join(ets)
+
+                # Config path
+                config_path = f"agent_configs/{agent_id}.yaml"
+
+                _cprint("")
+                _cprint(f"  [bold green]✅ Субагент '{agent_id}' успешно создан[/]")
+                _cprint("")
+                _cprint(f"  Level:    {level} | Parent: {parent_name}")
+                _cprint(f"  Provider: {provider_line}")
+                _cprint(f"  Tools:    {tools_line}")
+                _cprint(f"  Memory:   {subtree} (изолирована)")
+                _cprint(f"  Config:   {config_path}")
+                _cprint("")
+                _cprint("  [bold]Доступные команды:[/]")
+                _cprint(f"    /agent {agent_id} <задача>                 — отправить задачу")
+                _cprint(f"    /subagents tools {agent_id}                — управление инструментами")
+                _cprint(f"    /subagents memory {agent_id}               — просмотреть память")
+                _cprint(f"    /subagents tree                            — посмотреть иерархию")
+                _cprint("")
             except PermissionError as e:
                 _cprint(f"  [red]❌ {e}[/]")
             except Exception as e:
