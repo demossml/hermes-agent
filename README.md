@@ -46,6 +46,12 @@
 - **Propagation** — изменение настроек родителя применяется ко всей ветке
 - **CLI-управление** — `/subagents provider` для просмотра и настройки
 
+### Безопасное обновление
+- **`multiagent_updater`** — миграция конфигов с сохранением provider/model
+- **Бэкап** — автоматический бэкап в `backups/` перед изменениями
+- **Dry-run** — `/hermes-update --dry-run` показывает что изменится без правок
+- **Сброс LLM** — `/hermes-update --reset-llm` для принудительного сброса (опционально)
+
 ---
 
 ## Архитектура
@@ -162,6 +168,11 @@ python install_hooks.py
 /subagents provider coder fallback             # fallback-модели
 /subagents provider coder reset                # сброс к дефолтам
 /subagents provider list                       # список провайдеров
+
+# Безопасное обновление
+/hermes-update                                  # миграция конфигов
+/hermes-update --dry-run                        # показать что изменится
+/hermes-update --reset-llm                      # полный сброс LLM-настроек
 ```
 
 ---
@@ -304,8 +315,11 @@ multi-agent/                           ← ветка
 │   ├── reviewer.yaml                  ← L1, subtree-reviewer
 │   └── summarizer.yaml                ← L1, subtree-summarizer
 ├── cli.py                             ← /subagents, /agent-off, индикатор
+├── multiagent_updater.py              ← безопасная миграция конфигов
 ├── hermes_cli/
 │   └── commands.py                    ← CommandDef для новых команд
+├── tests/
+│   └── test_multiagent_updater.py     ← тесты миграции
 ├── gateway/
 │   ├── agent_mention.py               ← @mention-роутинг
 │   └── run.py                         ← диспетчеризация
