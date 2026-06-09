@@ -9749,17 +9749,51 @@ class HermesCLI:
                     _cprint(f"  Toolsets: {enabled}")
 
         elif action == "memory":
-            agent_id = args.strip()
+            # /subagents memory <agent_id> [--limit 50] [--full]
+            # Only orchestrator can read any branch's memory
+            parts_remain = args.split()
+            agent_id = parts_remain[0] if parts_remain else ""
             if not agent_id:
-                _cprint("  Usage: /subagents memory <agent_id>")
+                _cprint("  Usage: /subagents memory <agent_id> [--limit N] [--full]")
                 return
+
             cfg = registry.get(agent_id)
             if not cfg:
                 _cprint(f"  [red]Agent '{agent_id}' not found[/]")
                 return
-            # Show last 5 messages from this agent's memory
-            _cprint(f"  Memory for '{agent_id}' (last 5 turns):")
-            _cprint(f"  [dim](SessionDB integration needed for full history)[/]")
+
+            # Parse flags
+            limit = 20
+            full = False
+            for p in parts_remain[1:]:
+                if p == "--full":
+                    full = True
+                elif p.startswith("--limit="):
+                    limit = int(p.split("=", 1)[1])
+                elif p == "--limit" and parts_remain.index(p) + 1 < len(parts_remain):
+                    limit = int(parts_remain[parts_remain.index(p) + 1])
+
+            subtree = cfg.get("subtree_session_id", f"subtree-{agent_id}")
+            level = cfg.get("level", "?")
+
+            msgs = registry.get_subtree_memory(agent_id, limit=999 if full else limit)
+            if not msgs:
+                _cprint(f"  Память '{agent_id}' [L{level}] subtree={subtree[:30]}...")
+                _cprint(f"  [dim]Нет сообщений[/]")
+                return
+
+            ROLE_ICONS = {"user": "👤", "assistant": "🤖", "system": "⚙️", "tool": "🔧"}
+            _cprint(f"\n  Память ветки '{agent_id}' [L{level}] — {len(msgs)} сообщений")
+            _cprint(f"  subtree: {subtree}")
+            _cprint(f"  {'─' * 50}")
+            for m in msgs:
+                icon = ROLE_ICONS.get(m["role"], "❓")
+                content = m["content"]
+                if not full and len(content) > 120:
+                    content = content[:120] + "..."
+                role_color = {"user": "dim", "assistant": "green", "system": "yellow", "tool": "blue"}.get(m["role"], "")
+                _cprint(f"  {icon} [{role_color}]{m['role']}[/]: {content}")
+            _cprint(f"  {'─' * 50}")
 
         elif action == "delete":
             agent_id = args.strip()

@@ -501,14 +501,40 @@ class AgentRegistry:
         st["tokens"] += tokens
         st["total_ms"] += elapsed
 
+    def get_subtree_memory(self, agent_id: str, limit: int = 50) -> List[Dict]:
+        """Read the shared memory of an agent's entire branch.
+
+        Returns the conversation history from the agent's subtree_session_id.
+        Only orchestrator can read any branch's memory.
+        Sub-agents can only read their own branch (implicit — they use their own subtree).
+
+        Returns list of {role, content, timestamp} dicts.
+        """
+        cfg = self._agents.get(agent_id)
+        if not cfg:
+            return []
+        subtree = cfg.get("subtree_session_id", f"subtree-{agent_id}")
+        if not self._db:
+            return []
+
+        try:
+            msgs = self._db.get_messages_as_conversation(subtree)
+            if not msgs:
+                return []
+            result = [
+                {"role": m.get("role", "?"), "content": m.get("content", ""),
+                 "timestamp": m.get("created_at", m.get("timestamp", ""))}
+                for m in msgs[-limit:]
+            ]
+            return result
+        except Exception as e:
+            logger.warning(f"Failed to read subtree memory for {agent_id}: {e}")
+            return []
+
     @staticmethod
     def get_agent_session_id(session_id: str, agent_id: str) -> str:
-        """Return the isolated session namespace for an agent.
-
-        Uses subtree_session_id from agent config for branch-based memory isolation.
-        All agents in the same branch share one session.
-        """
-        return session_id  # caller should use subtree_session_id directly
+        """Return session_id as-is (subtree_session_id handles isolation)."""
+        return session_id
 
     def _load_history(self, agent_id: str, session_id: str) -> List[Dict]:
         """Load conversation history using subtree_session_id for branch isolation.
