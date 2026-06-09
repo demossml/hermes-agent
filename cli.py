@@ -9747,10 +9747,12 @@ class HermesCLI:
                 _cprint(f"  [red]Error: {e}[/]")
 
         elif action == "tools":
-            # /subagents tools <id> [set <tool1,tool2,...>]
+            # /subagents tools <id> [set <tool1,...>]  — replace all tools
+            # /subagents tools <id> add <tool1,...>    — add to existing
+            # /subagents tools <id>                    — show current tools
             sub_parts = args.split()
             if not sub_parts:
-                _cprint("  Usage: /subagents tools <id> [set <tool1,tool2,...>]")
+                _cprint("  Usage: /subagents tools <id> [set|add <tool1,tool2,...>]")
                 return
             agent_id = sub_parts[0]
             cfg = registry.get(agent_id)
@@ -9758,27 +9760,50 @@ class HermesCLI:
                 _cprint(f"  [red]Agent '{agent_id}' not found[/]")
                 return
 
-            if len(sub_parts) >= 3 and sub_parts[1] == "set":
-                # Set new tools
-                tools = sub_parts[2].split(",")
+            sub_action = sub_parts[1] if len(sub_parts) >= 2 else ""
+            raw_tools = sub_parts[2] if len(sub_parts) >= 3 else ""
+
+            if sub_action in ("set", "add") and raw_tools:
+                new_tools = [t.strip() for t in raw_tools.split(",") if t.strip()]
                 caller = _active_subagent["name"] if _active_subagent else "orchestrator"
+
+                if sub_action == "add":
+                    # Merge with existing tools
+                    current = cfg.get("enabled_toolsets")
+                    if current is None:
+                        # Agent currently has ALL tools — adding is
+                        # a no-op since they already have everything.
+                        _cprint(f"  ℹ️  Agent '{agent_id}' already has ALL tools (full clone)")
+                        return
+                    merged = list(set(current) | set(new_tools))
+                    new_tools = merged
+
                 try:
-                    registry.update_tools(agent_id, tools, caller_id=caller)
-                    _cprint(f"  ✅ Tools for '{agent_id}' set to: {tools}")
+                    registry.update_tools(agent_id, new_tools, caller_id=caller)
+                    desc = "ALL (full clone)" if new_tools is None else str(new_tools)
+                    verb = "updated" if sub_action == "add" else "set"
+                    _cprint(f"  ✅ Tools {verb}: {desc}")
                 except PermissionError as e:
                     _cprint(f"  [red]❌ {e}[/]")
                 except Exception as e:
                     _cprint(f"  [red]Error: {e}[/]")
+            elif sub_action in ("set", "add"):
+                _cprint(f"  Usage: /subagents tools {agent_id} {sub_action} tool1,tool2,...")
             else:
                 # Show current tools
-                tools = cfg.get("tools", [])
-                enabled = cfg.get("enabled_toolsets", [])
+                toolsets = cfg.get("enabled_toolsets")
                 parent = cfg.get("parent_id", "?")
                 level = cfg.get("level", "?")
+
+                if toolsets is None:
+                    tools_desc = "ALL (полный клон — все инструменты основного агента)"
+                elif len(toolsets) == 0:
+                    tools_desc = "(none — sandboxed)"
+                else:
+                    tools_desc = ", ".join(toolsets)
+
                 _cprint(f"  Agent: {agent_id} [L{level}] parent={parent}")
-                _cprint(f"  Tools: {tools if tools else '(none)'}")
-                if enabled:
-                    _cprint(f"  Toolsets: {enabled}")
+                _cprint(f"  Toolsets: {tools_desc}")
 
         elif action == "provider":
             # /subagents provider <id> [set|set-param|fallback|list|reset]

@@ -99,6 +99,7 @@ class AgentRegistry:
         config.setdefault("model", "claude-sonnet-4-20250514")
         config.setdefault("system_prompt", "You are a helpful assistant.")
         config.setdefault("tools", [])
+        config.setdefault("enabled_toolsets", None)  # None = all tools (full clone)
         config.setdefault("critical_rules", [])
         config.setdefault("max_context_tokens", 8000)
         config.setdefault("max_iterations", 3)
@@ -228,20 +229,115 @@ class AgentRegistry:
             )
 
     def update_tools(
-        self, agent_id: str, tools: list, caller_id: str = "orchestrator"
-    ) -> None:
-        """Update agent's toolset with permission check.
+        self, agent_id: str, toolsets: List[str] | None, caller_id: str = "orchestrator"
+    ) -> dict:
+        """Update agent's enabled toolsets with permission check.
 
+        Writes to enabled_toolsets (the field AIAgent actually reads),
+        persists the change to YAML, and forces recreation of the cached
+        AIAgent instance so the new toolset takes effect immediately.
+
+        Rules:
         - orchestrator (level 0) → any agent
         - sub-agent → only self and descendants
+
+        Args:
+            agent_id:  Target agent to modify.
+            toolsets:  List of toolset names to enable (e.g. ['terminal','file']).
+                       None means "all tools" (full clone — no restriction).
+                       Empty list [] means "no tools" (sandboxed agent).
+            caller_id: Who is making the change (permission check).
+
+        Returns:
+            The updated agent config dict.
+
+        Raises:
+            PermissionError if caller lacks permission.
+            KeyError if agent_id not found.
         """
+        # ── Permission guard ────────────────────────────────────────
         self._check_tool_permission(caller_id, agent_id)
         if agent_id not in self._agents:
             raise KeyError(f"Agent '{agent_id}' not found.")
 
-        self._agents[agent_id]["tools"] = tools
-        self._instances.pop(agent_id, None)  # force recreate with new tools
-        logger.info(f"Tools updated for '{agent_id}' by '{caller_id}': {tools}")
+        # ── Apply the change ────────────────────────────────────────
+        # Write to enabled_toolsets (the field AIAgent._get_agent reads),
+        # NOT to cfg["tools"] (legacy field, never consumed by AIAgent).
+        self._agents[agent_id]["enabled_toolsets"] = toolsets
+
+        # Force recreation of cached AIAgent so the new toolset takes
+        # effect on the very next call()/stream().
+        self._instances.pop(agent_id, None)
+
+        # Persist the updated config to agent_configs/{agent_id}.yaml
+        # so the change survives restarts and hot-reloads.
+        self._persist_agent_config(agent_id)
+
+        tools_desc = (
+            "ALL (full clone)" if toolsets is None
+            else "none (sandboxed)" if len(toolsets) == 0
+            else str(toolsets)
+        )
+        logger.info(
+            f"Tools updated for '{agent_id}' by '{caller_id}': {tools_desc}"
+        )
+
+        return self._agents[agent_id]
+
+    def _persist_agent_config(self, agent_id: str) -> None:
+        """Write the in-memory agent config back to agent_configs/{agent_id}.yaml.
+
+        Called automatically by update_tools(), update_provider(),
+        update_config_param(), and any other mutator that needs the
+        change to survive restarts and hot-reloads.
+
+        Only persists keys that belong in the YAML file — runtime-only
+        keys like _fallback_model are excluded.
+        """
+        cfg = self._agents.get(agent_id)
+        if not cfg:
+            return
+
+        yaml_path = self._config_dir / f"{agent_id}.yaml"
+
+        # ── Build the persistable subset of config ──────────────────
+        persist_cfg: dict = {}
+
+        # Identity & hierarchy
+        for key in ("agent_id", "parent_id", "level", "subtree_session_id",
+                     "description", "system_prompt"):
+            if key in cfg:
+                persist_cfg[key] = cfg[key]
+
+        # LLM configuration
+        for key in ("provider", "model", "temperature", "max_tokens", "top_p",
+                     "fallback_models", "priority", "auto_select",
+                     "reasoning_effort", "inherit_from_parent"):
+            if key in cfg:
+                persist_cfg[key] = cfg[key]
+
+        # Behaviour
+        for key in ("critical_rules", "rule_reminder_every",
+                     "max_context_tokens", "max_iterations"):
+            if key in cfg:
+                persist_cfg[key] = cfg[key]
+
+        # Tools — None means "all tools" (full clone), omit from YAML
+        # so reload preserves the "unrestricted" semantics.
+        if "enabled_toolsets" in cfg and cfg["enabled_toolsets"] is not None:
+            persist_cfg["enabled_toolsets"] = cfg["enabled_toolsets"]
+
+        # ── Write atomically (write + rename would be ideal, but
+        #    yaml.dump is idempotent enough for our use case) ────────
+        try:
+            with open(yaml_path, "w") as f:
+                yaml.dump(persist_cfg, f, allow_unicode=True,
+                          default_flow_style=False, sort_keys=False)
+            logger.debug(f"Persisted agent config: {yaml_path}")
+        except Exception as e:
+            logger.warning(
+                f"Failed to persist agent config for '{agent_id}': {e}"
+            )
 
     # ── LLM Config Management ────────────────────────────────
 
@@ -268,6 +364,7 @@ class AgentRegistry:
         if model:
             cfg["model"] = model
         self._instances.pop(target_id, None)
+        self._persist_agent_config(target_id)
         logger.info(f"Provider for '{target_id}' set to {provider}/{cfg.get('model','?')} by '{caller_id}'")
 
     def update_config_param(self, target_id: str, param_name: str, value,
@@ -281,6 +378,7 @@ class AgentRegistry:
             raise ValueError(f"Unknown param: {param_name}. Valid: {sorted(valid_params)}")
         self._agents[target_id][param_name] = value
         self._instances.pop(target_id, None)
+        self._persist_agent_config(target_id)
         logger.info(f"Config '{param_name}' for '{target_id}' set to {value} by '{caller_id}'")
 
     def propagate_to_subtree(self, root_id: str, updates: dict,
@@ -292,6 +390,7 @@ class AgentRegistry:
             if aid == root_id or self._is_descendant(root_id, aid):
                 cfg.update(updates)
                 self._instances.pop(aid, None)
+                self._persist_agent_config(aid)
                 count += 1
         logger.info(f"Propagated config to {count} agents in subtree of '{root_id}'")
         return count
@@ -469,35 +568,11 @@ class AgentRegistry:
 
         self.register(agent_id, config)
 
-        # Persist to YAML
+        # Persist to YAML using the shared helper so create() and
+        # update_tools() use identical serialization logic.
         yaml_path = self._config_dir / f"{agent_id}.yaml"
         try:
-            persist_cfg = {
-                "agent_id": agent_id,
-                "parent_id": parent_id,
-                "level": config.get("level", 1),
-                "subtree_session_id": subtree_session_id,
-                "provider": config.get("provider", "current"),
-                "model": config.get("model", ""),
-                "temperature": config.get("temperature", 0.7),
-                "max_tokens": config.get("max_tokens", 8192),
-                "top_p": config.get("top_p", 0.95),
-                "fallback_models": config.get("fallback_models", []),
-                "priority": config.get("priority", 2),
-                "auto_select": config.get("auto_select", "none"),
-                "reasoning_effort": config.get("reasoning_effort", "medium"),
-                "inherit_from_parent": config.get("inherit_from_parent", True),
-                "description": config.get("description", ""),
-                "system_prompt": config.get("system_prompt", ""),
-                "critical_rules": config.get("critical_rules", []),
-                "rule_reminder_every": config.get("rule_reminder_every", 0),
-                "max_context_tokens": config.get("max_context_tokens", 8000),
-                "max_iterations": config.get("max_iterations", 3),
-            }
-            if config.get("enabled_toolsets"):
-                persist_cfg["enabled_toolsets"] = config["enabled_toolsets"]
-            with open(yaml_path, "w") as f:
-                yaml.dump(persist_cfg, f, allow_unicode=True, default_flow_style=False)
+            self._persist_agent_config(agent_id)
             logger.info(
                 f"Created agent '{agent_id}' "
                 f"(level={config.get('level')}, parent={parent_id}, "
@@ -1421,7 +1496,14 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
                 session_db=self._db,
                 session_id=session_id or cfg.get("session_id", f"agent-{agent_id}"),
                 max_iterations=cfg.get("max_iterations", 3),
-                enabled_toolsets=cfg.get("enabled_toolsets") or None,
+                # Get enabled_toolsets carefully: empty list [] is falsy in
+                # Python, so `cfg.get(...) or None` would turn an explicit
+                # "no tools" request into "all tools".  We check is None
+                # explicitly instead.
+                enabled_toolsets=(
+                    None if cfg.get("enabled_toolsets") is None
+                    else cfg["enabled_toolsets"]
+                ),
             )
 
         return self._instances[agent_id]
