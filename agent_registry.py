@@ -200,13 +200,39 @@ class AgentRegistry:
         self._instances.clear()
         return self.load_all()
 
-    def create(self, agent_id: str, config: dict) -> dict:
+    def create(self, agent_id: str, config: dict, caller_id: str = "orchestrator") -> dict:
         """Create and register a new agent at runtime.
 
-        Auto-computes level from parent_id. Only orchestrator creates level-1 agents.
+        Permission rules:
+        - orchestrator (level 0) can create agents under any parent
+        - sub-agent (level ≥ 1) can only create agents with parent_id = their own id
+        - sub-agent CANNOT create agents under another parent
+
+        Auto-computes level from parent_id.
         Saves config to agent_configs/{agent_id}.yaml so it survives restarts.
         """
-        parent_id = config.get("parent_id", "orchestrator")
+        parent_id = config.get("parent_id", caller_id)
+
+        # ── Permission check ──────────────────────────────────────────
+        if caller_id != "orchestrator" and caller_id in self._agents:
+            caller_cfg = self._agents[caller_id]
+            caller_level = caller_cfg.get("level", 1)
+
+            # Sub-agent can only create children under itself
+            if parent_id != caller_id:
+                raise PermissionError(
+                    f"Agent '{caller_id}' (level {caller_level}) can only create agents "
+                    f"with parent_id='{caller_id}', not '{parent_id}'"
+                )
+
+            # Sub-agent cannot create at same or higher level
+            requested_level = config.get("level", caller_level + 1)
+            if requested_level <= caller_level:
+                raise PermissionError(
+                    f"Agent '{caller_id}' (level {caller_level}) cannot create "
+                    f"agent at level {requested_level}. Must be level > {caller_level}."
+                )
+        # ──────────────────────────────────────────────────────────────
 
         # Auto-compute level from parent
         if "level" not in config and parent_id in self._agents:

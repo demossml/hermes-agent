@@ -853,6 +853,8 @@ def _cleanup_all_browsers(*args, **kwargs):
 _cleanup_done = False
 # Weak reference to the active AIAgent for memory provider shutdown at exit
 _active_agent_ref = None
+# Active sub-agent for multi-agent mode (name, level, parent)
+_active_subagent: dict | None = None
 _deferred_agent_startup_done = False
 
 
@@ -3414,6 +3416,7 @@ class HermesCLI:
             "session_api_calls": 0,
             "compressions": 0,
             "active_background_tasks": 0,
+            "agent_name": _active_subagent["name"] if _active_subagent else None,
         }
 
         # Count live /background tasks. The dict entry is removed in the
@@ -3678,6 +3681,8 @@ class HermesCLI:
 
             compressions = snapshot.get("compressions", 0)
             parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
+            if snapshot.get("agent_name"):
+                parts.insert(0, f"[{snapshot['agent_name']}]")
             if compressions:
                 parts.append(f"🗜️ {compressions}")
             bg_count = snapshot.get("active_background_tasks", 0)
@@ -8430,6 +8435,10 @@ class HermesCLI:
             self._handle_agents_reload()
         elif canonical == "agents-create":
             self._handle_agents_create(cmd_original)
+        elif canonical == "subagents":
+            self._handle_subagents(cmd_original)
+        elif canonical == "agent-off":
+            self._handle_agent_off()
 
         else:
             # Check for user-defined quick commands (bypass agent loop, no LLM call)
@@ -9603,6 +9612,7 @@ class HermesCLI:
 
     def _handle_agents_create(self, cmd: str):
         """/agents-create <agent_id> <system_prompt> — create agent at runtime."""
+        global _active_subagent
         from agent_registry import get_registry
 
         parts = cmd.strip().split(None, 2)
@@ -9613,20 +9623,148 @@ class HermesCLI:
 
         agent_id = parts[1]
         system_prompt = parts[2]
+        parent_id = _active_subagent["name"] if _active_subagent else "orchestrator"
+        caller = _active_subagent["name"] if _active_subagent else "orchestrator"
 
         try:
             registry = get_registry()
-            registry.create(agent_id, {
-                "provider": "current",
+            created = registry.create(agent_id, {
                 "system_prompt": system_prompt,
-                "description": f"Created via /agents-create",
+                "parent_id": parent_id,
+                "description": f"Created by {caller}",
                 "max_context_tokens": 8000,
                 "max_iterations": 3,
-            })
-            _cprint(f"  Agent '{agent_id}' created → agent_configs/{agent_id}.yaml")
+            }, caller_id=caller)
+            level = created.get("level", 1)
+            _cprint(f"  ✅ Субагент '{agent_id}' создан (level {level}, parent: {parent_id})")
             _cprint(f"  Prompt: {system_prompt[:100]}...")
+        except PermissionError as e:
+            _cprint(f"  [red]❌ {e}[/]")
         except Exception as e:
-            _cprint(f"  [bold red]Create failed: {e}[/]")
+            _cprint(f"  [red]Create failed: {e}[/]")
+
+    def _handle_subagents(self, cmd: str):
+        """/subagents <action> [args] — manage sub-agents.
+        
+        Actions:
+          create <id> <prompt>    — create new sub-agent
+          tools <id> [tool,...]   — show/set sub-agent tools
+          memory <id>             — show sub-agent memory
+          delete <id>             — delete sub-agent
+          tree                    — show agent hierarchy
+        """
+        global _active_subagent
+        from agent_registry import get_registry
+
+        parts = cmd.strip().split(None, 2)
+        action = parts[1] if len(parts) > 1 else ""
+        args = parts[2] if len(parts) > 2 else ""
+
+        registry = get_registry()
+
+        if action == "tree":
+            _cprint(f"\n{registry.get_tree()}")
+
+        elif action == "create":
+            # Parse: /subagents create <id> "<prompt>" [--parent <parent_id>]
+            sub_parts = args.split(None, 1)
+            if not sub_parts:
+                _cprint("  Usage: /subagents create <id> \"<system_prompt>\" [--parent <id>]")
+                return
+
+            agent_id = sub_parts[0]
+            remaining = sub_parts[1] if len(sub_parts) > 1 else ""
+
+            # Parse --parent flag
+            parent_id = _active_subagent["name"] if _active_subagent else "orchestrator"
+            prompt = remaining
+            if "--parent" in remaining:
+                parent_match = remaining.split("--parent", 1)[1].strip().split()[0]
+                parent_id = parent_match
+                prompt = remaining.replace(f"--parent {parent_match}", "").strip().strip('"')
+
+            if not prompt:
+                _cprint("  Usage: /subagents create <id> \"<system_prompt>\" [--parent <id>]")
+                return
+
+            try:
+                caller = _active_subagent["name"] if _active_subagent else "orchestrator"
+                created = registry.create(agent_id, {
+                    "system_prompt": prompt,
+                    "parent_id": parent_id,
+                    "description": f"Created by {caller}",
+                    "max_iterations": 5,
+                }, caller_id=caller)
+                level = created.get("level", 1)
+                _cprint(f"  ✅ Субагент '{agent_id}' создан (level {level}, parent: {parent_id})")
+            except PermissionError as e:
+                _cprint(f"  [red]❌ {e}[/]")
+            except Exception as e:
+                _cprint(f"  [red]Error: {e}[/]")
+
+        elif action == "tools":
+            sub_parts = args.split()
+            if not sub_parts:
+                _cprint("  Usage: /subagents tools <id> [tool1,tool2,...]")
+                return
+            agent_id = sub_parts[0]
+            cfg = registry.get(agent_id)
+            if not cfg:
+                _cprint(f"  [red]Agent '{agent_id}' not found[/]")
+                return
+            if len(sub_parts) > 1:
+                tools = sub_parts[1].split(",")
+                try:
+                    registry.update_tools(agent_id, tools)
+                    _cprint(f"  Tools for '{agent_id}': {tools}")
+                except Exception as e:
+                    _cprint(f"  [red]{e}[/]")
+            else:
+                _cprint(f"  Tools for '{agent_id}': {cfg.get('tools', [])}")
+
+        elif action == "memory":
+            agent_id = args.strip()
+            if not agent_id:
+                _cprint("  Usage: /subagents memory <agent_id>")
+                return
+            cfg = registry.get(agent_id)
+            if not cfg:
+                _cprint(f"  [red]Agent '{agent_id}' not found[/]")
+                return
+            # Show last 5 messages from this agent's memory
+            _cprint(f"  Memory for '{agent_id}' (last 5 turns):")
+            _cprint(f"  [dim](SessionDB integration needed for full history)[/]")
+
+        elif action == "delete":
+            agent_id = args.strip()
+            if not agent_id:
+                _cprint("  Usage: /subagents delete <agent_id>")
+                return
+            if agent_id not in registry._agents:
+                _cprint(f"  [red]Agent '{agent_id}' not found[/]")
+                return
+            registry.unregister(agent_id)
+            if _active_subagent and _active_subagent["name"] == agent_id:
+                _active_subagent = None
+            _cprint(f"  Agent '{agent_id}' deleted")
+
+        else:
+            _cprint("  /subagents create|tools|memory|delete|tree")
+            _cprint("  Examples:")
+            _cprint("    /subagents tree")
+            _cprint("    /subagents create translator Translate to English")
+            _cprint("    /subagents tools translator")
+            _cprint("    /subagents tools translator file,search")
+            _cprint("    /subagents delete translator")
+
+    def _handle_agent_off(self):
+        """Return to main agent from sub-agent mode."""
+        global _active_subagent
+        if _active_subagent:
+            _cprint(f"  Leaving [{_active_subagent['name']}], back to main agent")
+            _active_subagent = None
+        else:
+            _cprint("  Already in main agent mode")
 
     def _handle_fast_command(self, cmd: str):
         """Handle /fast — toggle fast mode (OpenAI Priority Processing / Anthropic Fast Mode)."""
