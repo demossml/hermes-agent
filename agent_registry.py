@@ -416,38 +416,31 @@ class AgentRegistry:
         return f"Error from agent '{agent_id}': {last_error}"
 
     def _check_isolation(self, caller_id: str, agent_id: str, target_cfg: dict) -> str | None:
-        """Check if caller is allowed to call target. Returns error string or None."""
+        """Check if caller is allowed to call target. Returns error string or None.
+
+        Rules:
+        - orchestrator (level 0) → any agent
+        - sub-agent → its direct and indirect descendants (via _is_descendant)
+        - Forbidden: horizontal (same level), upward (parent), cross-branch (unrelated)
+        """
         if caller_id == "orchestrator" or caller_id not in self._agents:
             return None  # orchestrator can call anyone
 
-        caller_cfg = self._agents.get(caller_id)
-        if not caller_cfg:
-            return None
+        if self._is_descendant(caller_id, agent_id):
+            return None  # descendant — allowed
 
-        caller_level = caller_cfg.get("level", 1)
+        caller_level = self._agents[caller_id].get("level", 1)
         target_level = target_cfg.get("level", 1)
         target_parent = target_cfg.get("parent_id", "orchestrator")
 
-        # Horizontal call — same level = siblings, forbidden
-        if target_level <= caller_level:
-            error_msg = (
-                f"[ISOLATION VIOLATION] Agent '{caller_id}' (level {caller_level}) "
-                f"attempted to call '{agent_id}' (level {target_level}). "
-                f"Sub-agents can only call their own children."
-            )
-            logger.error(error_msg)
-            return f"Error: {error_msg}"
-
-        # Calling another agent's child — forbidden
-        if target_parent != caller_id:
-            error_msg = (
-                f"[ISOLATION VIOLATION] Agent '{caller_id}' attempted to call "
-                f"'{agent_id}' which belongs to '{target_parent}', not to '{caller_id}'."
-            )
-            logger.error(error_msg)
-            return f"Error: {error_msg}"
-
-        return None
+        error_msg = (
+            f"[ISOLATION VIOLATION] Agent '{caller_id}' (level {caller_level}) "
+            f"can only call its descendants. "
+            f"'{agent_id}' (level {target_level}, parent='{target_parent}') "
+            f"is not a descendant."
+        )
+        logger.error(error_msg)
+        return f"Error: {error_msg}"
 
     def _track_call(self, agent_id: str, start_ms: float, tokens: int):
         """Update per-agent performance stats."""
