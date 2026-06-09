@@ -9556,15 +9556,25 @@ class HermesCLI:
         agent_id = parts[1]
         message = parts[2] if len(parts) > 2 else ""
 
-        if not message:
-            _cprint(f"  Usage: /agent {agent_id} <message>")
-            return
-
         registry = get_registry()
         if not registry.get(agent_id):
             available = [a["agent_id"] for a in registry.list()]
             _cprint(f"  Unknown agent: {agent_id}")
             _cprint(f"  Available: {', '.join(available)}")
+            return
+
+        # Activate sub-agent mode — status bar will show [agent_id]
+        global _active_subagent
+        cfg = registry.get(agent_id)
+        _active_subagent = {
+            "name": agent_id,
+            "level": cfg.get("level", 1),
+            "parent": cfg.get("parent_id", "orchestrator"),
+        }
+
+        if not message:
+            _cprint(f"  ✅ Switched to [{agent_id}] (level {_active_subagent['level']})")
+            _cprint(f"  Type /agent-off to return to main agent")
             return
 
         session_id = getattr(self, "session_id", "cli-agent")
