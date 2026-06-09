@@ -14,7 +14,9 @@
 ### Изоляция и безопасность
 - **Горизонтальная изоляция** — субагент не может вызвать соседнего агента
 - **Изоляция памяти** — каждый агент видит только свою ветку (`subtree_session_id`)
-- **Контроль инструментов** — только оркестратор меняет `tools`; субагент — только себе и потомкам
+- **Full Clone агенты** — по умолчанию новый агент получает **все** инструменты (`enabled_toolsets: None`)
+- **Контроль инструментов** — только оркестратор меняет `enabled_toolsets` через `/subagents tools <id> set|add`
+- **Sandbox-режим** — `enabled_toolsets: []` = агент без инструментов
 - **Права создания** — `level: 1` может создать только своих `level: 2` детей
 
 ### Память (Subtree Architecture)
@@ -47,7 +49,10 @@
 - **CLI-управление** — `/subagents provider` для просмотра и настройки
 
 ### Безопасное обновление
-- **`multiagent_updater`** — миграция конфигов с сохранением provider/model
+- **Версионированные миграции** — `MIGRATIONS` с уникальными ID, идемпотентные, не затирают пользовательские настройки
+- **Автомиграция при `reload()`** — `apply_all_migrations()` вызывается при `/agents-reload` и старте
+- **Трекинг** — `applied_migrations` + `migration_version` в YAML каждого агента
+- **`multiagent_updater`** — делегирует версионированной системе миграций
 - **Бэкап** — автоматический бэкап в `backups/` перед изменениями
 - **Dry-run** — `/hermes-update --dry-run` показывает что изменится без правок
 - **Сброс LLM** — `/hermes-update --reset-llm` для принудительного сброса (опционально)
@@ -72,20 +77,27 @@
                  │            @orchestrate <msg>
                  │
                  └── AgentRegistry
+                      ├── MIGRATIONS [versioned, idempotent]
+                      │    ├── 20260609: subtree_session_id
+                      │    ├── 20260610: enabled_toolsets=None
+                      │    ├── 20260611: critical_rules
+                      │    └── 20260612: fallback_models, LLM params
+                      │
                       ├── orchestrator [L0, main-session]
                       │    ├── critical_rules: маршрутизация, DELEGATE
                       │    ├── rule_reminder_every: 3
                       │    └── RuleChecker: self-correction
                       │
                       ├── coder [L1, subtree-coder]
-                      │    ├── tools: terminal, file
+                      │    ├── enabled_toolsets: [terminal, file, search, skills]
                       │    └── children: [L2] code-checker ← общая память
                       │
                       ├── researcher [L1, subtree-researcher]
-                      │    └── tools: browser, search
+                      │    ├── enabled_toolsets: [browser, search, web]
+                      │    └── динамический клон → ALL tools (None)
                       │
                       ├── reviewer [L1, subtree-reviewer]
-                      │    └── tools: file, search
+                      │    └── enabled_toolsets: [file, search]
                       │
                       └── summarizer [L1, subtree-summarizer]
 
@@ -93,6 +105,11 @@
   coder ✗→ researcher      (горизонтальная блокировка)
   coder ✓→ code-checker    (свой потомок)
   orchestrator ✓→ любой    (level 0)
+
+Инструменты:
+  enabled_toolsets: null    → ALL (полный клон Гермеса)
+  enabled_toolsets: [...]   → только указанные наборы
+  enabled_toolsets: []      → sandbox (без инструментов)
 ```
 
 ---
@@ -128,8 +145,9 @@ python install_hooks.py
 /subagents create code-checker "Проверяй код" --parent coder
 
 # Инструменты
-/subagents tools coder                    # показать текущие
-/subagents tools coder set file,search    # установить новые
+/subagents tools coder                     # показать текущие (ALL/список/none)
+/subagents tools coder set file,search     # установить новые (замена)
+/subagents tools coder add web,browser     # добавить к существующим
 
 # Память ветки
 /subagents memory coder                   # последние 20 сообщений
@@ -296,10 +314,35 @@ asyncio.run(main())
 |-----------------------|------------------------|--------------------------|
 | Создать агента        | под любым `parent`     | только `parent=self`     |
 | Вызвать агента        | любого                 | только потомков          |
-| Менять `tools`        | любому                 | себе и потомкам          |
+| Менять `enabled_toolsets` | любому             | себе и потомкам          |
 | Менять LLM config     | любому                 | себе и потомкам          |
 | Читать память         | любой ветки            | только своей             |
 | Удалить агента        | любого                 | только своих детей       |
+
+### Full Clone vs Sandbox
+
+| `enabled_toolsets`  | Смысл                                   |
+|----------------------|-----------------------------------------|
+| `None` (default)     | **Full Clone** — все инструменты        |
+| `["terminal","web"]` | Только указанные наборы                 |
+| `[]`                 | **Sandbox** — агент без инструментов    |
+
+### Версионированные миграции
+
+```bash
+# Применить все ожидающие миграции ко всем агентам
+/agents-reload          # вызывает apply_all_migrations()
+
+# Или через updater (с бэкапом и dry-run)
+/hermes-update          # полное обновление + миграции
+/hermes-update --dry-run  # показать что будет изменено
+```
+
+Каждая миграция:
+- Имеет уникальный ID (например, `20260610_add_enabled_toolsets`)
+- Идемпотентна — можно запускать多次 без вреда
+- Не затирает пользовательские значения
+- Трекается в `applied_migrations` внутри YAML агента
 
 ---
 
@@ -315,11 +358,12 @@ multi-agent/                           ← ветка
 │   ├── reviewer.yaml                  ← L1, subtree-reviewer
 │   └── summarizer.yaml                ← L1, subtree-summarizer
 ├── cli.py                             ← /subagents, /agent-off, индикатор
-├── multiagent_updater.py              ← безопасная миграция конфигов
+├── multiagent_updater.py              ← миграции (версионированная система)
 ├── hermes_cli/
 │   └── commands.py                    ← CommandDef для новых команд
 ├── tests/
-│   └── test_multiagent_updater.py     ← тесты миграции
+│   ├── test_multiagent_updater.py     ← тесты миграции
+│   └── test_agent_registry.py         ← тесты реестра (smoke)
 ├── gateway/
 │   ├── agent_mention.py               ← @mention-роутинг
 │   └── run.py                         ← диспетчеризация
