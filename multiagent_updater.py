@@ -158,41 +158,34 @@ def migrate_agent_config(
     dry_run: bool = False,
     reset_llm: bool = False,
 ) -> dict[str, Any]:
-    """Migrate a single agent YAML config.
+    """Migrate a single agent YAML config using the versioned migration system.
+
+    Delegates to ``AgentRegistry.migrate_agent_config()`` which applies
+    only pending migrations (idempotent, safe to run repeatedly).
 
     Returns a report dict with changes made.
-
-    KEY RULE: Never overwrite existing 'provider' or 'model'.
     """
+    from agent_registry import AgentRegistry, MIGRATIONS
+
+    agent_id = file_path.stem
     report: dict[str, Any] = {
         "file": str(file_path),
-        "agent_id": file_path.stem,
+        "agent_id": agent_id,
         "added": [],
         "preserved": [],
         "error": None,
     }
 
     try:
+        # Load the config so we can report what was preserved
         with open(file_path) as f:
             config = yaml.safe_load(f) or {}
 
-        agent_id = config.get("agent_id", file_path.stem)
-
-        # ── Provider & Model (СОХРАНЯЕМ!) ──────────────────────
-        if "provider" not in config:
-            config["provider"] = DEFAULT_PROVIDER
-            report["added"].append(f"provider={DEFAULT_PROVIDER}")
-        else:
+        if "provider" in config:
             report["preserved"].append(f"provider={config['provider']}")
-
-        if "model" not in config:
-            config["model"] = _get_default_model(config["provider"])
-            if config["model"]:
-                report["added"].append(f"model={config['model']}")
-        else:
+        if "model" in config and config["model"]:
             report["preserved"].append(f"model={config['model']}")
 
-        # ── Reset LLM if requested ─────────────────────────────
         if reset_llm:
             config["provider"] = DEFAULT_PROVIDER
             config["model"] = _get_default_model(DEFAULT_PROVIDER)
@@ -200,48 +193,25 @@ def migrate_agent_config(
             config["fallback_models"] = _get_fallbacks(DEFAULT_PROVIDER)
             report["added"].append("LLM settings RESET to defaults")
 
-        # ── subtree_session_id ─────────────────────────────────
-        if "subtree_session_id" not in config:
-            import uuid
-            config["subtree_session_id"] = f"subtree-{agent_id}-{uuid.uuid4().hex[:8]}"
-            report["added"].append("subtree_session_id")
+        # ── Delegate to the versioned migration system ──────────
+        registry = AgentRegistry(config_dir=file_path.parent)
+        registry.register(agent_id, config)
+        mig_report = registry.migrate_agent_config(agent_id, dry_run=dry_run)
 
-        # ── level ──────────────────────────────────────────────
-        if "level" not in config:
-            config["level"] = 0 if agent_id == "orchestrator" else 1
-            report["added"].append(f"level={config['level']}")
+        if mig_report.get("error"):
+            report["error"] = mig_report["error"]
+        else:
+            for mig_id in mig_report.get("migrations_applied", []):
+                # Find the human-readable description
+                desc = mig_id
+                for m in MIGRATIONS:
+                    if m["id"] == mig_id:
+                        desc = f"{mig_id}: {m['description']}"
+                        break
+                report["added"].append(desc)
 
-        # ── parent_id ──────────────────────────────────────────
-        if "parent_id" not in config:
-            config["parent_id"] = "orchestrator"
-            report["added"].append("parent_id=orchestrator")
-
-        # ── fallback_models ────────────────────────────────────
-        if "fallback_models" not in config:
-            config["fallback_models"] = _get_fallbacks(config["provider"])
-            if config["fallback_models"]:
-                report["added"].append(f"fallback_models={config['fallback_models']}")
-
-        # ── LLM params ─────────────────────────────────────────
-        for param, default in DEFAULT_LLM_PARAMS.items():
-            if param not in config:
-                config[param] = default
-                report["added"].append(f"{param}={default}")
-
-        # ── critical_rules ─────────────────────────────────────
-        if "critical_rules" not in config:
-            config["critical_rules"] = []
-            report["added"].append("critical_rules=[]")
-
-        # ── rule_reminder_every ────────────────────────────────
-        if "rule_reminder_every" not in config:
-            config["rule_reminder_every"] = 4
-            report["added"].append("rule_reminder_every=4")
-
-        # Write back
-        if not dry_run:
-            with open(file_path, "w") as f:
-                yaml.dump(config, f, allow_unicode=True, default_flow_style=False)
+            for mig_id in mig_report.get("already_applied", []):
+                report["preserved"].append(f"migration: {mig_id}")
 
     except Exception as e:
         report["error"] = str(e)

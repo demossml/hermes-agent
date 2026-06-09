@@ -48,6 +48,106 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_DIR = Path(__file__).parent / "agent_configs"
 
+# ── Versioned agent config migrations ──────────────────────────
+# Each migration is a dict with:
+#   id          — unique identifier (date + short name)
+#   description — human-readable one-liner
+#   apply       — callable(cfg: dict) → bool
+#                 Returns True if the migration made any change,
+#                 False if the config was already up-to-date.
+#
+# Migrations are IDEMPOTENT — running them repeatedly on an
+# already-migrated config is a no-op.
+#
+# When adding a NEW migration, append it to the END of this list
+# and bump CURRENT_MIGRATION_VERSION below.
+# NEVER reorder or delete existing entries — migration IDs are
+# recorded inside agent YAML files and must remain valid forever.
+
+CURRENT_MIGRATION_VERSION = "20260612"
+
+MIGRATIONS: list[dict] = [
+    {
+        "id": "20260609_add_subtree_session",
+        "description": "Добавление subtree_session_id для изоляции памяти",
+        "apply": lambda cfg: _migrate_add_subtree_session(cfg),
+    },
+    {
+        "id": "20260610_add_enabled_toolsets",
+        "description": "Явное добавление enabled_toolsets = None (полный клон)",
+        "apply": lambda cfg: _migrate_add_enabled_toolsets(cfg),
+    },
+    {
+        "id": "20260611_add_critical_rules",
+        "description": "Добавление critical_rules и rule_reminder_every",
+        "apply": lambda cfg: _migrate_add_critical_rules(cfg),
+    },
+    {
+        "id": "20260612_add_provider_fallback",
+        "description": "Добавление fallback_models, priority, auto_select, LLM params",
+        "apply": lambda cfg: _migrate_add_llm_params(cfg),
+    },
+]
+
+
+# ── Individual migration functions (module-level, reusable) ────
+
+def _migrate_add_subtree_session(cfg: dict) -> bool:
+    """Ensure subtree_session_id exists."""
+    if "subtree_session_id" in cfg:
+        return False
+    import uuid
+    agent_id = cfg.get("agent_id", "unknown")
+    cfg["subtree_session_id"] = f"subtree-{agent_id}-{uuid.uuid4().hex[:8]}"
+    return True
+
+
+def _migrate_add_enabled_toolsets(cfg: dict) -> bool:
+    """Add enabled_toolsets=None if the key is missing.
+
+    Does NOT touch existing values — if the user explicitly set
+    enabled_toolsets to [] or ["terminal"] we preserve that.
+    """
+    if "enabled_toolsets" in cfg:
+        return False
+    cfg["enabled_toolsets"] = None  # full clone
+    return True
+
+
+def _migrate_add_critical_rules(cfg: dict) -> bool:
+    """Add critical_rules list and rule_reminder_every if missing."""
+    changed = False
+    if "critical_rules" not in cfg:
+        cfg["critical_rules"] = []
+        changed = True
+    if "rule_reminder_every" not in cfg:
+        cfg["rule_reminder_every"] = 0
+        changed = True
+    return changed
+
+
+def _migrate_add_llm_params(cfg: dict) -> bool:
+    """Add LLM tuning parameters that were added in Phase 6.
+
+    Preserves any existing values the user may have set.
+    """
+    changed = False
+    defaults = {
+        "fallback_models": [],
+        "priority": 2,
+        "auto_select": "none",
+        "reasoning_effort": "medium",
+        "inherit_from_parent": True,
+        "temperature": 0.7,
+        "max_tokens": 8192,
+        "top_p": 0.95,
+    }
+    for key, default in defaults.items():
+        if key not in cfg:
+            cfg[key] = default
+            changed = True
+    return changed
+
 
 class AgentRegistry:
     """Registry and orchestrator for sub-agents.
@@ -151,6 +251,13 @@ class AgentRegistry:
         config.setdefault("level", 1)
         config.setdefault("parent_id", "orchestrator")
         config.setdefault("subtree_session_id", f"subtree-{agent_id}")
+
+        # ── Migration tracking ─────────────────────────────────────
+        # New agents start with all current migrations pre-applied
+        # so they don't get re-migrated on the next reload().
+        all_migration_ids = [m["id"] for m in MIGRATIONS]
+        config.setdefault("applied_migrations", list(all_migration_ids))
+        config.setdefault("migration_version", CURRENT_MIGRATION_VERSION)
 
         # ── Register ───────────────────────────────────────────────
         self._agents[agent_id] = config
@@ -444,6 +551,12 @@ class AgentRegistry:
                 # gets None (via register() default).
                 persist_cfg.pop("enabled_toolsets", None)
 
+        # Migration tracking — always persisted so the versioned
+        # migration system knows which migrations have been applied.
+        for key in ("applied_migrations", "migration_version"):
+            if key in cfg:
+                persist_cfg[key] = cfg[key]
+
         # ── Scrub runtime-only keys from persisted output ───────
         # These must NEVER leak to disk — they're regenerated each run.
         for runtime_key in (
@@ -589,6 +702,12 @@ class AgentRegistry:
         self._instances.clear()
         count = self.load_all()
         self._migrate_subtree_sessions()
+
+        # Apply any pending config migrations to existing agents.
+        # New agents (created via create()) already have all
+        # migrations pre-applied via register() defaults.
+        self.apply_all_migrations()
+
         return count
 
     def _migrate_subtree_sessions(self):
@@ -629,6 +748,146 @@ class AgentRegistry:
                 # Fallback
                 if "subtree_session_id" not in cfg:
                     cfg["subtree_session_id"] = f"subtree-{cfg['agent_id']}-{uuid.uuid4().hex[:8]}"
+
+    # ── Versioned migrations ─────────────────────────────────
+
+    def migrate_agent_config(
+        self, agent_id: str, dry_run: bool = False
+    ) -> dict:
+        """Apply pending migrations to a single agent config.
+
+        Reads the agent's ``applied_migrations`` list from its YAML
+        config (or from the in-memory ``self._agents`` dict) and
+        applies every migration whose ID is not yet in that list.
+
+        Each migration in :data:`MIGRATIONS` is idempotent — running
+        it twice on an already-migrated config is a no-op.
+
+        Returns a report dict::
+
+            {
+                "agent_id": "coder",
+                "migrations_applied": ["20260610_add_enabled_toolsets", ...],
+                "already_applied": ["20260609_add_subtree_session", ...],
+                "dry_run": False,
+                "error": None,
+            }
+        """
+        cfg = self._agents.get(agent_id)
+        if not cfg:
+            return {
+                "agent_id": agent_id,
+                "error": f"Agent '{agent_id}' not in registry",
+                "migrations_applied": [],
+                "already_applied": [],
+                "dry_run": dry_run,
+            }
+
+        # ── Determine which migrations are already applied ─────
+        applied_ids: list[str] = list(cfg.get("applied_migrations", []))
+        # First run with no tracking → apply everything
+        first_run = "applied_migrations" not in cfg
+
+        pending = [m for m in MIGRATIONS if m["id"] not in applied_ids]
+        already = [m["id"] for m in MIGRATIONS if m["id"] in applied_ids]
+
+        if not pending and not first_run:
+            logger.debug(
+                f"Agent '{agent_id}': all {len(MIGRATIONS)} migrations "
+                f"already applied (v{cfg.get('migration_version', '?')})"
+            )
+            return {
+                "agent_id": agent_id,
+                "migrations_applied": [],
+                "already_applied": already,
+                "dry_run": dry_run,
+                "error": None,
+            }
+
+        # ── Apply pending migrations ───────────────────────────
+        applied_now: list[str] = []
+        for migration in pending:
+            mig_id = migration["id"]
+            try:
+                made_change = migration["apply"](cfg)
+                if made_change or first_run:
+                    # Record the migration ID even if apply() returned
+                    # False on a first-run — this ensures the ID is
+                    # tracked for future runs.
+                    applied_ids.append(mig_id)
+                    applied_now.append(mig_id)
+                    logger.info(
+                        f"Agent '{agent_id}': applied migration "
+                        f"'{mig_id}' — {migration['description']}"
+                        f"{' [DRY-RUN]' if dry_run else ''}"
+                    )
+                else:
+                    logger.debug(
+                        f"Agent '{agent_id}': migration '{mig_id}' "
+                        f"no-op (already up-to-date)"
+                    )
+            except Exception as e:
+                logger.error(
+                    f"Agent '{agent_id}': migration '{mig_id}' "
+                    f"FAILED: {e}"
+                )
+                return {
+                    "agent_id": agent_id,
+                    "error": f"Migration '{mig_id}' failed: {e}",
+                    "migrations_applied": applied_now,
+                    "already_applied": already,
+                    "dry_run": dry_run,
+                }
+
+        # ── Finalise ───────────────────────────────────────────
+        cfg["applied_migrations"] = applied_ids
+        cfg["migration_version"] = CURRENT_MIGRATION_VERSION
+
+        if not dry_run:
+            self._persist_agent_config(agent_id)
+            logger.info(
+                f"Agent '{agent_id}': migrated to "
+                f"v{CURRENT_MIGRATION_VERSION} "
+                f"({len(applied_now)} new migrations)"
+            )
+
+        return {
+            "agent_id": agent_id,
+            "migrations_applied": applied_now,
+            "already_applied": already,
+            "dry_run": dry_run,
+            "error": None,
+        }
+
+    def apply_all_migrations(self, dry_run: bool = False) -> List[dict]:
+        """Apply pending migrations to ALL registered agents.
+
+        Iterates over every agent in the registry, runs
+        :meth:`migrate_agent_config` for each, and returns a
+        combined report.
+
+        Safe to call multiple times — already-applied migrations
+        are skipped.
+        """
+        reports: list[dict] = []
+        for agent_id in sorted(self._agents):
+            report = self.migrate_agent_config(agent_id, dry_run=dry_run)
+            reports.append(report)
+            if report.get("error"):
+                logger.warning(
+                    f"Migration failed for '{agent_id}': "
+                    f"{report['error']}"
+                )
+
+        total_new = sum(len(r["migrations_applied"]) for r in reports)
+        total_already = sum(len(r["already_applied"]) for r in reports)
+        logger.info(
+            f"apply_all_migrations: {len(reports)} agents, "
+            f"{total_new} new migrations applied, "
+            f"{total_already} already up-to-date"
+            f"{' [DRY-RUN]' if dry_run else ''}"
+        )
+        return reports
 
     def _check_create_permission(self, caller_id: str, parent_id: str) -> None:
         """Check if caller can create an agent under the given parent.
