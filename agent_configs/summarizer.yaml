@@ -1,6 +1,7 @@
 agent_id: summarizer
 level: 1
 parent_id: orchestrator
+subtree_session_id: subtree-summarizer
 description: Summarizes text
 max_context_tokens: 8000
 max_iterations: 1

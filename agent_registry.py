@@ -104,6 +104,7 @@ class AgentRegistry:
         config.setdefault("provider", "current")  # "current" = use Hermes' active provider
         config.setdefault("level", 1)           # 0 = orchestrator, 1 = sub-agent, 2+ = grandchild
         config.setdefault("parent_id", "orchestrator")
+        config.setdefault("subtree_session_id", f"subtree-{agent_id}")
         self._agents[agent_id] = config
         logger.info(
             f"Registered agent: {agent_id} "
@@ -229,7 +230,48 @@ class AgentRegistry:
         Returns count of loaded configs.
         """
         self._instances.clear()
-        return self.load_all()
+        count = self.load_all()
+        self._migrate_subtree_sessions()
+        return count
+
+    def _migrate_subtree_sessions(self):
+        """Ensure all agents have subtree_session_id.
+
+        - orchestrator → "main-session"
+        - direct children of orchestrator (level 1) → new subtree_session each
+        - descendants inherit from their level-1 ancestor
+        """
+        import uuid
+
+        # orchestrator
+        if "orchestrator" in self._agents:
+            self._agents["orchestrator"].setdefault("subtree_session_id", "main-session")
+
+        # Level 1 agents (direct children of orchestrator) — each gets own branch
+        for cfg in self._agents.values():
+            if cfg.get("level") == 1 and cfg.get("parent_id") == "orchestrator":
+                cfg.setdefault(
+                    "subtree_session_id",
+                    f"subtree-{cfg['agent_id']}-{uuid.uuid4().hex[:8]}"
+                )
+
+        # Level 2+ — inherit from their level-1 ancestor
+        for cfg in self._agents.values():
+            if cfg.get("level", 1) >= 2 and "subtree_session_id" not in cfg:
+                parent = cfg.get("parent_id", "")
+                # Walk up to find the level-1 ancestor
+                while parent and parent in self._agents:
+                    parent_cfg = self._agents[parent]
+                    if parent_cfg.get("level") == 1:
+                        cfg["subtree_session_id"] = parent_cfg.get(
+                            "subtree_session_id",
+                            f"subtree-{parent}-{uuid.uuid4().hex[:8]}"
+                        )
+                        break
+                    parent = parent_cfg.get("parent_id", "")
+                # Fallback
+                if "subtree_session_id" not in cfg:
+                    cfg["subtree_session_id"] = f"subtree-{cfg['agent_id']}-{uuid.uuid4().hex[:8]}"
 
     def _check_create_permission(self, caller_id: str, parent_id: str) -> None:
         """Check if caller can create an agent under the given parent.
@@ -273,12 +315,21 @@ class AgentRegistry:
             parent_level = self._agents[parent_id].get("level", 0)
             config["level"] = parent_level + 1
 
-        # Generate subtree session ID for memory isolation
+        # Generate or inherit subtree session ID for memory isolation
+        # - parent == orchestrator → new subtree_session_id (new branch)
+        # - parent is sub-agent → inherit subtree_session_id (same branch)
         import uuid
-        subtree_session_id = config.get(
-            "subtree_session_id",
-            f"subtree-{agent_id}-{uuid.uuid4().hex[:8]}"
-        )
+        if "subtree_session_id" in config:
+            subtree_session_id = config["subtree_session_id"]
+        elif parent_id != "orchestrator" and parent_id in self._agents:
+            # Inherit from parent — same memory branch
+            subtree_session_id = self._agents[parent_id].get(
+                "subtree_session_id",
+                f"subtree-{parent_id}-{uuid.uuid4().hex[:8]}"
+            )
+        else:
+            # New branch under orchestrator
+            subtree_session_id = f"subtree-{agent_id}-{uuid.uuid4().hex[:8]}"
 
         config["agent_id"] = agent_id
         config["parent_id"] = parent_id
@@ -454,27 +505,27 @@ class AgentRegistry:
     def get_agent_session_id(session_id: str, agent_id: str) -> str:
         """Return the isolated session namespace for an agent.
 
-        Format: "{user_session_id}:{agent_id}"
-        Use this everywhere instead of raw session_id when accessing agent memory.
+        Uses subtree_session_id from agent config for branch-based memory isolation.
+        All agents in the same branch share one session.
         """
-        return f"{session_id}:{agent_id}"
+        return session_id  # caller should use subtree_session_id directly
 
     def _load_history(self, agent_id: str, session_id: str) -> List[Dict]:
-        """Load conversation history from agent's isolated memory namespace.
+        """Load conversation history using subtree_session_id for branch isolation.
 
-        Memory isolation: each agent has its own namespace "{session_id}:{agent_id}".
-        No agent can access another agent's history through this method.
+        All agents in the same branch (e.g., coder + its children) share one
+        subtree_session_id. Different branches are completely isolated.
         """
         history: List[Dict] = []
         if not self._db:
             return history
         try:
-            agent_session = self.get_agent_session_id(session_id, agent_id)
-            msgs = self._db.get_messages_as_conversation(agent_session)
+            cfg = self._agents.get(agent_id, {})
+            subtree = cfg.get("subtree_session_id", f"subtree-{agent_id}")
+            msgs = self._db.get_messages_as_conversation(subtree)
             if not msgs:
                 return history
             history = [{"role": m["role"], "content": m["content"]} for m in msgs]
-            cfg = self._agents.get(agent_id, {})
             max_tokens = cfg.get("max_context_tokens", 8000)
             total = sum(len((m.get("content") or "")) // 4 for m in history)
             if total > max_tokens:
@@ -493,25 +544,26 @@ class AgentRegistry:
                     total += t
                 history = trimmed
         except Exception as e:
-            logger.warning(f"Failed to load history for {agent_id}/{session_id}: {e}")
+            logger.warning(f"Failed to load history for {agent_id}: {e}")
         return history
 
     def _save_turn(self, agent_id: str, session_id: str, user_msg: str, reply: str):
-        """Persist user message + assistant reply to agent's isolated namespace."""
+        """Persist turn to agent's subtree_session_id for branch-level isolation."""
         if not self._db or not reply:
             return
         try:
-            agent_session = self.get_agent_session_id(session_id, agent_id)
-            if not self._db.get_session(agent_session):
+            cfg = self._agents.get(agent_id, {})
+            subtree = cfg.get("subtree_session_id", f"subtree-{agent_id}")
+            if not self._db.get_session(subtree):
                 self._db.create_session(
-                    session_id=agent_session,
+                    session_id=subtree,
                     source=f"agent:{agent_id}",
-                    model=self._agents.get(agent_id, {}).get("model", ""),
+                    model=cfg.get("model", ""),
                 )
-            self._db.append_message(agent_session, "user", user_msg)
-            self._db.append_message(agent_session, "assistant", reply)
+            self._db.append_message(subtree, "user", user_msg)
+            self._db.append_message(subtree, "assistant", reply)
         except Exception as e:
-            logger.warning(f"Failed to save turn for {agent_id}/{session_id}: {e}")
+            logger.warning(f"Failed to save turn for {agent_id}: {e}")
 
     async def stream(
         self,

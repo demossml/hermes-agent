@@ -1,0 +1,9 @@
+agent_id: branch-a-child
+description: ''
+level: 2
+max_context_tokens: 8000
+max_iterations: 3
+parent_id: branch-a
+provider: current
+subtree_session_id: subtree-branch-a-c65dfa04
+system_prompt: x

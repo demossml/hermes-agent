@@ -3,6 +3,7 @@ agent_id: orchestrator
 provider: current
 level: 0
 parent_id: orchestrator
+subtree_session_id: main-session
 description: "Главный агент — маршрутизация и синтез"
 system_prompt: |
   Ты — главный оркестратор Hermes. Твоя роль: маршрутизация задач, не выполнение.

@@ -1,0 +1,9 @@
+agent_id: child-b
+description: ''
+level: 2
+max_context_tokens: 8000
+max_iterations: 3
+parent_id: researcher
+provider: current
+subtree_session_id: subtree-researcher
+system_prompt: x

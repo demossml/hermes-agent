@@ -1,0 +1,8 @@
+agent_id: test-child
+description: ''
+level: 2
+max_context_tokens: 8000
+max_iterations: 3
+parent_id: coder
+provider: current
+system_prompt: test

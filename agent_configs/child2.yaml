@@ -1,0 +1,9 @@
+agent_id: child2
+description: ''
+level: 2
+max_context_tokens: 8000
+max_iterations: 3
+parent_id: coder
+provider: current
+subtree_session_id: subtree-child2-728bdff8
+system_prompt: x
