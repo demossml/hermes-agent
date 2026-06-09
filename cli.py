@@ -9663,7 +9663,19 @@ class HermesCLI:
         registry = get_registry()
 
         if action == "tree":
-            _cprint(f"\n{registry.get_tree()}")
+            tree_text = registry.get_tree()
+            # Colorize by level
+            colored_lines = []
+            for line in tree_text.split("\n"):
+                if "[L0]" in line:
+                    colored_lines.append(f"[bold blue]{line}[/]")
+                elif "[L1]" in line:
+                    colored_lines.append(f"[bold green]{line}[/]")
+                elif "[L2]" in line or "[L3]" in line:
+                    colored_lines.append(f"[bold yellow]{line}[/]")
+                else:
+                    colored_lines.append(f"[dim]{line}[/]")
+            _cprint("\n" + "\n".join(colored_lines))
 
         elif action == "create":
             # Parse: /subagents create <id> "<prompt>" [--parent <parent_id>]

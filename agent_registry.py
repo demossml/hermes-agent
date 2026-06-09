@@ -152,17 +152,22 @@ class AgentRegistry:
         ]
 
     def get_tree(self, root_id: str = "orchestrator", indent: int = 0) -> str:
-        """Return ASCII tree of agent hierarchy with levels and stats."""
+        """Return ASCII tree of agent hierarchy with levels, stats, violations."""
         lines = []
         cfg = self._agents.get(root_id, {})
         if not cfg:
             return f"Agent '{root_id}' not found."
         prefix = "  " * indent + ("└─ " if indent > 0 else "")
+        level = cfg.get("level", 0)
         calls = self._stats.get(root_id, {}).get("calls", 0)
+        violations = self._stats.get(root_id, {}).get("violations", 0)
+        subtree = cfg.get("subtree_session_id", "")
+        subtree_short = f" [{subtree[:20]}...]" if subtree and len(subtree) > 23 else (f" [{subtree}]" if subtree else "")
         lines.append(
             f"{prefix}{root_id} "
-            f"[level={cfg.get('level', 0)}] "
-            f"calls={calls}"
+            f"[L{level}] "
+            f"(calls: {calls}, viol: {violations})"
+            f"{subtree_short}"
         )
         for child in self.get_children(root_id):
             child_id = child["agent_id"]
