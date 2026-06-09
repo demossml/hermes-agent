@@ -200,47 +200,58 @@ class AgentRegistry:
         self._instances.clear()
         return self.load_all()
 
+    def _check_create_permission(self, caller_id: str, parent_id: str) -> None:
+        """Check if caller can create an agent under the given parent.
+
+        Rules:
+        - caller.level == 0 (orchestrator): allowed under any parent
+        - caller.level >= 1: allowed ONLY if parent_id == caller_id
+
+        Raises PermissionError on violation.
+        """
+        if caller_id == "orchestrator" or caller_id not in self._agents:
+            return  # orchestrator can create anywhere
+
+        caller_cfg = self._agents[caller_id]
+        caller_level = caller_cfg.get("level", 1)
+
+        if parent_id != caller_id:
+            raise PermissionError(
+                f"Agent '{caller_id}' (level {caller_level}) can only create "
+                f"agents with parent_id='{caller_id}', not '{parent_id}'"
+            )
+
     def create(self, agent_id: str, config: dict, caller_id: str = "orchestrator") -> dict:
         """Create and register a new agent at runtime.
 
         Permission rules:
-        - orchestrator (level 0) can create agents under any parent
-        - sub-agent (level ≥ 1) can only create agents with parent_id = their own id
-        - sub-agent CANNOT create agents under another parent
+        - caller.level == 0 → allowed under any parent_id
+        - caller.level ≥ 1 → allowed ONLY if parent_id == caller_id
+        - Auto-computed: level = parent_level + 1
+        - Generates subtree_session_id for isolated memory namespace.
 
-        Auto-computes level from parent_id.
         Saves config to agent_configs/{agent_id}.yaml so it survives restarts.
         """
         parent_id = config.get("parent_id", caller_id)
 
         # ── Permission check ──────────────────────────────────────────
-        if caller_id != "orchestrator" and caller_id in self._agents:
-            caller_cfg = self._agents[caller_id]
-            caller_level = caller_cfg.get("level", 1)
-
-            # Sub-agent can only create children under itself
-            if parent_id != caller_id:
-                raise PermissionError(
-                    f"Agent '{caller_id}' (level {caller_level}) can only create agents "
-                    f"with parent_id='{caller_id}', not '{parent_id}'"
-                )
-
-            # Sub-agent cannot create at same or higher level
-            requested_level = config.get("level", caller_level + 1)
-            if requested_level <= caller_level:
-                raise PermissionError(
-                    f"Agent '{caller_id}' (level {caller_level}) cannot create "
-                    f"agent at level {requested_level}. Must be level > {caller_level}."
-                )
-        # ──────────────────────────────────────────────────────────────
+        self._check_create_permission(caller_id, parent_id)
 
         # Auto-compute level from parent
         if "level" not in config and parent_id in self._agents:
             parent_level = self._agents[parent_id].get("level", 0)
             config["level"] = parent_level + 1
 
+        # Generate subtree session ID for memory isolation
+        import uuid
+        subtree_session_id = config.get(
+            "subtree_session_id",
+            f"subtree-{agent_id}-{uuid.uuid4().hex[:8]}"
+        )
+
         config["agent_id"] = agent_id
         config["parent_id"] = parent_id
+        config["subtree_session_id"] = subtree_session_id
         self.register(agent_id, config)
 
         # Persist to YAML
@@ -250,6 +261,7 @@ class AgentRegistry:
                 "agent_id": agent_id,
                 "parent_id": parent_id,
                 "level": config.get("level", 1),
+                "subtree_session_id": subtree_session_id,
                 "provider": config.get("provider", "current"),
                 "description": config.get("description", ""),
                 "system_prompt": config.get("system_prompt", ""),
@@ -260,7 +272,11 @@ class AgentRegistry:
                 persist_cfg["enabled_toolsets"] = config["enabled_toolsets"]
             with open(yaml_path, "w") as f:
                 yaml.dump(persist_cfg, f, allow_unicode=True, default_flow_style=False)
-            logger.info(f"Created agent '{agent_id}' (level={config.get('level')}) → {yaml_path}")
+            logger.info(
+                f"Created agent '{agent_id}' "
+                f"(level={config.get('level')}, parent={parent_id}, "
+                f"session={subtree_session_id}) → {yaml_path}"
+            )
         except Exception as e:
             logger.warning(f"Failed to persist agent config for {agent_id}: {e}")
         return self._agents[agent_id]
