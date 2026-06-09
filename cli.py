@@ -5514,13 +5514,17 @@ class HermesCLI:
             agents = registry.list()
             if agents:
                 _cprint(f"\n  Sub-agents ({len(agents)} registered):")
-                _cprint(f"  {'ID':<16} {'Calls':>6} {'Avg ms':>8}  Description")
+                _cprint(f"  {'ID':<16} {'Lvl':>3} {'Calls':>6} {'Viol':>4} {'Avg ms':>7}  Description")
                 for a in agents:
+                    viol = a.get("violations", 0)
+                    viol_color = "[red]" if viol > 0 else "[dim]"
                     _cprint(
                         f"  {a['agent_id']:<16} "
+                        f"{a.get('level','?'):>3} "
                         f"{a.get('calls',0):>6} "
-                        f"{a.get('avg_latency_ms',0):>8}  "
-                        f"{a.get('description','')[:40]}"
+                        f"{viol_color}{viol:>4}[/] "
+                        f"{a.get('avg_latency_ms',0):>7}  "
+                        f"{a.get('description','')[:32]}"
                     )
         except Exception as e:
             _cprint(f"  [sub-agents: {e}]")

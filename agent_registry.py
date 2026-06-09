@@ -134,6 +134,8 @@ class AgentRegistry:
             st = self._stats.get(agent_id, {})
             entry["calls"] = st.get("calls", 0)
             entry["tokens"] = st.get("tokens", 0)
+            entry["violations"] = st.get("violations", 0)
+            entry["last_violation"] = st.get("last_violation", "")
             if st.get("calls", 0) > 0:
                 entry["avg_latency_ms"] = st.get("total_ms", 0) // st["calls"]
             else:
@@ -469,13 +471,18 @@ class AgentRegistry:
                 cfg_for_check = cfg
                 rules = cfg_for_check.get("critical_rules", [])
                 if rules:
+                    corrected = False
                     for correction_attempt in range(2):
                         violations = self._check_violations(agent_id, reply)
                         if not violations:
+                            if corrected:
+                                reply = f"[✅ Исправлено после {correction_attempt+1} попытки самокоррекции]\n\n{reply}"
                             break
+                        corrected = True
                         # Increment violation counter
                         self._stats.setdefault(agent_id, {}).setdefault("violations", 0)
                         self._stats[agent_id]["violations"] += 1
+                        self._stats[agent_id]["last_violation"] = violations[0][:60]
                         logger.warning(
                             f"Agent '{agent_id}' violated rules "
                             f"(attempt {correction_attempt+1}/2): {violations}"
