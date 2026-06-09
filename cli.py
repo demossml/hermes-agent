@@ -9762,6 +9762,83 @@ class HermesCLI:
                 if enabled:
                     _cprint(f"  Toolsets: {enabled}")
 
+        elif action == "provider":
+            # /subagents provider <id> [set|set-param|fallback|list|reset]
+            sub_parts = args.split()
+            if not sub_parts:
+                _cprint("  Usage: /subagents provider <id> [set|set-param|fallback|list|reset]")
+                return
+            agent_id = sub_parts[0]
+            cfg = registry.get(agent_id)
+            if not cfg:
+                _cprint(f"  [red]Agent '{agent_id}' not found[/]")
+                return
+
+            caller = _active_subagent["name"] if _active_subagent else "orchestrator"
+
+            if len(sub_parts) < 2 or sub_parts[1] == "show":
+                # Show current config
+                eff = registry.get_effective_config(agent_id)
+                _cprint(f"  Provider config for '{agent_id}':")
+                _cprint(f"    provider:     {eff.get('provider','?')}")
+                _cprint(f"    model:        {eff.get('model','?')}")
+                _cprint(f"    temperature:  {eff.get('temperature','?')}")
+                _cprint(f"    max_tokens:   {eff.get('max_tokens','?')}")
+                _cprint(f"    top_p:        {eff.get('top_p','?')}")
+                _cprint(f"    priority:     {eff.get('priority','?')}")
+                _cprint(f"    auto_select:  {eff.get('auto_select','?')}")
+                _cprint(f"    fallbacks:    {eff.get('fallback_models',[])}")
+                _cprint(f"    inherit:      {eff.get('inherit_from_parent','?')}")
+
+            elif sub_parts[1] == "set":
+                if len(sub_parts) < 3:
+                    _cprint("  Usage: /subagents provider <id> set <provider> [model]")
+                    return
+                provider = sub_parts[2]
+                model = sub_parts[3] if len(sub_parts) > 3 else None
+                try:
+                    registry.update_provider(agent_id, provider, model, caller_id=caller)
+                    _cprint(f"  ✅ Provider: {provider}/{model or 'default'}")
+                except PermissionError as e:
+                    _cprint(f"  [red]❌ {e}[/]")
+
+            elif sub_parts[1] == "set-param":
+                if len(sub_parts) < 4:
+                    _cprint("  Usage: /subagents provider <id> set-param <name> <value>")
+                    _cprint("  Params: temperature, max_tokens, top_p, priority, auto_select")
+                    return
+                param, value = sub_parts[2], sub_parts[3]
+                try:
+                    if value.replace(".","").replace("-","").isdigit():
+                        value = float(value) if "." in value else int(value)
+                    registry.update_config_param(agent_id, param, value, caller_id=caller)
+                    _cprint(f"  ✅ {param} = {value}")
+                except (PermissionError, ValueError) as e:
+                    _cprint(f"  [red]{e}[/]")
+
+            elif sub_parts[1] == "fallback":
+                fallbacks = cfg.get("fallback_models", [])
+                _cprint(f"  Fallback models for '{agent_id}': {fallbacks or '(none)'}")
+
+            elif sub_parts[1] == "reset":
+                try:
+                    registry.propagate_to_subtree(agent_id, {
+                        "model": "", "temperature": 0.7, "max_tokens": 8192,
+                        "top_p": 0.95, "fallback_models": [], "auto_select": "none",
+                        "inherit_from_parent": True,
+                    }, caller_id=caller)
+                    _cprint(f"  ✅ Config reset to defaults for '{agent_id}' subtree")
+                except PermissionError as e:
+                    _cprint(f"  [red]❌ {e}[/]")
+
+            elif sub_parts[1] == "list":
+                _cprint("  Available providers:")
+                _cprint("    anthropic  — Claude Sonnet, Opus, Haiku")
+                _cprint("    deepseek   — DeepSeek v4, Chat")
+                _cprint("    openai     — GPT-4o, GPT-4o-mini")
+                _cprint("    current    — use Hermes active provider")
+                _cprint("  Use: /subagents provider <id> set <provider> [model]")
+
         elif action == "memory":
             # /subagents memory <agent_id> [--limit 50] [--full]
             # Only orchestrator can read any branch's memory

@@ -99,10 +99,22 @@ class AgentRegistry:
         config.setdefault("model", "claude-sonnet-4-20250514")
         config.setdefault("system_prompt", "You are a helpful assistant.")
         config.setdefault("tools", [])
-        config.setdefault("critical_rules", [])    # rules injected into system_prompt
+        config.setdefault("critical_rules", [])
         config.setdefault("max_context_tokens", 8000)
         config.setdefault("max_iterations", 3)
         config.setdefault("provider", "current")
+
+        # ── LLM tuning ───────────────────────────────────────────
+        config.setdefault("temperature", 0.7)
+        config.setdefault("max_tokens", 8192)
+        config.setdefault("top_p", 0.95)
+        config.setdefault("fallback_models", [])
+        config.setdefault("priority", 2)            # 1=critical, 2=normal, 3=low
+        config.setdefault("auto_select", "none")    # cheapest|fastest|balanced|none
+        config.setdefault("reasoning_effort", "medium")  # low|medium|high
+        config.setdefault("inherit_from_parent", True)
+        # ──────────────────────────────────────────────────────────
+
         config.setdefault("level", 1)
         config.setdefault("parent_id", "orchestrator")
         config.setdefault("subtree_session_id", f"subtree-{agent_id}")
@@ -168,10 +180,15 @@ class AgentRegistry:
         violations = self._stats.get(root_id, {}).get("violations", 0)
         subtree = cfg.get("subtree_session_id", "")
         subtree_short = f" [{subtree[:20]}...]" if subtree and len(subtree) > 23 else (f" [{subtree}]" if subtree else "")
+        provider = cfg.get("provider", "?")
+        model = cfg.get("model", "") or cfg.get("_fallback_model", "")
+        model_short = model.split("/")[-1] if "/" in model else model
+        provider_info = f" {provider}" + (f"/{model_short}" if model else "") + f" [t={cfg.get('temperature', 0.7)}]"
         lines.append(
             f"{prefix}{root_id} "
             f"[L{level}] "
             f"(calls: {calls}, viol: {violations})"
+            f"{provider_info}"
             f"{subtree_short}"
         )
         for child in self.get_children(root_id):
@@ -225,6 +242,109 @@ class AgentRegistry:
         self._agents[agent_id]["tools"] = tools
         self._instances.pop(agent_id, None)  # force recreate with new tools
         logger.info(f"Tools updated for '{agent_id}' by '{caller_id}': {tools}")
+
+    # ── LLM Config Management ────────────────────────────────
+
+    def _check_config_permission(self, caller_id: str, target_id: str) -> None:
+        """Check if caller can modify LLM config of target.
+
+        - orchestrator (level 0) → any agent
+        - sub-agent → self and descendants only
+        """
+        if caller_id == "orchestrator":
+            return
+        if not self._is_descendant(caller_id, target_id):
+            raise PermissionError(
+                f"Agent '{caller_id}' can only modify config for "
+                f"itself and its descendants. '{target_id}' is not a descendant."
+            )
+
+    def update_provider(self, target_id: str, provider: str, model: str | None = None,
+                        caller_id: str = "orchestrator"):
+        """Change provider and optionally model for an agent."""
+        self._check_config_permission(caller_id, target_id)
+        cfg = self._agents[target_id]
+        cfg["provider"] = provider
+        if model:
+            cfg["model"] = model
+        self._instances.pop(target_id, None)
+        logger.info(f"Provider for '{target_id}' set to {provider}/{cfg.get('model','?')} by '{caller_id}'")
+
+    def update_config_param(self, target_id: str, param_name: str, value,
+                            caller_id: str = "orchestrator"):
+        """Update a single LLM parameter (temperature, max_tokens, top_p, etc.)."""
+        self._check_config_permission(caller_id, target_id)
+        valid_params = {"temperature", "max_tokens", "top_p", "priority",
+                        "auto_select", "reasoning_effort", "inherit_from_parent",
+                        "fallback_models"}
+        if param_name not in valid_params:
+            raise ValueError(f"Unknown param: {param_name}. Valid: {sorted(valid_params)}")
+        self._agents[target_id][param_name] = value
+        self._instances.pop(target_id, None)
+        logger.info(f"Config '{param_name}' for '{target_id}' set to {value} by '{caller_id}'")
+
+    def propagate_to_subtree(self, root_id: str, updates: dict,
+                             caller_id: str = "orchestrator"):
+        """Apply config updates to an agent and all its descendants."""
+        self._check_config_permission(caller_id, root_id)
+        count = 0
+        for aid, cfg in self._agents.items():
+            if aid == root_id or self._is_descendant(root_id, aid):
+                cfg.update(updates)
+                self._instances.pop(aid, None)
+                count += 1
+        logger.info(f"Propagated config to {count} agents in subtree of '{root_id}'")
+        return count
+
+    def get_effective_config(self, agent_id: str) -> dict:
+        """Return effective config with inheritance resolved."""
+        cfg = dict(self._agents.get(agent_id, {}))
+        if cfg.get("inherit_from_parent", True):
+            parent_id = cfg.get("parent_id")
+            if parent_id and parent_id in self._agents:
+                parent = self.get_effective_config(parent_id)
+                for key in ("provider", "model", "temperature", "max_tokens", "top_p",
+                            "fallback_models", "priority", "auto_select", "reasoning_effort"):
+                    if cfg.get(key) is None or cfg.get(key) == "":
+                        cfg[key] = parent.get(key, cfg.get(key))
+        return cfg
+
+    def auto_select_model(self, agent_id: str) -> str | None:
+        """Auto-select model based on auto_select strategy. Returns model name or None."""
+        cfg = self._agents.get(agent_id, {})
+        strategy = cfg.get("auto_select", "none")
+        if strategy == "none":
+            return cfg.get("model")
+
+        fallbacks = cfg.get("fallback_models", [])
+        if not fallbacks:
+            return cfg.get("model")
+
+        # Price tiers for known models (relative scale, 1=cheapest)
+        PRICE_TIERS = {
+            "deepseek-v4-pro": 1, "deepseek-chat": 1,
+            "claude-3-5-haiku": 2, "claude-3-haiku": 2,
+            "claude-3-5-sonnet": 4, "claude-sonnet-4": 4,
+            "claude-3-opus": 6, "claude-opus-4": 8,
+            "gpt-4o-mini": 2, "gpt-4o": 6,
+        }
+        SPEED_TIERS = {
+            "deepseek-v4-pro": 3, "deepseek-chat": 3,
+            "claude-3-5-haiku": 5, "claude-3-haiku": 5,
+            "claude-3-5-sonnet": 3, "claude-sonnet-4": 2,
+            "claude-3-opus": 1, "claude-opus-4": 1,
+        }
+
+        if strategy == "cheapest":
+            return min(fallbacks, key=lambda m: PRICE_TIERS.get(m, 99))
+        elif strategy == "fastest":
+            return max(fallbacks, key=lambda m: SPEED_TIERS.get(m, 0))
+        elif strategy == "balanced":
+            scored = [(m, PRICE_TIERS.get(m, 99) + (6 - SPEED_TIERS.get(m, 0))) for m in fallbacks]
+            return min(scored, key=lambda x: x[1])[0]
+        return fallbacks[0]
+
+    # ── Lifecycle ────────────────────────────────────────────
 
     def reload(self) -> int:
         """Hot-reload all agent configs from agent_configs/ directory.
@@ -338,6 +458,15 @@ class AgentRegistry:
         config["agent_id"] = agent_id
         config["parent_id"] = parent_id
         config["subtree_session_id"] = subtree_session_id
+
+        # Inherit LLM params from parent if inherit_from_parent is True
+        if config.get("inherit_from_parent", True) and parent_id in self._agents:
+            parent = self._agents[parent_id]
+            for key in ("provider", "model", "temperature", "max_tokens", "top_p",
+                        "fallback_models", "priority", "auto_select", "reasoning_effort"):
+                if key not in config:
+                    config[key] = parent.get(key, config.get(key))
+
         self.register(agent_id, config)
 
         # Persist to YAML
@@ -349,6 +478,15 @@ class AgentRegistry:
                 "level": config.get("level", 1),
                 "subtree_session_id": subtree_session_id,
                 "provider": config.get("provider", "current"),
+                "model": config.get("model", ""),
+                "temperature": config.get("temperature", 0.7),
+                "max_tokens": config.get("max_tokens", 8192),
+                "top_p": config.get("top_p", 0.95),
+                "fallback_models": config.get("fallback_models", []),
+                "priority": config.get("priority", 2),
+                "auto_select": config.get("auto_select", "none"),
+                "reasoning_effort": config.get("reasoning_effort", "medium"),
+                "inherit_from_parent": config.get("inherit_from_parent", True),
                 "description": config.get("description", ""),
                 "system_prompt": config.get("system_prompt", ""),
                 "critical_rules": config.get("critical_rules", []),
@@ -439,7 +577,22 @@ class AgentRegistry:
         t0 = asyncio.get_event_loop().time() * 1000
         last_error = None
 
+        # Build fallback model list
+        fallbacks = [cfg.get("model", "")]
+        fallbacks += cfg.get("fallback_models", [])
+        fallbacks = [m for m in fallbacks if m]  # filter empty
+
         for attempt in range(retries + 1):
+            # ── Smart fallback: try next model on failure ──────────────────
+            if attempt > 0 and attempt < len(fallbacks):
+                fallback_model = fallbacks[attempt]
+                logger.warning(
+                    f"Agent '{agent_id}' falling back to model '{fallback_model}' "
+                    f"(attempt {attempt+1}/{len(fallbacks)})"
+                )
+                cfg["_fallback_model"] = fallback_model
+                self._instances.pop(agent_id, None)  # recreate with new model
+
             try:
                 agent = self._get_agent(agent_id, cfg, session_id)
 
@@ -1234,9 +1387,11 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
                         f"{runtime.get('provider')} / {runtime.get('model')}"
                     )
                 else:
+                    # Use _fallback_model if set (smart fallback), else config model
+                    effective_model = cfg.get("_fallback_model") or cfg.get("model")
                     runtime = resolve_runtime_provider(
                         requested=provider_cfg,
-                        target_model=cfg.get("model"),
+                        target_model=effective_model,
                     )
                     logger.info(
                         f"Agent '{agent_id}' using explicit provider: "
