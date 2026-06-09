@@ -94,36 +94,82 @@ class AgentRegistry:
         return count
 
     def register(self, agent_id: str, config: dict):
-        """Register an agent by id and config dict."""
-        config.setdefault("agent_id", agent_id)
-        config.setdefault("model", "claude-sonnet-4-20250514")
-        config.setdefault("system_prompt", "You are a helpful assistant.")
-        config.setdefault("tools", [])
-        config.setdefault("enabled_toolsets", None)  # None = all tools (full clone)
-        config.setdefault("critical_rules", [])
-        config.setdefault("max_context_tokens", 8000)
-        config.setdefault("max_iterations", 3)
-        config.setdefault("provider", "current")
+        """Register an agent by id and config dict.
 
-        # ── LLM tuning ───────────────────────────────────────────
+        Fills in defaults for every field that the YAML config or
+        runtime caller may have omitted.  After this call the config
+        dict is complete and the agent is live in ``self._agents``.
+
+        enabled_toolsets semantics
+        -------------------------
+        The *only* field consumed by ``_get_agent()`` / ``AIAgent`` for
+        tool selection is ``enabled_toolsets`` (NOT the legacy ``tools``
+        field, which is kept for backward-compat but never read).
+
+        ┌──────────────────────┬─────────────────────────────────────┐
+        │ enabled_toolsets     │ Meaning                             │
+        ├──────────────────────┼─────────────────────────────────────┤
+        │ None (default)       │ FULL CLONE — AIAgent loads every    │
+        │                      │ available tool.                     │
+        │ [] (empty list)      │ Sandboxed — zero tools.             │
+        │ ["terminal","file"]  │ Restricted to those toolsets only.  │
+        └──────────────────────┴─────────────────────────────────────┘
+        """
+        # ── Identity ──────────────────────────────────────────────
+        config.setdefault("agent_id", agent_id)
+        config.setdefault("system_prompt", "You are a helpful assistant.")
+        config.setdefault("description", "")
+
+        # ── Tools ──────────────────────────────────────────────────
+        # tools: legacy field kept for backward compatibility.
+        #        Never read by _get_agent() — see enabled_toolsets.
+        config.setdefault("tools", [])
+
+        # enabled_toolsets: the canonical tool field.
+        # None = full clone (all tools).  [] = sandboxed.
+        config.setdefault("enabled_toolsets", None)
+
+        # ── LLM configuration ──────────────────────────────────────
+        config.setdefault("provider", "current")
+        config.setdefault("model", "claude-sonnet-4-20250514")
         config.setdefault("temperature", 0.7)
         config.setdefault("max_tokens", 8192)
         config.setdefault("top_p", 0.95)
         config.setdefault("fallback_models", [])
-        config.setdefault("priority", 2)            # 1=critical, 2=normal, 3=low
-        config.setdefault("auto_select", "none")    # cheapest|fastest|balanced|none
-        config.setdefault("reasoning_effort", "medium")  # low|medium|high
+        config.setdefault("priority", 2)          # 1=critical, 2=normal, 3=low
+        config.setdefault("auto_select", "none")  # cheapest|fastest|balanced|none
+        config.setdefault("reasoning_effort", "medium")
         config.setdefault("inherit_from_parent", True)
-        # ──────────────────────────────────────────────────────────
 
+        # ── Behaviour ──────────────────────────────────────────────
+        config.setdefault("critical_rules", [])
+        config.setdefault("rule_reminder_every", 0)
+        config.setdefault("max_context_tokens", 8000)
+        config.setdefault("max_iterations", 3)
+
+        # ── Hierarchy ──────────────────────────────────────────────
         config.setdefault("level", 1)
         config.setdefault("parent_id", "orchestrator")
         config.setdefault("subtree_session_id", f"subtree-{agent_id}")
+
+        # ── Register ───────────────────────────────────────────────
         self._agents[agent_id] = config
+
+        # Human-readable toolset description for the log line
+        ets = config.get("enabled_toolsets")
+        if ets is None:
+            tools_desc = "ALL"
+        elif len(ets) == 0:
+            tools_desc = "none"
+        else:
+            tools_desc = ",".join(ets)
+
         logger.info(
             f"Registered agent: {agent_id} "
             f"(level={config['level']}, parent={config['parent_id']}, "
-            f"provider={config['provider']}, max_iter={config['max_iterations']}, "
+            f"provider={config['provider']}, "
+            f"tools={tools_desc}, "
+            f"max_iter={config['max_iterations']}, "
             f"rules={len(config['critical_rules'])})"
         )
 
@@ -1530,6 +1576,32 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
                     logger.error(f"Fallback also failed for '{agent_id}': {e2}")
                     runtime = {}
 
+            # ── Resolve enabled_toolsets ──────────────────────────
+            # cfg["enabled_toolsets"] is the canonical tool field.
+            #
+            #   None       → pass None to AIAgent → ALL tools (full clone)
+            #   []         → pass []   to AIAgent → zero tools (sandboxed)
+            #   ["t1","t2"]→ pass list to AIAgent → restricted set
+            #
+            # IMPORTANT: we CANNOT use `cfg.get(...) or None` because
+            # empty list [] is falsy in Python and would be collapsed
+            # to None, turning an explicit "no tools" request into
+            # "all tools".  Always use an explicit `is None` check.
+            raw_toolsets = cfg.get("enabled_toolsets")
+            if raw_toolsets is None:
+                enabled_toolsets = None         # full clone
+            elif isinstance(raw_toolsets, list):
+                enabled_toolsets = raw_toolsets  # [] or ["terminal",...]
+            else:
+                # Defensive: non-list, non-None garbage from a
+                # malformed YAML → treat as full clone with warning.
+                logger.warning(
+                    f"Agent '{agent_id}': enabled_toolsets is "
+                    f"{type(raw_toolsets).__name__} (expected list or None). "
+                    f"Falling back to full clone."
+                )
+                enabled_toolsets = None
+
             self._instances[agent_id] = AIAgent(
                 model=runtime.get("model") or cfg.get("model", ""),
                 provider=runtime.get("provider", ""),
@@ -1540,14 +1612,7 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
                 session_db=self._db,
                 session_id=session_id or cfg.get("session_id", f"agent-{agent_id}"),
                 max_iterations=cfg.get("max_iterations", 3),
-                # Get enabled_toolsets carefully: empty list [] is falsy in
-                # Python, so `cfg.get(...) or None` would turn an explicit
-                # "no tools" request into "all tools".  We check is None
-                # explicitly instead.
-                enabled_toolsets=(
-                    None if cfg.get("enabled_toolsets") is None
-                    else cfg["enabled_toolsets"]
-                ),
+                enabled_toolsets=enabled_toolsets,
             )
 
         return self._instances[agent_id]
