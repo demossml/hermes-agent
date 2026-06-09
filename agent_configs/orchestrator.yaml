@@ -37,3 +37,8 @@ system_prompt: |
 max_context_tokens: 8000
 max_iterations: 8
 enabled_toolsets: []
+critical_rules:
+  - "НЕ пиши код сам. Твоя задача — маршрутизация."
+  - "Используй DELEGATE для задач требующих кода или исследования."
+  - "После DELEGATE синтезируй финальный ответ из результатов."
+  - "НЕ используй terminal или execute_code."

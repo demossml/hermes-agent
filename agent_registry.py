@@ -99,17 +99,19 @@ class AgentRegistry:
         config.setdefault("model", "claude-sonnet-4-20250514")
         config.setdefault("system_prompt", "You are a helpful assistant.")
         config.setdefault("tools", [])
+        config.setdefault("critical_rules", [])    # rules injected into system_prompt
         config.setdefault("max_context_tokens", 8000)
-        config.setdefault("max_iterations", 3)  # default: 3-turn tool loop
-        config.setdefault("provider", "current")  # "current" = use Hermes' active provider
-        config.setdefault("level", 1)           # 0 = orchestrator, 1 = sub-agent, 2+ = grandchild
+        config.setdefault("max_iterations", 3)
+        config.setdefault("provider", "current")
+        config.setdefault("level", 1)
         config.setdefault("parent_id", "orchestrator")
         config.setdefault("subtree_session_id", f"subtree-{agent_id}")
         self._agents[agent_id] = config
         logger.info(
             f"Registered agent: {agent_id} "
             f"(level={config['level']}, parent={config['parent_id']}, "
-            f"provider={config['provider']}, max_iter={config['max_iterations']})"
+            f"provider={config['provider']}, max_iter={config['max_iterations']}, "
+            f"rules={len(config['critical_rules'])})"
         )
 
     def unregister(self, agent_id: str):
@@ -347,6 +349,7 @@ class AgentRegistry:
                 "provider": config.get("provider", "current"),
                 "description": config.get("description", ""),
                 "system_prompt": config.get("system_prompt", ""),
+                "critical_rules": config.get("critical_rules", []),
                 "max_context_tokens": config.get("max_context_tokens", 8000),
                 "max_iterations": config.get("max_iterations", 3),
             }
@@ -1103,6 +1106,28 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
 
     # ── Internal ─────────────────────────────────────────────
 
+    @staticmethod
+    def _build_system_prompt(cfg: dict) -> str:
+        """Build system prompt with critical rules block appended.
+
+        Format:
+            {system_prompt}
+
+            [CRITICAL RULES]
+            1. rule one
+            2. rule two
+
+        Critical rules persist across sessions and are non-negotiable.
+        """
+        prompt = cfg.get("system_prompt", "You are a helpful assistant.")
+        rules = cfg.get("critical_rules", [])
+        if rules:
+            prompt += "\n\n[CRITICAL RULES]\n"
+            for i, rule in enumerate(rules, 1):
+                prompt += f"{i}. {rule}\n"
+            prompt += "\nThese rules persist across sessions. Follow them ALWAYS."
+        return prompt
+
     def _get_agent(self, agent_id: str, cfg: dict, session_id: str = ""):
         """Get or create an AIAgent using Hermes' built-in provider resolution.
 
@@ -1157,9 +1182,7 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
                 api_key=runtime.get("api_key", ""),
                 base_url=runtime.get("base_url", ""),
                 api_mode=runtime.get("api_mode", "chat_completions"),
-                ephemeral_system_prompt=cfg.get(
-                    "system_prompt", "You are a helpful assistant."
-                ),
+                ephemeral_system_prompt=self._build_system_prompt(cfg),
                 session_db=self._db,
                 session_id=session_id or cfg.get("session_id", f"agent-{agent_id}"),
                 max_iterations=cfg.get("max_iterations", 3),
