@@ -175,25 +175,51 @@ class AgentRegistry:
                 lines.append(self.get_tree(child_id, indent + 1))
         return "\n".join(lines)
 
+    def _is_descendant(self, ancestor_id: str, target_id: str) -> bool:
+        """Check if target_id is a descendant of ancestor_id."""
+        if ancestor_id == target_id:
+            return True
+        cfg = self._agents.get(target_id)
+        if not cfg:
+            return False
+        parent = cfg.get("parent_id", "")
+        while parent and parent in self._agents:
+            if parent == ancestor_id:
+                return True
+            parent = self._agents[parent].get("parent_id", "")
+        return False
+
+    def _check_tool_permission(self, caller_id: str, target_id: str) -> None:
+        """Check if caller can modify tools of target.
+
+        Rules:
+        - orchestrator (level 0) → any agent
+        - sub-agent → only self and descendants (not siblings, not parent, not unrelated)
+        """
+        if caller_id == "orchestrator":
+            return
+        if not self._is_descendant(caller_id, target_id):
+            caller_level = self._agents.get(caller_id, {}).get("level", 1)
+            raise PermissionError(
+                f"Agent '{caller_id}' (level {caller_level}) can only modify tools "
+                f"for itself and its descendants. '{target_id}' is not a descendant."
+            )
+
     def update_tools(
         self, agent_id: str, tools: list, caller_id: str = "orchestrator"
     ) -> None:
-        """Update agent's toolset. Only orchestrator can change tools.
+        """Update agent's toolset with permission check.
 
-        Sub-agents cannot expand their own permissions.
-        The orchestrator decides what each agent is allowed to do.
+        - orchestrator (level 0) → any agent
+        - sub-agent → only self and descendants
         """
-        if caller_id != "orchestrator":
-            raise PermissionError(
-                f"Only orchestrator can modify agent tools. "
-                f"Caller '{caller_id}' attempted to change tools of '{agent_id}'."
-            )
+        self._check_tool_permission(caller_id, agent_id)
         if agent_id not in self._agents:
             raise KeyError(f"Agent '{agent_id}' not found.")
 
         self._agents[agent_id]["tools"] = tools
         self._instances.pop(agent_id, None)  # force recreate with new tools
-        logger.info(f"Tools updated for '{agent_id}' by '{caller_id}'")
+        logger.info(f"Tools updated for '{agent_id}' by '{caller_id}': {tools}")
 
     def reload(self) -> int:
         """Hot-reload all agent configs from agent_configs/ directory.

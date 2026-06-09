@@ -9715,24 +9715,38 @@ class HermesCLI:
                 _cprint(f"  [red]Error: {e}[/]")
 
         elif action == "tools":
+            # /subagents tools <id> [set <tool1,tool2,...>]
             sub_parts = args.split()
             if not sub_parts:
-                _cprint("  Usage: /subagents tools <id> [tool1,tool2,...]")
+                _cprint("  Usage: /subagents tools <id> [set <tool1,tool2,...>]")
                 return
             agent_id = sub_parts[0]
             cfg = registry.get(agent_id)
             if not cfg:
                 _cprint(f"  [red]Agent '{agent_id}' not found[/]")
                 return
-            if len(sub_parts) > 1:
-                tools = sub_parts[1].split(",")
+
+            if len(sub_parts) >= 3 and sub_parts[1] == "set":
+                # Set new tools
+                tools = sub_parts[2].split(",")
+                caller = _active_subagent["name"] if _active_subagent else "orchestrator"
                 try:
-                    registry.update_tools(agent_id, tools)
-                    _cprint(f"  Tools for '{agent_id}': {tools}")
+                    registry.update_tools(agent_id, tools, caller_id=caller)
+                    _cprint(f"  ✅ Tools for '{agent_id}' set to: {tools}")
+                except PermissionError as e:
+                    _cprint(f"  [red]❌ {e}[/]")
                 except Exception as e:
-                    _cprint(f"  [red]{e}[/]")
+                    _cprint(f"  [red]Error: {e}[/]")
             else:
-                _cprint(f"  Tools for '{agent_id}': {cfg.get('tools', [])}")
+                # Show current tools
+                tools = cfg.get("tools", [])
+                enabled = cfg.get("enabled_toolsets", [])
+                parent = cfg.get("parent_id", "?")
+                level = cfg.get("level", "?")
+                _cprint(f"  Agent: {agent_id} [L{level}] parent={parent}")
+                _cprint(f"  Tools: {tools if tools else '(none)'}")
+                if enabled:
+                    _cprint(f"  Toolsets: {enabled}")
 
         elif action == "memory":
             agent_id = args.strip()
