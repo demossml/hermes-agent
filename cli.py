@@ -8443,6 +8443,8 @@ class HermesCLI:
             self._handle_subagents(cmd_original)
         elif canonical == "agent-off":
             self._handle_agent_off()
+        elif canonical == "hermes-update":
+            self._handle_hermes_update(cmd_original)
 
         else:
             # Check for user-defined quick commands (bypass agent loop, no LLM call)
@@ -9656,6 +9658,22 @@ class HermesCLI:
             _cprint(f"  [red]❌ {e}[/]")
         except Exception as e:
             _cprint(f"  [red]Create failed: {e}[/]")
+
+    def _handle_hermes_update(self, cmd: str):
+        """/hermes-update [--dry-run] [--reset-llm] — update multi-agent installation."""
+        dry_run = "--dry-run" in cmd
+        reset_llm = "--reset-llm" in cmd
+
+        if reset_llm:
+            _cprint("  ⚠️  [yellow]--reset-llm: все LLM-настройки будут сброшены к дефолтам[/]")
+
+        try:
+            from multiagent_updater import run_update
+
+            report = run_update(dry_run=dry_run, reset_llm=reset_llm)
+            _cprint(report)
+        except Exception as e:
+            _cprint(f"  [red]Update failed: {e}[/]")
 
     def _handle_subagents(self, cmd: str):
         """/subagents <action> [args] — manage sub-agents.

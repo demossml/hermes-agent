@@ -250,6 +250,29 @@ COMMAND_REGISTRY: list[CommandDef] = [
         args_hint="<agent_id> <system_prompt>",
         cli_only=True,
     ),
+    CommandDef(
+        "subagents",
+        "Manage sub-agents: create, tools, memory, delete, tree. /subagents <action>",
+        "Agents",
+        aliases=("sub",),
+        args_hint="<create|tools|memory|delete|tree> [args...]",
+        cli_only=True,
+    ),
+    CommandDef(
+        "hermes-update",
+        "Update Multi-Agent: migrate configs preserving providers. /hermes-update [--dry-run] [--reset-llm]",
+        "Agents",
+        args_hint="[--dry-run] [--reset-llm]",
+        cli_only=True,
+    ),
+    CommandDef(
+        "agent-off",
+        "Exit sub-agent mode and return to main agent",
+        "Agents",
+        aliases=("off",),
+        args_hint="",
+        cli_only=True,
+    ),
 ]
 
 
