@@ -350,6 +350,7 @@ class AgentRegistry:
                 "description": config.get("description", ""),
                 "system_prompt": config.get("system_prompt", ""),
                 "critical_rules": config.get("critical_rules", []),
+                "rule_reminder_every": config.get("rule_reminder_every", 0),
                 "max_context_tokens": config.get("max_context_tokens", 8000),
                 "max_iterations": config.get("max_iterations", 3),
             }
@@ -447,7 +448,17 @@ class AgentRegistry:
 
                 msg = message if attempt == 0 else f"Please respond concisely: {message}"
 
-                conversation_history = self._load_history(agent_id, session_id)
+                # ── Rule reminder ──────────────────────────────────────
+                reminder_every = cfg.get("rule_reminder_every", 0)
+                if reminder_every > 0:
+                    conversation_history = self._load_history(agent_id, session_id)
+                    msg_count = len([m for m in conversation_history if m.get("role") == "user"])
+                    if msg_count > 0 and msg_count % reminder_every == 0:
+                        msg = "[REMINDER: All critical rules still apply. Follow them strictly.]\n\n" + msg
+                else:
+                    conversation_history = self._load_history(agent_id, session_id)
+                # ────────────────────────────────────────────────────────
+
                 result = agent.run_conversation(
                     msg,
                     conversation_history=conversation_history,
