@@ -330,60 +330,148 @@ class AgentRegistry:
 
         return self._agents[agent_id]
 
-    def _persist_agent_config(self, agent_id: str) -> None:
-        """Write the in-memory agent config back to agent_configs/{agent_id}.yaml.
+    def _persist_agent_config(self, agent_id: str) -> bool:
+        """Write the in-memory agent config to agent_configs/{agent_id}.yaml.
 
-        Called automatically by update_tools(), update_provider(),
-        update_config_param(), and any other mutator that needs the
-        change to survive restarts and hot-reloads.
+        Called automatically by every mutator — update_tools(),
+        update_provider(), update_config_param(), propagate_to_subtree(),
+        and create() — so changes survive restarts and hot-reloads.
 
-        Only persists keys that belong in the YAML file — runtime-only
-        keys like _fallback_model are excluded.
+        Strategy
+        --------
+        1. Read the EXISTING YAML file (if any) to preserve manual edits,
+           custom key ordering, and comments that PyYAML can't round-trip.
+        2. Deep-merge the in-memory config over the file contents so only
+           changed keys are touched.
+        3. Write back with ``yaml.dump(sort_keys=False)`` to keep the
+           key order stable.
+
+        Keys excluded from persistence
+        ------------------------------
+        Runtime-only keys like ``_fallback_model`` are NEVER written to
+        YAML — they live only in ``self._agents`` and are rebuilt on
+        next ``_get_agent()``.
+
+        enabled_toolsets: ``None`` is omitted from YAML so that a
+        reload correctly interprets "no key" as "full clone".
+
+        Returns
+        -------
+        ``True`` if the file was written successfully, ``False`` on any
+        I/O or YAML error (the in-memory config is unaffected).
         """
         cfg = self._agents.get(agent_id)
         if not cfg:
-            return
+            logger.debug(
+                f"_persist_agent_config: agent '{agent_id}' not in registry"
+            )
+            return False
 
         yaml_path = self._config_dir / f"{agent_id}.yaml"
 
-        # ── Build the persistable subset of config ──────────────────
-        persist_cfg: dict = {}
+        # ── Ensure the directory exists ─────────────────────────
+        try:
+            self._config_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.error(
+                f"Cannot create config directory {self._config_dir}: {e}"
+            )
+            return False
+
+        # ── Load existing file (best-effort) ────────────────────
+        existing: dict = {}
+        try:
+            if yaml_path.exists():
+                with open(yaml_path, "r") as fh:
+                    loaded = yaml.safe_load(fh)
+                if isinstance(loaded, dict):
+                    existing = loaded
+                else:
+                    logger.debug(
+                        f"Existing {yaml_path} is not a mapping "
+                        f"(got {type(loaded).__name__}), overwriting."
+                    )
+        except yaml.YAMLError as e:
+            logger.debug(
+                f"YAML parse error reading {yaml_path}: {e}. "
+                f"Will overwrite with fresh config."
+            )
+        except OSError as e:
+            logger.debug(
+                f"Cannot read {yaml_path}: {e}. "
+                f"Will create a new file."
+            )
+
+        # ── Build the persistable config ────────────────────────
+        # Start from the existing file content (preserves hand-edited
+        # keys & ordering), then overlay the in-memory values so that
+        # programmatic changes take precedence.
+        persist_cfg = dict(existing)
 
         # Identity & hierarchy
-        for key in ("agent_id", "parent_id", "level", "subtree_session_id",
-                     "description", "system_prompt"):
+        for key in (
+            "agent_id", "parent_id", "level", "subtree_session_id",
+            "description", "system_prompt",
+        ):
             if key in cfg:
                 persist_cfg[key] = cfg[key]
 
         # LLM configuration
-        for key in ("provider", "model", "temperature", "max_tokens", "top_p",
-                     "fallback_models", "priority", "auto_select",
-                     "reasoning_effort", "inherit_from_parent"):
+        for key in (
+            "provider", "model", "temperature", "max_tokens", "top_p",
+            "fallback_models", "priority", "auto_select",
+            "reasoning_effort", "inherit_from_parent",
+        ):
             if key in cfg:
                 persist_cfg[key] = cfg[key]
 
         # Behaviour
-        for key in ("critical_rules", "rule_reminder_every",
-                     "max_context_tokens", "max_iterations"):
+        for key in (
+            "critical_rules", "rule_reminder_every",
+            "max_context_tokens", "max_iterations",
+        ):
             if key in cfg:
                 persist_cfg[key] = cfg[key]
 
-        # Tools — None means "all tools" (full clone), omit from YAML
-        # so reload preserves the "unrestricted" semantics.
-        if "enabled_toolsets" in cfg and cfg["enabled_toolsets"] is not None:
-            persist_cfg["enabled_toolsets"] = cfg["enabled_toolsets"]
+        # Tools — None means "all tools" (full clone).
+        # Omit the key entirely so that a fresh load_all() interprets
+        # its absence as unrestricted access.
+        if "enabled_toolsets" in cfg:
+            if cfg["enabled_toolsets"] is not None:
+                persist_cfg["enabled_toolsets"] = cfg["enabled_toolsets"]
+            else:
+                # Explicitly remove from persisted dict so reload
+                # gets None (via register() default).
+                persist_cfg.pop("enabled_toolsets", None)
 
-        # ── Write atomically (write + rename would be ideal, but
-        #    yaml.dump is idempotent enough for our use case) ────────
+        # ── Scrub runtime-only keys from persisted output ───────
+        # These must NEVER leak to disk — they're regenerated each run.
+        for runtime_key in (
+            "_fallback_model", "session_id", "status",
+            "sessions_count", "calls", "tokens", "violations",
+            "last_violation", "avg_latency_ms",
+        ):
+            persist_cfg.pop(runtime_key, None)
+
+        # ── Write ───────────────────────────────────────────────
         try:
-            with open(yaml_path, "w") as f:
-                yaml.dump(persist_cfg, f, allow_unicode=True,
-                          default_flow_style=False, sort_keys=False)
-            logger.debug(f"Persisted agent config: {yaml_path}")
-        except Exception as e:
-            logger.warning(
-                f"Failed to persist agent config for '{agent_id}': {e}"
+            with open(yaml_path, "w") as fh:
+                yaml.dump(
+                    persist_cfg, fh,
+                    Dumper=yaml.SafeDumper,
+                    allow_unicode=True,
+                    default_flow_style=False,
+                    sort_keys=False,
+                )
+        except (OSError, yaml.YAMLError) as e:
+            logger.error(
+                f"Failed to persist agent config for '{agent_id}' "
+                f"to {yaml_path}: {e}"
             )
+            return False
+
+        logger.debug(f"Persisted agent config: {yaml_path}")
+        return True
 
     # ── LLM Config Management ────────────────────────────────
 
