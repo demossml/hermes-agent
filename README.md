@@ -1,43 +1,83 @@
 # Hermes Agent — Multi-Agent Edition
 
-Расширенная версия [Hermes Agent](https://github.com/NousResearch/hermes-agent) с мульти-агентной оркестрацией, DAG-пайплайнами и изолированной памятью подагентов.
+Расширенная версия [Hermes Agent](https://github.com/NousResearch/hermes-agent) с мульти-агентной оркестрацией, DAG-пайплайнами, изолированной памятью подагентов и RuleEngine для контроля поведения.
 
 ## Возможности
 
-- **5 подагентов** — coder, researcher, reviewer, summarizer, orchestrator
+### Оркестрация и иерархия
+- **5+ подагентов** — coder, researcher, reviewer, summarizer, orchestrator + динамическое создание
+- **Иерархия уровней** — level 0 (orchestrator) → level 1 (субагенты) → level 2+ (подагенты)
 - **DAG-оркестрация** — цепочки `coder → reviewer`, параллельное выполнение
+- **Адаптивный оркестратор** — ultra-cheap классификатор: SIMPLE → 1 вызов, COMPLEX → full delegation
+- **Динамическое создание** — `/subagents create` или `/agents-create` на лету
+
+### Изоляция и безопасность
+- **Горизонтальная изоляция** — субагент не может вызвать соседнего агента
+- **Изоляция памяти** — каждый агент видит только свою ветку (subtree_session_id)
+- **Контроль инструментов** — только оркестратор меняет tools; субагент — только себе и потомкам
+- **Права создания** — level 1 может создать только своих level 2 детей
+
+### Память (Subtree Architecture)
+- **Ветки памяти** — coder + его дети делят один `subtree_session_id`
+- **Главный агент** — `main-session`; каждая ветка — свой изолированный subtree
+- **Наследование** — подагенты наследуют `subtree_session_id` от родителя
+- **Чтение памяти** — `/subagents memory <id>` показывает историю всей ветки
+
+### RuleEngine
+- **critical_rules** — правила в YAML конфиге, переживают сессии
+- **_build_system_prompt** — автоматически вставляет [CRITICAL RULES] в system_prompt
+- **rule_reminder_every** — напоминание каждые N сообщений
+- **RuleChecker** — детектор нарушений (keyword matching)
+- **Self-correction loop** — до 2 попыток исправления
+- **Сохранение при сжатии** — [RULES STILL APPLY] в history summary
+- **Статистика нарушений** — violations + last_violation в /agents
+
+### Интерфейс
+- **Индикатор агента** — статус-бар показывает `[coder]` когда активен субагент
+- **Цветная иерархия** — level 0 (синий), level 1 (зелёный), level 2+ (жёлтый)
 - **@mention роутинг** — `@coder напиши сортировку` в Telegram/Discord
-- **Slash-команды** — `/agent`, `/orchestrate`, `/agents` в CLI и gateway
-- **provider: current** — подагенты используют тот же провайдер что и главный Hermes (без отдельных API-ключей)
-- **Per-agent toolsets** — coder с terminal/file, researcher с browser/search
-- **История между вызовами** — скользящее окно токенов + авто-суммаризация
-- **Shared scratchpad** — канал для общения агентов
-- **Статистика** — calls, tokens, avg latency на каждого агента
-- **Retry с fallback** — автоматический ретрай при ошибках
+- **Slash-команды** — `/agent`, `/orchestrate`, `/subagents`, `/agent-off`
+- **provider: current** — подагенты используют тот же провайдер что и главный Hermes
 
 ## Архитектура
 
 ```
-Пользователь → Главный агент Hermes
+Пользователь → Главный агент Hermes [level 0, main-session]
                  │
-                 ├── CLI:   /agent coder <msg>
-                 │          /orchestrate <msg>
-                 │          /agents
+                 ├── CLI:   /subagents tree           — дерево иерархии
+                 │          /subagents create <id>    — создать субагента
+                 │          /subagents tools <id> set — управление инструментами
+                 │          /subagents memory <id>    — чтение памяти ветки
+                 │          /agent <id> <msg>         — вызов + активация
+                 │          /agent-off                — возврат к главному
+                 │          /orchestrate <msg>        — авто-делегирование
+                 │          /agents                   — список + violations
                  │
                  ├── Gateway: @coder <msg>
                  │            @orchestrate <msg>
-                 │            @agents
                  │
                  └── AgentRegistry
-                      ├── orchestrator (маршрутизация)
-                      │    ├── DELEGATE: coder | задача | -> reviewer
-                      │    ├── DELEGATE: researcher | задача
-                      │    └── Параллельное выполнение через asyncio.gather
+                      ├── orchestrator [L0, main-session]
+                      │    ├── critical_rules: маршрутизация, DELEGATE
+                      │    ├── rule_reminder_every: 3
+                      │    └── RuleChecker: self-correction
                       │
-                      ├── coder (терминал, файлы, код)
-                      ├── researcher (браузер, поиск)
-                      ├── reviewer (проверка кода)
-                      └── summarizer (резюме)
+                      ├── coder [L1, subtree-coder]
+                      │    ├── tools: terminal, file
+                      │    └── children: [L2] code-checker ← общая память
+                      │
+                      ├── researcher [L1, subtree-researcher]
+                      │    └── tools: browser, search
+                      │
+                      ├── reviewer [L1, subtree-reviewer]
+                      │    └── tools: file, search
+                      │
+                      └── summarizer [L1, subtree-summarizer]
+
+Изоляция:
+  coder ✗→ researcher    (горизонтальная блокировка)
+  coder ✓→ code-checker   (свой потомок)
+  orchestrator ✓→ любой   (level 0)
 ```
 
 ## Установка
@@ -48,77 +88,83 @@ git clone https://github.com/demossml/hermes-agent.git
 cd hermes-agent
 git checkout multi-agent
 
-# Установить зависимости (если нужно)
+# Установить зависимости
 pip install -e .
 
-# Скопировать конфиги агентов
-cp agent_configs/*.yaml ~/.hermes/hermes-agent/agent_configs/
-
+# Конфиги агентов уже в agent_configs/
 # Установить @mention hook для gateway (опционально)
 python install_hooks.py
-hermes hooks doctor
 ```
 
 ## CLI команды
 
 ```bash
-# Список всех подагентов со статистикой
+# Дерево иерархии с уровнями и violations
+/subagents tree
+
+# Создать субагента (по умолчанию под текущим активным)
+/subagents create translator "Переводи на английский"
+/subagents create code-checker "Проверяй код" --parent coder
+
+# Управление инструментами
+/subagents tools coder                    # показать текущие
+/subagents tools coder set file,search    # установить новые
+
+# Память ветки
+/subagents memory coder                   # последние 20 сообщений
+/subagents memory coder --limit 50        # последние 50
+/subagents memory coder --full            # вся история
+
+# Удалить субагента
+/subagents delete translator
+
+# Список с колонкой Violations
 /agents
 
-# Прямой вызов подагента
-/agent coder напиши функцию сортировки на Python
-/agent researcher объясни архитектуру transformer
-/agent reviewer проверь этот код на безопасность
+# Прямой вызов + активация
+/agent coder напиши функцию сортировки
+/agent coder                               # только переключиться
 
-# Оркестратор — сам решит кому делегировать
-/orchestrate исследуй алгоритмы сортировки и напиши бенчмарк
+# Вернуться к главному
+/agent-off
 
-# Создать нового агента на лету
-/agents-create translator Переводи всё на английский
-
-# Hot-reload конфигов
-/agents-reload
+# Оркестратор
+/orchestrate исследуй и напиши бенчмарк
 ```
 
 ## Gateway (Telegram / Discord)
 
 ```
-@agents                              # список агентов
-@coder напиши парсер JSON            # прямой вызов coder
-@researcher что такое RAG            # прямой вызов researcher
-@orchestrate сложная задача          # через оркестратор
-@agents-reload                       # перезагрузка конфигов
+@coder напиши парсер JSON
+@researcher что такое RAG
+@orchestrate сложная задача
+@agents
+@agents-reload
 ```
 
 ## Конфигурация агентов
 
-Агенты живут в `agent_configs/*.yaml`. Пример:
-
 ```yaml
 agent_id: coder
-provider: current          # current = использовать провайдер Hermes
+provider: current
+level: 1
+parent_id: orchestrator
+subtree_session_id: subtree-coder
 description: "Пишет код"
 system_prompt: |
-  Ты — агент-программист. Пишешь чистый код.
+  Ты — агент-программист.
+
+# ── RuleEngine ──────
+critical_rules:
+  - "НЕ пиши код пока не попросят явно"
+  - "Всегда добавляй docstring"
+rule_reminder_every: 3
+
+# ── Настройки ───────
 max_context_tokens: 8000
-max_iterations: 5          # макс. итераций tool loop
-enabled_toolsets: [terminal, file, search, skills]
+max_iterations: 5
+enabled_toolsets: [terminal, file, search]
 ```
-
-`provider: current` — подагент использует тот же API-ключ что и главный Hermes. Для отдельных провайдеров: `provider: anthropic` или `provider: deepseek`.
-
-## DAG пайплайны
-
-Оркестратор поддерживает цепочки через `| ->`:
-
-```
-DELEGATE: coder | напиши парсер | -> reviewer
-DELEGATE: researcher | найди best practices
-```
-
-- coder получает задачу, reviewer получает **вывод coder** как контекст
-- Если coder упал — reviewer пропускается
-- Результаты сохраняются как `coder→reviewer` в статистике
 
 ## Python API
 
@@ -129,65 +175,71 @@ from agent_registry import get_registry
 async def main():
     r = get_registry()
 
-    # Прямой вызов
-    reply = await r.call("coder", "session-1", "напиши hello world")
-    print(reply)
+    # Прямой вызов с проверкой изоляции
+    reply = await r.call("coder", "session-1", "напиши sort",
+                         caller_id="orchestrator")
 
-    # Оркестратор
-    reply = await r.orchestrate("session-1", "исследуй и напиши сортировку")
-    print(reply)
+    # Оркестратор (адаптивный: SIMPLE/COMPLEX)
+    reply = await r.orchestrate("session-1", "исследуй алгоритмы")
 
-    # Стриминг
-    async for chunk in r.stream("researcher", "session-1", "что такое RAG"):
-        print(chunk, end="")
+    # Создать агента с проверкой прав
+    created = r.create("helper", {
+        "system_prompt": "Помогай с кодом",
+        "parent_id": "coder",
+    }, caller_id="orchestrator")  # level авто = 2
 
-    # Диалог между агентами
-    transcript = await r.dialogue("coder", "researcher", "session-1",
-        "Discuss: is Python good for ML?", turns=3)
+    # Разрешённые вызовы
+    r._check_isolation("coder", "child1")       # ✅ потомок
+    r._check_isolation("coder", "researcher")    # ❌ сосед
 
-    # Статистика
+    # Memory
+    msgs = r.get_subtree_memory("coder", limit=50)
+
+    # Tools
+    r._check_tool_permission("coder", "child1")  # ✅ свой потомок
+    r.update_tools("child1", ["file"], caller_id="coder")
+
+    # Статистика с violations
     for a in r.list():
-        print(f"{a['agent_id']}: {a['calls']} calls, {a['avg_latency_ms']}ms")
+        print(f"{a['agent_id']}: {a['calls']} calls, "
+              f"{a['violations']} violations")
 
-    # Создать агента на лету
-    r.create("translator", {"system_prompt": "Translate to English"})
-
-    # Shared scratchpad
-    r.scratchpad_publish("general", "coder", "I wrote the parser")
-    msgs = r.scratchpad_read("general")
+    # Дерево иерархии
+    print(r.get_tree())
 
 asyncio.run(main())
 ```
 
-## Структура файлов
+## Permission Matrix
+
+| Действие | orchestrator (L0) | sub-agent (L1+) |
+|----------|------------------|-----------------|
+| Создать агента | под любым parent | только parent=self |
+| Вызвать агента | любого | только потомков |
+| Менять tools | любому | себе и потомкам |
+| Читать память | любой ветки | только своей |
+| Удалить агента | любого | только своих детей |
+
+## Структура
 
 ```
-agent_registry.py              # реестр + оркестратор + DAG
-agent_configs/
-├── coder.yaml                 # пишет код (terminal, file, search)
-├── researcher.yaml            # исследует (browser, search, web)
-├── reviewer.yaml              # проверяет код
-├── orchestrator.yaml          # маршрутизация (без инструментов)
-└── summarizer.yaml            # резюмирует текст
-
-gateway/
-├── agent_mention.py           # @mention роутинг для gateway
-└── run.py                     # патч: перехват @ перед dispatch
-
-hooks/
-└── agent-mention/             # Hook-альтернатива для @mention
-    ├── HOOK.yaml
-    └── handler.py
-
-install_hooks.py               # установщик hook
+multi-agent/                           ← ветка
+├── agent_registry.py                  ← реестр + оркестратор + RuleEngine
+├── agent_configs/
+│   ├── orchestrator.yaml              ← L0, main-session, critical_rules
+│   ├── coder.yaml                     ← L1, subtree-coder
+│   ├── researcher.yaml                ← L1, subtree-researcher
+│   ├── reviewer.yaml                  ← L1, subtree-reviewer
+│   └── summarizer.yaml                ← L1, subtree-summarizer
+├── cli.py                             ← /subagents, /agent-off, индикатор
+├── hermes_cli/
+│   └── commands.py                    ← CommandDef для новых команд
+├── gateway/
+│   ├── agent_mention.py               ← @mention роутинг
+│   └── run.py                         ← диспетчеризация
+├── hooks/agent-mention/               ← hook-интеграция
+└── install_hooks.py
 ```
-
-## Зависимости
-
-- Hermes Agent (основной репо)
-- `pyyaml` — парсинг конфигов
-- `anthropic` — опционально, если `provider: anthropic`
-- SessionDB из `hermes_state.py` — для истории и scratchpad
 
 ## Лицензия
 
