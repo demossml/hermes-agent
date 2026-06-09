@@ -523,63 +523,107 @@ class AgentRegistry:
         Permission rules:
         - caller.level == 0 → allowed under any parent_id
         - caller.level ≥ 1 → allowed ONLY if parent_id == caller_id
-        - Auto-computed: level = parent_level + 1
-        - Generates subtree_session_id for isolated memory namespace.
 
-        Saves config to agent_configs/{agent_id}.yaml so it survives restarts.
+        Toolset behaviour (enabled_toolsets):
+        - key ABSENT in config  → None (FULL CLONE — all tools inherited)
+        - None explicitly        → None (same as above)
+        - [] explicitly          → empty list (sandboxed — no tools)
+        - ["terminal","file"]    → restricted to those toolsets
+
+        Other auto-computed fields:
+        - level = parent_level + 1 (unless explicit)
+        - subtree_session_id = new branch ID (under orchestrator)
+          or inherit from parent (under sub-agent)
+        - LLM config (provider, model, temperature, …) inherited
+          from parent unless explicitly overridden
+
+        Saves config to agent_configs/{agent_id}.yaml so it
+        survives restarts and hot-reloads.
         """
+        import uuid
+
         parent_id = config.get("parent_id", caller_id)
 
-        # ── Permission check ──────────────────────────────────────────
+        # ── Permission check ──────────────────────────────────────
         self._check_create_permission(caller_id, parent_id)
 
-        # Auto-compute level from parent
+        # ── Hierarchy: level ──────────────────────────────────────
         if "level" not in config and parent_id in self._agents:
             parent_level = self._agents[parent_id].get("level", 0)
             config["level"] = parent_level + 1
 
-        # Generate or inherit subtree session ID for memory isolation
-        # - parent == orchestrator → new subtree_session_id (new branch)
-        # - parent is sub-agent → inherit subtree_session_id (same branch)
-        import uuid
+        # ── Memory isolation: subtree_session_id ───────────────────
+        # Each top-level branch (child of orchestrator) gets its own
+        # isolated memory namespace.  Descendants of a sub-agent
+        # inherit the parent's subtree_session_id so they share
+        # memory with their branch.
         if "subtree_session_id" in config:
             subtree_session_id = config["subtree_session_id"]
         elif parent_id != "orchestrator" and parent_id in self._agents:
-            # Inherit from parent — same memory branch
+            # Inherit parent's session — same memory branch
             subtree_session_id = self._agents[parent_id].get(
                 "subtree_session_id",
-                f"subtree-{parent_id}-{uuid.uuid4().hex[:8]}"
+                f"subtree-{parent_id}-{uuid.uuid4().hex[:8]}",
             )
         else:
-            # New branch under orchestrator
+            # Fresh branch under orchestrator
             subtree_session_id = f"subtree-{agent_id}-{uuid.uuid4().hex[:8]}"
 
+        # ── Identity ──────────────────────────────────────────────
         config["agent_id"] = agent_id
         config["parent_id"] = parent_id
         config["subtree_session_id"] = subtree_session_id
 
-        # Inherit LLM params from parent if inherit_from_parent is True
+        # ── Tools: full clone by default ───────────────────────────
+        # If the caller didn't specify a toolset at all, the agent
+        # becomes a FULL CLONE (None = AIAgent loads every available
+        # tool).  Explicit [] means sandboxed (no tools).
+        # Explicit ["terminal", …] means restricted to those.
+        if "enabled_toolsets" not in config:
+            config["enabled_toolsets"] = None   # full clone
+
+        # ── LLM inheritance from parent ────────────────────────────
+        # Child agents inherit provider, model, temperature, etc.
+        # from their parent unless explicitly overridden in config.
+        # Controlled by inherit_from_parent (default True).
         if config.get("inherit_from_parent", True) and parent_id in self._agents:
             parent = self._agents[parent_id]
-            for key in ("provider", "model", "temperature", "max_tokens", "top_p",
-                        "fallback_models", "priority", "auto_select", "reasoning_effort"):
+            for key in (
+                "provider", "model", "temperature", "max_tokens",
+                "top_p", "fallback_models", "priority", "auto_select",
+                "reasoning_effort",
+            ):
                 if key not in config:
                     config[key] = parent.get(key, config.get(key))
 
+        # ── Register & persist ────────────────────────────────────
         self.register(agent_id, config)
 
-        # Persist to YAML using the shared helper so create() and
-        # update_tools() use identical serialization logic.
         yaml_path = self._config_dir / f"{agent_id}.yaml"
         try:
             self._persist_agent_config(agent_id)
+
+            # Human-readable toolset description for the log line
+            ets = config.get("enabled_toolsets")
+            if ets is None:
+                tools_desc = "ALL (full clone)"
+            elif len(ets) == 0:
+                tools_desc = "none (sandboxed)"
+            else:
+                tools_desc = ", ".join(ets)
+
             logger.info(
                 f"Created agent '{agent_id}' "
                 f"(level={config.get('level')}, parent={parent_id}, "
+                f"provider={config.get('provider')}/{config.get('model', '?')}, "
+                f"tools={tools_desc}, "
                 f"session={subtree_session_id}) → {yaml_path}"
             )
         except Exception as e:
-            logger.warning(f"Failed to persist agent config for {agent_id}: {e}")
+            logger.warning(
+                f"Failed to persist agent config for '{agent_id}': {e}"
+            )
+
         return self._agents[agent_id]
 
     # ── Lifecycle ────────────────────────────────────────────
