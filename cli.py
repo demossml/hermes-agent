@@ -9710,35 +9710,70 @@ class HermesCLI:
             _cprint("\n" + "\n".join(colored_lines))
 
         elif action == "create":
-            # Parse: /subagents create <id> "<prompt>" [--parent <parent_id>]
+            # Parse: /subagents create <id> "<prompt>" [--parent <id>] [--full] [--tools <list|all>]
             sub_parts = args.split(None, 1)
             if not sub_parts:
-                _cprint("  Usage: /subagents create <id> \"<system_prompt>\" [--parent <id>]")
+                _cprint("  Usage: /subagents create <id> \"<system_prompt>\" [--parent <id>] [--full] [--tools <list|all>]")
                 return
 
             agent_id = sub_parts[0]
             remaining = sub_parts[1] if len(sub_parts) > 1 else ""
 
-            # Parse --parent flag
+            # ── Parse flags ────────────────────────────────────────
             parent_id = _active_subagent["name"] if _active_subagent else "orchestrator"
             prompt = remaining
+            explicit_toolsets = None   # None = ALL tools (full clone), list = restricted
+
+            # --parent <id>
             if "--parent" in remaining:
                 parent_match = remaining.split("--parent", 1)[1].strip().split()[0]
                 parent_id = parent_match
-                prompt = remaining.replace(f"--parent {parent_match}", "").strip().strip('"')
+                prompt = prompt.replace(f"--parent {parent_match}", "").strip()
+
+            # --full  (explicit full clone with ALL tools)
+            if "--full" in prompt:
+                explicit_toolsets = None   # None → AIAgent loads every tool
+                prompt = prompt.replace("--full", "").strip()
+
+            # --tools all  (same as --full)
+            if "--tools all" in prompt:
+                explicit_toolsets = None
+                prompt = prompt.replace("--tools all", "").strip()
+            elif "--tools" in prompt:
+                # --tools terminal,file,web_search  (restricted set)
+                tools_match = prompt.split("--tools", 1)[1].strip()
+                # Stop at next flag or end of string
+                if " --" in tools_match:
+                    tools_match = tools_match.split(" --", 1)[0]
+                explicit_toolsets = [t.strip() for t in tools_match.split(",") if t.strip()]
+                prompt = prompt.replace(f"--tools {tools_match}", "").strip()
+
+            # Strip quotes from prompt
+            prompt = prompt.strip().strip('"').strip("'")
 
             if not prompt:
-                _cprint("  Usage: /subagents create <id> \"<system_prompt>\" [--parent <id>]")
+                _cprint("  Usage: /subagents create <id> \"<system_prompt>\" [--parent <id>] [--full] [--tools <list|all>]")
+                _cprint("")
+                _cprint("  Examples:")
+                _cprint("    /subagents create myagent \"Ты — эксперт по Python\"")
+                _cprint("    /subagents create myagent \"...\" --full")
+                _cprint("    /subagents create myagent \"...\" --tools terminal,file")
+                _cprint("    /subagents create child \"...\" --parent coder")
                 return
 
             try:
                 caller = _active_subagent["name"] if _active_subagent else "orchestrator"
-                created = registry.create(agent_id, {
+
+                # Build config dict — always set enabled_toolsets explicitly
+                create_config = {
                     "system_prompt": prompt,
                     "parent_id": parent_id,
                     "description": f"Created by {caller}",
                     "max_iterations": 5,
-                }, caller_id=caller)
+                    "enabled_toolsets": explicit_toolsets,  # None=ALL, list=restricted
+                }
+
+                created = registry.create(agent_id, create_config, caller_id=caller)
 
                 # ── Build a rich success message ──────────────────
                 level = created.get("level", 1)
@@ -9747,10 +9782,10 @@ class HermesCLI:
                 subtree = created.get("subtree_session_id", "?")
                 inherit_from = created.get("inherit_from_parent", True)
                 parent_name = created.get("parent_id", "?")
+                ets = created.get("enabled_toolsets")
 
                 # Provider display
                 if provider == "current":
-                    # Resolve what "current" actually means
                     from hermes_cli.runtime_provider import resolve_runtime_provider
                     try:
                         rt = resolve_runtime_provider(requested=None, target_model=None)
@@ -9765,38 +9800,59 @@ class HermesCLI:
 
                 provider_line = f"{provider_display}"
                 if model_display:
-                    # Shorten long model names
                     short_model = model_display.split("/")[-1] if "/" in model_display else model_display
                     provider_line += f" ({short_model})"
                 if inherit_from:
                     provider_line += " — унаследован"
 
                 # Tools description
-                ets = created.get("enabled_toolsets")
                 if ets is None:
-                    tools_line = "ALL (полный клон Гермеса)"
+                    tools_line = "ALL (полный доступ)"
                 elif len(ets) == 0:
                     tools_line = "none (sandboxed — без инструментов)"
                 else:
                     tools_line = ", ".join(ets)
 
+                # ── Capability indicators ────────────────────────
+                def _has(tool: str) -> bool:
+                    """Check if a toolset is available (None = all available)."""
+                    return ets is None or tool in ets
+
+                capabilities = [
+                    ("Delegation",   _has("delegation"),   "Может создавать подагентов и делегировать задачи"),
+                    ("Messaging",    _has("messaging"),    "Может отправлять сообщения в Telegram/Discord/Slack"),
+                    ("Terminal",     _has("terminal"),     "Доступ к shell-командам"),
+                    ("File",         _has("file"),         "Чтение/запись/поиск файлов"),
+                    ("Web Search",   _has("web_search"),   "Поиск в интернете"),
+                    ("Skills",       _has("skills"),       "Управление навыками (сохранение опыта)"),
+                    ("Browser",      _has("browser"),      "Автоматизация браузера"),
+                ]
+
                 # Config path
                 config_path = f"agent_configs/{agent_id}.yaml"
 
+                # ── Print success banner ─────────────────────────
+                clone_label = "как полноценный клон" if (ets is None) else ""
                 _cprint("")
-                _cprint(f"  [bold green]✅ Субагент '{agent_id}' успешно создан[/]")
+                _cprint(f"  [bold green]✅ Субагент '{agent_id}' успешно создан {clone_label}[/]".rstrip())
                 _cprint("")
-                _cprint(f"  Level:    {level} | Parent: {parent_name}")
-                _cprint(f"  Provider: {provider_line}")
-                _cprint(f"  Tools:    {tools_line}")
-                _cprint(f"  Memory:   {subtree} (изолирована)")
-                _cprint(f"  Config:   {config_path}")
+                _cprint(f"  [bold]Level:[/]    {level} | Parent: {parent_name}")
+                _cprint(f"  [bold]Provider:[/] {provider_line}")
+                _cprint(f"  [bold]Tools:[/]    {tools_line}")
+                _cprint(f"  [bold]Memory:[/]   изолированная ([dim]{subtree}[/])")
                 _cprint("")
-                _cprint("  [bold]Доступные команды:[/]")
-                _cprint(f"    /agent {agent_id} <задача>                 — отправить задачу")
-                _cprint(f"    /subagents tools {agent_id}                — управление инструментами")
-                _cprint(f"    /subagents memory {agent_id}               — просмотреть память")
-                _cprint(f"    /subagents tree                            — посмотреть иерархию")
+                _cprint("  [bold]Capabilities:[/]")
+                for cap_name, available, desc in capabilities:
+                    icon = "[green]✅[/]" if available else "[red]✗[/]"
+                    _cprint(f"    {icon} [bold]{cap_name}:[/] {desc}")
+                _cprint("")
+                _cprint(f"  [bold]Config:[/]   {config_path}")
+                _cprint("")
+                _cprint("  [bold]Используйте:[/]")
+                _cprint(f"    [cyan]/agent {agent_id} <задача>[/]           — отправить задачу субагенту")
+                _cprint(f"    [cyan]/subagents tools {agent_id}[/]          — управление инструментами")
+                _cprint(f"    [cyan]/subagents memory {agent_id}[/]         — просмотреть память ветки")
+                _cprint(f"    [cyan]/subagents tree[/]                      — посмотреть иерархию")
                 _cprint("")
             except PermissionError as e:
                 _cprint(f"  [red]❌ {e}[/]")
@@ -10003,9 +10059,11 @@ class HermesCLI:
             _cprint("  /subagents create|tools|memory|delete|tree")
             _cprint("  Examples:")
             _cprint("    /subagents tree")
-            _cprint("    /subagents create translator Translate to English")
+            _cprint('    /subagents create translator "Translate to English"')
+            _cprint('    /subagents create expert "Ты — эксперт" --full')
+            _cprint('    /subagents create helper "..." --tools terminal,file')
             _cprint("    /subagents tools translator")
-            _cprint("    /subagents tools translator file,search")
+            _cprint("    /subagents tools translator set file,search")
             _cprint("    /subagents delete translator")
 
     def _handle_agent_off(self):
