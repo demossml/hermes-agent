@@ -2,6 +2,96 @@
 
 Расширенная версия [Hermes Agent](https://github.com/NousResearch/hermes-agent) с мульти-агентной оркестрацией, DAG-пайплайнами, изолированной памятью подагентов и **RuleEngine** для контроля поведения.
 
+## Quick Start
+
+```bash
+# 1. Стянуть обновления
+cd ~/.hermes/hermes-agent
+git pull origin multi-agent
+pip install -e .
+
+# 2. Включить инструменты для multi-agent
+hermes tools enable delegation messaging
+
+# 3. Применить миграции к существующим агентам (если есть)
+hermes update
+
+# 4. Запустить Hermes
+hermes
+```
+
+После этого вам доступны все команды:
+
+```
+/subagents tree                              # посмотреть иерархию
+/subagents create myclone "Ты — ..."         # создать полноценного клона
+/agent myclone напиши функцию                # вызвать субагента
+/orchestrate сложная задача                  # авто-делегирование
+/agents                                      # список с нарушениями
+```
+
+**Что происходит при `hermes tools enable delegation messaging`:**
+- Включает `delegation` и `messaging` глобально для Hermes
+- Автоматически пропагирует эти toolsets во **все существующие** L1+ агенты
+- Новые агенты создаются сразу с полным доступом (`enabled_toolsets: null`)
+- Не нужно вручную настраивать `/subagents tools` для каждого
+
+---
+
+## Создание полноценного клона
+
+Новый субагент по умолчанию создаётся как **полноценный клон Гермеса** —
+с полным доступом ко всем инструментам, включая создание подагентов,
+работу с Telegram/Discord, файловую систему и браузер.
+
+```bash
+# Создать полноценного клона (по умолчанию — ALL tools)
+/subagents create telegram_clone "Ты — автономный Telegram-клон Гермеса. Можешь создавать каналы и подагентов."
+
+# Явно указать полный доступ
+/subagents create myclone "..." --full
+/subagents create myclone "..." --tools all
+
+# Создать с ограниченным набором инструментов
+/subagents create helper "..." --tools terminal,file
+
+# Создать подагента под другим родителем
+/subagents create child "..." --parent coder
+```
+
+**Вывод при создании:**
+
+```
+✅ Субагент 'telegram_clone' успешно создан как полноценный клон
+
+Level:    1 | Parent: orchestrator
+Provider: deepseek (deepseek-v4-pro) — унаследован
+Tools:    ALL (полный доступ)
+Memory:   изолированная (subtree-telegram_clone-a1b2c3d4)
+
+Capabilities:
+  ✅ Delegation: Может создавать подагентов и делегировать задачи
+  ✅ Messaging:  Может отправлять сообщения в Telegram/Discord/Slack
+  ✅ Terminal:   Доступ к shell-командам
+  ✅ File:       Чтение/запись/поиск файлов
+  ✅ Web Search: Поиск в интернете
+  ✅ Skills:     Управление навыками (сохранение опыта)
+  ✅ Browser:    Автоматизация браузера
+
+Используйте:
+  /agent telegram_clone <задача>     — отправить задачу субагенту
+```
+
+**Авто-пропагация при `hermes tools enable`:**
+
+```bash
+$ hermes tools enable delegation
+Enabled: delegation
+Multi-agent: propagated ['delegation'] to 3 agent(s) (1 skipped)
+# → coder, researcher, helper получили delegation
+# → orchestrator пропущен (уже full clone)
+```
+
 ## Возможности
 
 ### Оркестрация и иерархия
@@ -81,7 +171,11 @@
                       │    ├── 20260609: subtree_session_id
                       │    ├── 20260610: enabled_toolsets=None
                       │    ├── 20260611: critical_rules
-                      │    └── 20260612: fallback_models, LLM params
+                      │    ├── 20260612: fallback_models, LLM params
+                      │    └── 20260613: upgrade agent toolsets
+                      │
+                      ├── propagate_toolset_to_agents()
+                      │    └── hermes tools enable → авто-пропагация
                       │
                       ├── orchestrator [L0, main-session]
                       │    ├── critical_rules: маршрутизация, DELEGATE
@@ -116,17 +210,35 @@
 
 ## Установка
 
+### Новая установка
+
 ```bash
-# Клонировать ветку multi-agent
 git clone https://github.com/demossml/hermes-agent.git
 cd hermes-agent
 git checkout multi-agent
+pip install -e .
+```
 
-# Установить зависимости
+### Обновление существующей
+
+```bash
+cd ~/.hermes/hermes-agent
+git pull origin multi-agent
 pip install -e .
 
-# Конфиги агентов уже лежат в agent_configs/
-# Установить @mention-hook для gateway (опционально)
+# Включить multi-agent toolsets + пропагация в агентов
+hermes tools enable delegation messaging
+
+# Применить миграции к существующим конфигам
+hermes update
+```
+
+После обновления все существующие агенты автоматически получат новые toolsets.
+Новые агенты создаются сразу как полноценные клоны.
+
+### Установка @mention-хука (опционально)
+
+```bash
 python install_hooks.py
 ```
 
@@ -142,6 +254,8 @@ python install_hooks.py
 
 # Создать субагента
 /subagents create translator "Переводи на английский"
+/subagents create myclone "Ты — эксперт" --full         # полный клон (ALL tools)
+/subagents create helper "..." --tools terminal,file     # ограниченный набор
 /subagents create code-checker "Проверяй код" --parent coder
 
 # Инструменты
