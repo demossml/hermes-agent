@@ -2530,8 +2530,15 @@ def get_registry(db=None) -> AgentRegistry:
     if _registry is None:
         _registry = AgentRegistry(db)
         _registry.load_all()
-        # Initialise long-term memory (best-effort, non-blocking)
+        # Initialise long-term memory (best-effort, non-blocking).
+        # When ChromaDB is not installed, LTM is silently disabled
+        # and all agents work normally — no crash, no error.
         _registry.init_longterm_memory()
+        if not _registry._longterm_memory or not _registry._longterm_memory.enabled:
+            logger.debug(
+                "Long-Term Memory is disabled (ChromaDB not installed). "
+                "Install with: pip install chromadb"
+            )
     elif db is not None and _registry._db is None:
         _registry.set_db(db)
     return _registry
