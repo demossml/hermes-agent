@@ -226,24 +226,6 @@ def _migrate_upgrade_agent_toolsets(cfg: dict) -> bool:
     cfg["enabled_toolsets"] = list(CURATED)
     return True
 
-class AgentRegistry:
-    """Registry and orchestrator for sub-agents.
-
-    Each agent is a YAML config + a record in SessionDB.
-    Uses Hermes' AIAgent and runtime provider resolution — no manual
-    API keys or AnthropicProvider imports needed.
-    """
-
-    def __init__(self, db=None, config_dir: Path | None = None):
-        self._db = db  # SessionDB — set later if None
-        self._config_dir = config_dir or DEFAULT_CONFIG_DIR
-        self._agents: dict[str, dict] = {}         # agent_id -> config
-        self._tasks: dict[str, asyncio.Task] = {}  # agent_id -> running task
-        self._instances: dict[str, Any] = {}       # agent_id -> AIAgent
-        self._stats: dict[str, dict] = {}          # agent_id -> {calls, tokens, total_ms}
-        self._longterm_memory: LongTermMemory | None = None  # set via init_longterm_memory()
-
-
 # ── RuleChecker (lightweight, no LLM) ─────────────────────────
 
 class RuleChecker:
@@ -366,6 +348,25 @@ class RuleChecker:
 
         self._rules = extracted
         return len(extracted)
+
+
+class AgentRegistry:
+    """Registry and orchestrator for sub-agents.
+
+    Each agent is a YAML config + a record in SessionDB.
+    Uses Hermes' AIAgent and runtime provider resolution — no manual
+    API keys or AnthropicProvider imports needed.
+    """
+
+    def __init__(self, db=None, config_dir: Path | None = None):
+        self._db = db  # SessionDB — set later if None
+        self._config_dir = config_dir or DEFAULT_CONFIG_DIR
+        self._agents: dict[str, dict] = {}         # agent_id -> config
+        self._tasks: dict[str, asyncio.Task] = {}  # agent_id -> running task
+        self._instances: dict[str, Any] = {}       # agent_id -> AIAgent
+        self._stats: dict[str, dict] = {}          # agent_id -> {calls, tokens, total_ms}
+        self._longterm_memory: LongTermMemory | None = None  # set via init_longterm_memory()
+
 
     def set_db(self, db):
         """Set SessionDB after init (avoids circular imports)."""
