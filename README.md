@@ -1,216 +1,225 @@
 # Hermes Agent — Multi-Agent Edition
 
-Расширенная версия [Hermes Agent](https://github.com/NousResearch/hermes-agent) с мульти-агентной оркестрацией, DAG-пайплайнами, изолированной памятью подагентов и **RuleEngine** для контроля поведения.
+An extended version of [Hermes Agent](https://github.com/NousResearch/hermes-agent) with multi-agent orchestration, DAG pipelines, isolated sub-agent memory, per-agent LLM configuration, and a **RuleEngine** for behaviour control.
+
+> **Built on Hermes Agent by Nous Research.** Works with any LLM provider. Runs on Linux, macOS, and WSL.
+
+---
 
 ## Quick Start
 
 ```bash
-# 1. Стянуть обновления
+# 1. Pull the latest changes
 cd ~/.hermes/hermes-agent
 git pull origin multi-agent
 pip install -e .
 
-# 2. Включить инструменты для multi-agent
+# 2. Enable multi-agent toolsets (auto-propagates to all sub-agents)
 hermes tools enable delegation messaging
 
-# 3. Применить миграции к существующим агентам (если есть)
+# 3. Apply migrations to existing agent configs (if any)
 hermes update
 
-# 4. Запустить Hermes
+# 4. Launch Hermes
 hermes
 ```
 
-После этого вам доступны все команды:
+You're ready to go:
 
 ```
-/subagents tree                              # посмотреть иерархию
-/subagents create myclone "Ты — ..."         # создать полноценного клона
-/agent myclone напиши функцию                # вызвать субагента
-/orchestrate сложная задача                  # авто-делегирование
-/agents                                      # список с нарушениями
+/subagents tree                                   # view the agent hierarchy
+/subagents create myclone "You are a Python expert"  # create a full clone
+/agent myclone write a sorting function            # call a sub-agent
+/orchestrate research sorting algorithms            # auto-delegate
+/agents                                           # list all agents with stats
 ```
 
-**Что происходит при `hermes tools enable delegation messaging`:**
-- Включает `delegation` и `messaging` глобально для Hermes
-- Автоматически пропагирует эти toolsets во **все существующие** L1+ агенты
-- Новые агенты создаются сразу с полным доступом (`enabled_toolsets: null`)
-- Не нужно вручную настраивать `/subagents tools` для каждого
+**What `hermes tools enable delegation messaging` does:**
+- Enables `delegation` and `messaging` globally for Hermes
+- Automatically propagates these toolsets to **all existing** L1+ agents
+- New agents are created with full access by default (`enabled_toolsets: null`)
+- No need to manually run `/subagents tools` for each agent
 
 ---
 
-## Создание полноценного клона
+## Creating a Full Clone Agent
 
-Новый субагент по умолчанию создаётся как **полноценный клон Гермеса** —
-с полным доступом ко всем инструментам, включая создание подагентов,
-работу с Telegram/Discord, файловую систему и браузер.
+By default, every new sub-agent is a **full Hermes clone** — it gets access to all tools, including the ability to create its own sub-agents, work with Telegram/Discord, access the file system, and drive a browser.
 
 ```bash
-# Создать полноценного клона (по умолчанию — ALL tools)
-/subagents create telegram_clone "Ты — автономный Telegram-клон Гермеса. Можешь создавать каналы и подагентов."
+# Create a full clone (default — ALL tools)
+/subagents create assistant "You are an autonomous Hermes clone. You can create sub-agents and work across platforms."
 
-# Явно указать полный доступ
+# Explicit full access
 /subagents create myclone "..." --full
 /subagents create myclone "..." --tools all
 
-# Создать с ограниченным набором инструментов
+# Restricted toolset
 /subagents create helper "..." --tools terminal,file
 
-# Создать подагента под другим родителем
+# Create under a different parent
 /subagents create child "..." --parent coder
 ```
 
-**Вывод при создании:**
+**Success output:**
 
 ```
-✅ Субагент 'telegram_clone' успешно создан как полноценный клон
+✅ Sub-agent 'assistant' successfully created as a full clone
 
 Level:    1 | Parent: orchestrator
-Provider: deepseek (deepseek-v4-pro) — унаследован
-Tools:    ALL (полный доступ)
-Memory:   изолированная (subtree-telegram_clone-a1b2c3d4)
+Provider: deepseek (deepseek-v4-pro) — inherited
+Tools:    ALL (full access)
+Memory:   isolated (subtree-assistant-a1b2c3d4)
 
 Capabilities:
-  ✅ Delegation: Может создавать подагентов и делегировать задачи
-  ✅ Messaging:  Может отправлять сообщения в Telegram/Discord/Slack
-  ✅ Terminal:   Доступ к shell-командам
-  ✅ File:       Чтение/запись/поиск файлов
-  ✅ Web Search: Поиск в интернете
-  ✅ Skills:     Управление навыками (сохранение опыта)
-  ✅ Browser:    Автоматизация браузера
+  ✅ Delegation: Can create sub-agents and delegate tasks
+  ✅ Messaging:  Can send messages to Telegram/Discord/Slack
+  ✅ Terminal:   Shell command access
+  ✅ File:       Read/write/search files
+  ✅ Web Search: Internet search
+  ✅ Skills:     Skill management (persistent experience)
+  ✅ Browser:    Browser automation
 
-Используйте:
-  /agent telegram_clone <задача>     — отправить задачу субагенту
+Usage:
+  /agent assistant <task>     — send a task to this sub-agent
 ```
 
-**Авто-пропагация при `hermes tools enable`:**
+**Auto-propagation on `hermes tools enable`:**
 
 ```bash
 $ hermes tools enable delegation
 Enabled: delegation
 Multi-agent: propagated ['delegation'] to 3 agent(s) (1 skipped)
-# → coder, researcher, helper получили delegation
-# → orchestrator пропущен (уже full clone)
+# → coder, researcher, helper received delegation
+# → orchestrator skipped (already full clone)
 ```
 
-## Возможности
+---
 
-### Оркестрация и иерархия
-- **5+ подагентов** — `coder`, `researcher`, `reviewer`, `summarizer`, `orchestrator` и динамическое создание
-- **Иерархия уровней** — `level: 0` (orchestrator) → `level: 1` (субагенты) → `level: 2+` (подагенты)
-- **DAG-оркестрация** — цепочки `coder → reviewer`, параллельное выполнение
-- **Адаптивный оркестратор** — ultra-cheap классификатор: `SIMPLE` → 1 вызов, `COMPLEX` → full delegation
-- **Динамическое создание** — `/subagents create` или `/agents-create` на лету
+## Features
 
-### Изоляция и безопасность
-- **Горизонтальная изоляция** — субагент не может вызвать соседнего агента
-- **Изоляция памяти** — каждый агент видит только свою ветку (`subtree_session_id`)
-- **Full Clone агенты** — по умолчанию новый агент получает **все** инструменты (`enabled_toolsets: None`)
-- **Контроль инструментов** — только оркестратор меняет `enabled_toolsets` через `/subagents tools <id> set|add`
-- **Sandbox-режим** — `enabled_toolsets: []` = агент без инструментов
-- **Права создания** — `level: 1` может создать только своих `level: 2` детей
+### Orchestration & Hierarchy
+- **5+ built-in sub-agents** — `coder`, `researcher`, `reviewer`, `summarizer`, `orchestrator` plus dynamic creation
+- **Level-based hierarchy** — `level: 0` (Orchestrator) → `level: 1` (sub-agents) → `level: 2+` (grandchildren)
+- **DAG pipelines** — `coder → reviewer` chains, parallel execution
+- **Adaptive orchestration** — ultra-cheap classifier: `SIMPLE` → 1 API call, `COMPLEX` → full delegation
+- **Dynamic creation** — `/subagents create` or `/agents-create` on the fly
 
-### Память (Subtree Architecture)
-- **Ветки памяти** — `coder` и его дети делят один `subtree_session_id`
-- **Главный агент** — `main-session`; каждая ветка — свой изолированный `subtree`
-- **Наследование** — подагенты наследуют `subtree_session_id` от родителя
-- **Чтение памяти** — `/subagents memory <id>` показывает историю всей ветки
+### Isolation & Security
+- **Horizontal isolation** — a sub-agent cannot call a sibling agent
+- **Memory isolation** — each agent sees only its own branch (`subtree_session_id`)
+- **Full Clone agents** — new agents get **all** tools by default (`enabled_toolsets: None`)
+- **Tool control** — only the Orchestrator can change `enabled_toolsets` via `/subagents tools <id> set|add`
+- **Sandbox mode** — `enabled_toolsets: []` = agent with zero tools
+- **Creation permissions** — `level: 1` agents can only create `level: 2` children
+
+### Subtree Memory Architecture
+- **Memory branches** — `coder` and its children share one `subtree_session_id`
+- **Main agent** — `main-session`; each branch has its own isolated `subtree`
+- **Inheritance** — grandchildren inherit `subtree_session_id` from their parent
+- **Memory inspection** — `/subagents memory <id>` shows the entire branch history
 
 ### RuleEngine
-- **`critical_rules`** — правила в YAML-конфиге, переживают сессии
-- **`_build_system_prompt`** — автоматически вставляет `[CRITICAL RULES]` в system_prompt
-- **`rule_reminder_every`** — напоминание каждые N сообщений
-- **RuleChecker** — детектор нарушений (keyword matching)
-- **Self-correction loop** — до 2 попыток исправления
-- **Сохранение при сжатии** — `[RULES STILL APPLY]` в history summary
-- **Статистика нарушений** — `violations` и `last_violation` в `/agents`
+- **`critical_rules`** — rules in the YAML config that persist across sessions
+- **`_build_system_prompt`** — automatically injects `[CRITICAL RULES]` into the system prompt
+- **`rule_reminder_every`** — reminder every N user messages
+- **RuleChecker** — violation detector (keyword matching)
+- **Self-correction loop** — up to 2 correction attempts
+- **Compression-safe** — `[RULES STILL APPLY]` preserved in history summaries
+- **Violation stats** — `violations` and `last_violation` visible in `/agents`
 
-### Интерфейс
-- **Индикатор агента** — статус-бар показывает `[coder]`, когда активен субагент
-- **Цветная иерархия** — `level: 0` (синий), `level: 1` (зелёный), `level: 2+` (жёлтый)
-- **@mention-роутинг** — `@coder напиши сортировку` в Telegram / Discord
-- **Слеш-команды** — `/agent`, `/orchestrate`, `/subagents`, `/agent-off`
+### Interface
+- **Agent indicator** — status bar shows `[coder]` when a sub-agent is active
+- **Colored hierarchy** — `level: 0` (blue), `level: 1` (green), `level: 2+` (yellow)
+- **@mention routing** — `@coder write a sorting function` in Telegram / Discord
+- **Slash commands** — `/agent`, `/orchestrate`, `/subagents`, `/agent-off`
 
-### Per-Agent LLM Config
-- **Индивидуальный провайдер** — каждый агент на своём провайдере (`anthropic` / `deepseek` / `openai`)
-- **Наследование** — подагенты наследуют `provider`, `model`, `temperature` от родителя
-- **Smart fallback** — автоматическое переключение на следующую модель из `fallback_models`
-- **Auto-select** — `cheapest` / `fastest` / `balanced` — выбор модели из доступных
-- **Propagation** — изменение настроек родителя применяется ко всей ветке
-- **CLI-управление** — `/subagents provider` для просмотра и настройки
+### Per-Agent LLM Configuration
+- **Individual provider** — each agent on its own provider (`anthropic` / `deepseek` / `openai`)
+- **Inheritance** — children inherit `provider`, `model`, `temperature` from their parent
+- **Smart fallback** — automatic switch to the next model in `fallback_models` on failure
+- **Auto-select** — `cheapest` / `fastest` / `balanced` — pick the best model automatically
+- **Propagation** — parent config changes apply to the entire branch
+- **CLI management** — `/subagents provider` to view and configure
 
-### Безопасное обновление
-- **Версионированные миграции** — `MIGRATIONS` с уникальными ID, идемпотентные, не затирают пользовательские настройки
-- **Автомиграция при `reload()`** — `apply_all_migrations()` вызывается при `/agents-reload` и старте
-- **Трекинг** — `applied_migrations` + `migration_version` в YAML каждого агента
-- **`multiagent_updater`** — делегирует версионированной системе миграций
-- **Бэкап** — автоматический бэкап в `backups/` перед изменениями
-- **Dry-run** — `/hermes-update --dry-run` показывает что изменится без правок
-- **Сброс LLM** — `/hermes-update --reset-llm` для принудительного сброса (опционально)
+### Safe Updater
+- **Versioned migrations** — `MIGRATIONS` with unique IDs; idempotent; never overwrite user settings
+- **Auto-migration on reload** — `apply_all_migrations()` runs on `/agents-reload` and startup
+- **Tracking** — `applied_migrations` + `migration_version` in each agent's YAML
+- **`multiagent_updater`** — delegates to the versioned migration system
+- **Backup** — automatic backup to `backups/` before any changes
+- **Dry-run** — `/hermes-update --dry-run` shows what will change without applying
+- **LLM reset** — `/hermes-update --reset-llm` for forced reset (optional)
 
----
-
-## Архитектура
-
-```
-Пользователь → Главный агент Hermes [level: 0, main-session]
-                 │
-                 ├── CLI:   /subagents tree           — дерево иерархии
-                 │          /subagents create <id>    — создать субагента
-                 │          /subagents tools <id> set — управление инструментами
-                 │          /subagents memory <id>    — чтение памяти ветки
-                 │          /agent <id> <msg>         — вызов + активация
-                 │          /agent-off                — возврат к главному
-                 │          /orchestrate <msg>        — авто-делегирование
-                 │          /agents                   — список с violations
-                 │
-                 ├── Gateway: @coder <msg>
-                 │            @orchestrate <msg>
-                 │
-                 └── AgentRegistry
-                      ├── MIGRATIONS [versioned, idempotent]
-                      │    ├── 20260609: subtree_session_id
-                      │    ├── 20260610: enabled_toolsets=None
-                      │    ├── 20260611: critical_rules
-                      │    ├── 20260612: fallback_models, LLM params
-                      │    └── 20260613: upgrade agent toolsets
-                      │
-                      ├── propagate_toolset_to_agents()
-                      │    └── hermes tools enable → авто-пропагация
-                      │
-                      ├── orchestrator [L0, main-session]
-                      │    ├── critical_rules: маршрутизация, DELEGATE
-                      │    ├── rule_reminder_every: 3
-                      │    └── RuleChecker: self-correction
-                      │
-                      ├── coder [L1, subtree-coder]
-                      │    ├── enabled_toolsets: [terminal, file, search, skills]
-                      │    └── children: [L2] code-checker ← общая память
-                      │
-                      ├── researcher [L1, subtree-researcher]
-                      │    ├── enabled_toolsets: [browser, search, web]
-                      │    └── динамический клон → ALL tools (None)
-                      │
-                      ├── reviewer [L1, subtree-reviewer]
-                      │    └── enabled_toolsets: [file, search]
-                      │
-                      └── summarizer [L1, subtree-summarizer]
-
-Изоляция:
-  coder ✗→ researcher      (горизонтальная блокировка)
-  coder ✓→ code-checker    (свой потомок)
-  orchestrator ✓→ любой    (level 0)
-
-Инструменты:
-  enabled_toolsets: null    → ALL (полный клон Гермеса)
-  enabled_toolsets: [...]   → только указанные наборы
-  enabled_toolsets: []      → sandbox (без инструментов)
-```
+### Auto-Propagation
+- **`propagate_toolset_to_agents()`** — when you `hermes tools enable`, the new toolset is automatically added to every existing L1+ agent
+- After `git pull`, just run `hermes tools enable delegation messaging` — all agents are ready
+- Full Clone agents (None) are skipped — they already have everything
 
 ---
 
-## Установка
+## Architecture
 
-### Новая установка
+```
+User → Main Hermes Agent [level: 0, main-session]
+           │
+           ├── CLI:   /subagents tree           — view hierarchy tree
+           │          /subagents create <id>    — create a sub-agent
+           │          /subagents tools <id> set — manage tools
+           │          /subagents memory <id>    — read branch memory
+           │          /agent <id> <msg>         — call + activate
+           │          /agent-off                — return to main agent
+           │          /orchestrate <msg>        — auto-delegate
+           │          /agents                   — list with Violations
+           │
+           ├── Gateway: @coder <msg>
+           │            @orchestrate <msg>
+           │
+           └── AgentRegistry
+                ├── MIGRATIONS [versioned, idempotent]
+                │    ├── 20260609: subtree_session_id
+                │    ├── 20260610: enabled_toolsets=None
+                │    ├── 20260611: critical_rules
+                │    ├── 20260612: fallback_models, LLM params
+                │    └── 20260613: upgrade agent toolsets
+                │
+                ├── propagate_toolset_to_agents()
+                │    └── hermes tools enable → auto-propagation
+                │
+                ├── orchestrator [L0, main-session]
+                │    ├── critical_rules: routing, DELEGATE
+                │    ├── rule_reminder_every: 3
+                │    └── RuleChecker: self-correction
+                │
+                ├── coder [L1, subtree-coder]
+                │    ├── enabled_toolsets: [terminal, file, search, skills]
+                │    └── children: [L2] code-checker ← shared memory
+                │
+                ├── researcher [L1, subtree-researcher]
+                │    ├── enabled_toolsets: [browser, search, web]
+                │    └── dynamic clone → ALL tools (None)
+                │
+                ├── reviewer [L1, subtree-reviewer]
+                │    └── enabled_toolsets: [file, search]
+                │
+                └── summarizer [L1, subtree-summarizer]
+
+Isolation:
+  coder ✗→ researcher      (horizontal block)
+  coder ✓→ code-checker    (own descendant)
+  orchestrator ✓→ any      (level 0)
+
+Toolsets:
+  enabled_toolsets: null    → ALL (full Hermes clone)
+  enabled_toolsets: [...]   → restricted to listed toolsets
+  enabled_toolsets: []      → sandbox (no tools)
+```
+
+---
+
+## Installation
+
+### Fresh Install
 
 ```bash
 git clone https://github.com/demossml/hermes-agent.git
@@ -219,24 +228,23 @@ git checkout multi-agent
 pip install -e .
 ```
 
-### Обновление существующей
+### Update Existing
 
 ```bash
 cd ~/.hermes/hermes-agent
 git pull origin multi-agent
 pip install -e .
 
-# Включить multi-agent toolsets + пропагация в агентов
+# Enable multi-agent toolsets (auto-propagates to all agents)
 hermes tools enable delegation messaging
 
-# Применить миграции к существующим конфигам
+# Apply migrations to existing configs
 hermes update
 ```
 
-После обновления все существующие агенты автоматически получат новые toolsets.
-Новые агенты создаются сразу как полноценные клоны.
+After the update, all existing agents automatically receive the new toolsets. New agents are created as full clones by default.
 
-### Установка @mention-хука (опционально)
+### Install @mention Hook (optional)
 
 ```bash
 python install_hooks.py
@@ -244,67 +252,67 @@ python install_hooks.py
 
 ---
 
-## CLI-команды
+## CLI Commands
 
-### Управление агентами
+### Agent Management
 
 ```bash
-# Дерево иерархии — уровни, вызовы, нарушения, провайдер
+# Hierarchy tree — levels, calls, violations, provider
 /subagents tree
 
-# Создать субагента
-/subagents create translator "Переводи на английский"
-/subagents create myclone "Ты — эксперт" --full         # полный клон (ALL tools)
-/subagents create helper "..." --tools terminal,file     # ограниченный набор
-/subagents create code-checker "Проверяй код" --parent coder
+# Create a sub-agent
+/subagents create translator "Translate to English"
+/subagents create expert "You are a Python expert" --full      # full clone
+/subagents create helper "..." --tools terminal,file             # restricted
+/subagents create code-checker "Review code" --parent coder
 
-# Инструменты
-/subagents tools coder                     # показать текущие (ALL/список/none)
-/subagents tools coder set file,search     # установить новые (замена)
-/subagents tools coder add web,browser     # добавить к существующим
+# Tools
+/subagents tools coder                     # show current (ALL / list / none)
+/subagents tools coder set file,search     # replace all tools
+/subagents tools coder add web,browser     # add to existing
 
-# Память ветки
-/subagents memory coder                   # последние 20 сообщений
-/subagents memory coder --limit 50        # последние 50
-/subagents memory coder --full            # вся история
+# Branch memory
+/subagents memory coder                   # last 20 messages
+/subagents memory coder --limit 50        # last 50
+/subagents memory coder --full            # entire history
 
-# Удалить
+# Delete
 /subagents delete translator
 
-# Список — ID, Lvl, Calls, Violations, Avg ms
+# List — ID, Lvl, Calls, Violations, Avg ms
 /agents
 ```
 
-### Режимы работы
+### Working Modes
 
 ```bash
-# Вызов + активация субагента
-/agent coder напиши функцию сортировки
+# Call + activate a sub-agent
+/agent coder write a sorting function
 
-# Только переключиться (без сообщения)
+# Switch without sending a message
 /agent coder
 
-# Вернуться к главному агенту
+# Return to the main agent
 /agent-off
 
-# Авто-делегирование через оркестратор
-/orchestrate исследуй алгоритмы и напиши бенчмарк
+# Auto-delegate through the Orchestrator
+/orchestrate research algorithms and write a benchmark
 ```
 
 ### Per-Agent LLM Config
 
 ```bash
-/subagents provider coder                     # показать настройки LLM
+/subagents provider coder                     # show LLM settings
 /subagents provider coder set anthropic claude-3-opus
 /subagents provider coder set-param temperature 0.3
-/subagents provider coder fallback             # fallback-модели
-/subagents provider coder reset                # сброс к дефолтам
-/subagents provider list                       # список провайдеров
+/subagents provider coder fallback             # view fallback models
+/subagents provider coder reset                # reset to defaults
+/subagents provider list                       # list available providers
 
-# Безопасное обновление
-/hermes-update                                  # миграция конфигов
-/hermes-update --dry-run                        # показать что изменится
-/hermes-update --reset-llm                      # полный сброс LLM-настроек
+# Safe update
+/hermes-update                                  # migrate configs
+/hermes-update --dry-run                        # preview changes
+/hermes-update --reset-llm                      # full LLM reset
 ```
 
 ---
@@ -312,23 +320,23 @@ python install_hooks.py
 ## Gateway (Telegram / Discord)
 
 ```
-@coder напиши парсер JSON
-@researcher что такое RAG
-@orchestrate сложная задача
+@coder write a JSON parser
+@researcher what is RAG
+@orchestrate complex multi-step task
 @agents
 @agents-reload
 ```
 
 ---
 
-## Конфигурация агентов
+## Agent Configuration
 
-Агенты живут в `agent_configs/*.yaml`. Полный пример:
+Agents live in `agent_configs/*.yaml`. Full example:
 
 ```yaml
-# ── Идентификация ───
+# ── Identity ────────
 agent_id: coder
-description: "Пишет код"
+description: "Writes clean, documented code"
 level: 1
 parent_id: orchestrator
 subtree_session_id: subtree-coder
@@ -349,15 +357,16 @@ inherit_from_parent: true
 
 # ── System Prompt ───
 system_prompt: |
-  Ты — агент-программист. Пишешь чистый, документированный код.
+  You are a code-writing agent. Write clean, documented Python code.
+  Follow best practices and add type hints.
 
 # ── RuleEngine ──────
 critical_rules:
-  - "НЕ пиши код пока не попросят явно"
-  - "Всегда добавляй docstring к функциям"
+  - "Do NOT write code unless explicitly asked"
+  - "Always add docstrings to functions"
 rule_reminder_every: 3
 
-# ── Инструменты ─────
+# ── Tools ───────────
 max_context_tokens: 8000
 max_iterations: 5
 enabled_toolsets: [terminal, file, search]
@@ -374,38 +383,38 @@ from agent_registry import get_registry
 async def main():
     r = get_registry()
 
-    # ── Вызовы ───────────────────────────────
-    reply = await r.call("coder", "session-1", "напиши sort",
+    # ── Calls ──────────────────────────────────
+    reply = await r.call("coder", "session-1", "write a sort function",
                          caller_id="orchestrator")
 
-    reply = await r.orchestrate("session-1", "исследуй алгоритмы")
+    reply = await r.orchestrate("session-1", "research sorting algorithms")
 
-    # ── Создание ─────────────────────────────
+    # ── Creation ───────────────────────────────
     created = r.create("helper", {
-        "system_prompt": "Помогай с кодом",
+        "system_prompt": "Help with code",
         "parent_id": "coder",
-    }, caller_id="orchestrator")         # level вычисляется автоматически
+    }, caller_id="orchestrator")         # level auto-computed
 
-    # ── Изоляция ─────────────────────────────
-    r._check_isolation("coder", "child1")       # ✅ потомок
-    r._check_isolation("coder", "researcher")    # ❌ сосед — заблокирован
+    # ── Isolation ──────────────────────────────
+    r._check_isolation("coder", "child1")       # ✅ descendant
+    r._check_isolation("coder", "researcher")    # ❌ sibling — blocked
 
-    # ── Память ───────────────────────────────
+    # ── Memory ─────────────────────────────────
     msgs = r.get_subtree_memory("coder", limit=50)
 
-    # ── Инструменты ──────────────────────────
-    r._check_tool_permission("coder", "child1")  # ✅ свой потомок
+    # ── Tools ──────────────────────────────────
+    r._check_tool_permission("coder", "child1")  # ✅ own descendant
     r.update_tools("child1", ["file"], caller_id="coder")
 
-    # ── Статистика ───────────────────────────
+    # ── Stats ──────────────────────────────────
     for a in r.list():
         print(f"{a['agent_id']}: {a['calls']} calls, "
               f"{a['violations']} violations")
 
-    # ── Дерево ───────────────────────────────
+    # ── Tree ───────────────────────────────────
     print(r.get_tree())
 
-    # ── LLM Config ───────────────────────────
+    # ── LLM Config ─────────────────────────────
     r.update_provider("coder", "anthropic", "claude-opus",
                       caller_id="orchestrator")
     r.update_config_param("coder", "temperature", 0.3,
@@ -417,6 +426,10 @@ async def main():
     print(f"Effective: {cfg['provider']}/{cfg['model']} "
           f"t={cfg['temperature']}")
 
+    # ── Propagation ────────────────────────────
+    report = r.propagate_toolset_to_agents(["delegation"])
+    print(f"Updated {report['agents_updated']} agents")
+
 asyncio.run(main())
 ```
 
@@ -424,69 +437,69 @@ asyncio.run(main())
 
 ## Permission Matrix
 
-| Действие              | orchestrator (`L0`)    | sub-agent (`L1+`)        |
-|-----------------------|------------------------|--------------------------|
-| Создать агента        | под любым `parent`     | только `parent=self`     |
-| Вызвать агента        | любого                 | только потомков          |
-| Менять `enabled_toolsets` | любому             | себе и потомкам          |
-| Менять LLM config     | любому                 | себе и потомкам          |
-| Читать память         | любой ветки            | только своей             |
-| Удалить агента        | любого                 | только своих детей       |
+| Action                 | Orchestrator (`L0`)     | Sub-agent (`L1+`)          |
+|------------------------|-------------------------|----------------------------|
+| Create agent           | under any `parent`      | only `parent=self`         |
+| Call agent             | any                     | only descendants            |
+| Change `enabled_toolsets` | any                  | self and descendants        |
+| Change LLM config      | any                     | self and descendants        |
+| Read memory            | any branch              | own branch only             |
+| Delete agent           | any                     | own children only           |
 
 ### Full Clone vs Sandbox
 
-| `enabled_toolsets`  | Смысл                                   |
-|----------------------|-----------------------------------------|
-| `None` (default)     | **Full Clone** — все инструменты        |
-| `["terminal","web"]` | Только указанные наборы                 |
-| `[]`                 | **Sandbox** — агент без инструментов    |
+| `enabled_toolsets`   | Meaning                                  |
+|----------------------|------------------------------------------|
+| `None` (default)     | **Full Clone** — all tools available     |
+| `["terminal","web"]` | Restricted to listed toolsets            |
+| `[]`                 | **Sandbox** — agent with zero tools      |
 
-### Версионированные миграции
+### Versioned Migrations
 
 ```bash
-# Применить все ожидающие миграции ко всем агентам
-/agents-reload          # вызывает apply_all_migrations()
+# Apply all pending migrations to all agents
+/agents-reload          # calls apply_all_migrations()
 
-# Или через updater (с бэкапом и dry-run)
-/hermes-update          # полное обновление + миграции
-/hermes-update --dry-run  # показать что будет изменено
+# Or via the updater (with backup and dry-run)
+/hermes-update          # full update + migrations
+/hermes-update --dry-run  # preview what will change
 ```
 
-Каждая миграция:
-- Имеет уникальный ID (например, `20260610_add_enabled_toolsets`)
-- Идемпотентна — можно запускать多次 без вреда
-- Не затирает пользовательские значения
-- Трекается в `applied_migrations` внутри YAML агента
+Each migration:
+- Has a unique ID (e.g. `20260610_add_enabled_toolsets`)
+- Is idempotent — safe to run repeatedly
+- Never overwrites user-set values
+- Is tracked in `applied_migrations` inside each agent's YAML
 
 ---
 
-## Структура проекта
+## Project Structure
 
 ```
-multi-agent/                           ← ветка
-├── agent_registry.py                  ← реестр + оркестратор + RuleEngine
+multi-agent/                           ← branch
+├── agent_registry.py                  ← registry + orchestrator + RuleEngine
 ├── agent_configs/
 │   ├── orchestrator.yaml              ← L0, main-session, critical_rules
 │   ├── coder.yaml                     ← L1, subtree-coder
 │   ├── researcher.yaml                ← L1, subtree-researcher
 │   ├── reviewer.yaml                  ← L1, subtree-reviewer
 │   └── summarizer.yaml                ← L1, subtree-summarizer
-├── cli.py                             ← /subagents, /agent-off, индикатор
-├── multiagent_updater.py              ← миграции (версионированная система)
+├── cli.py                             ← /subagents, /agent-off, status indicator
+├── multiagent_updater.py              ← migrations (versioned system)
 ├── hermes_cli/
-│   └── commands.py                    ← CommandDef для новых команд
+│   └── commands.py                    ← CommandDef for new commands
 ├── tests/
-│   ├── test_multiagent_updater.py     ← тесты миграции
-│   └── test_agent_registry.py         ← тесты реестра (smoke)
+│   ├── test_multiagent_updater.py     ← migration tests
+│   └── test_agent_registry.py         ← registry smoke tests
 ├── gateway/
-│   ├── agent_mention.py               ← @mention-роутинг
-│   └── run.py                         ← диспетчеризация
-├── hooks/agent-mention/               ← hook-интеграция
+│   ├── agent_mention.py               ← @mention routing
+│   └── run.py                         ← dispatch
+├── hooks/agent-mention/               ← hook integration
 └── install_hooks.py
 ```
 
 ---
 
-## Лицензия
+## License
 
-Основано на [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent). MIT License.
+Based on [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent). MIT License.
