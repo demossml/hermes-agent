@@ -17,10 +17,13 @@ pip install -e .
 # 2. Enable multi-agent toolsets (auto-propagates to all sub-agents)
 hermes tools enable delegation messaging
 
-# 3. Apply migrations to existing agent configs (if any)
+# 3. (Optional) Enable long-term vector memory
+pip install chromadb
+
+# 4. Apply migrations to existing agent configs (if any)
 hermes update
 
-# 4. Launch Hermes
+# 5. Launch Hermes
 hermes
 ```
 
@@ -119,6 +122,16 @@ Multi-agent: propagated ['delegation'] to 3 agent(s) (1 skipped)
 - **Inheritance** — grandchildren inherit `subtree_session_id` from their parent
 - **Memory inspection** — `/subagents memory <id>` shows the entire branch history
 
+### Long-Term Vector Memory (NEW)
+- **ChromaDB backend** — persistent vector storage that survives restarts
+- **Multi-level architecture** — Short-term (conversation) → Subtree (branch) → Long-term (vectors) → Global (rules)
+- **Auto-summarization** — every 10 exchanges, key insights are extracted and stored
+- **Semantic retrieval** — before each agent call, relevant past memories are injected into context
+- **Subtree isolation** — each branch only retrieves its own memories + global rules
+- **Critical rules persistence** — `critical_rules` automatically stored with maximum importance
+- **Graceful degradation** — fully functional without ChromaDB; install `pip install chromadb` to enable
+- **CLI access** — `/memory search`, `/memory summarize`, `/memory insights`
+
 ### RuleEngine
 - **`critical_rules`** — rules in the YAML config that persist across sessions
 - **`_build_system_prompt`** — automatically injects `[CRITICAL RULES]` into the system prompt
@@ -176,6 +189,11 @@ User → Main Hermes Agent [level: 0, main-session]
            │            @orchestrate <msg>
            │
            └── AgentRegistry
+                ├── LongTermMemory (ChromaDB)
+                │    ├── add_memory / search / get_insights
+                │    ├── auto-summarize every 10 turns
+                │    └── subtree-isolated + global rules
+                │
                 ├── MIGRATIONS [versioned, idempotent]
                 │    ├── 20260609: subtree_session_id
                 │    ├── 20260610: enabled_toolsets=None
@@ -281,6 +299,22 @@ python install_hooks.py
 
 # List — ID, Lvl, Calls, Violations, Avg ms
 /agents
+```
+
+### Long-Term Memory
+
+```bash
+# Semantic search across past sessions
+/memory search auth bug
+
+# Force summarise current session to long-term memory
+/memory summarize
+
+# View important insights for current agent
+/memory insights
+
+# View insights for a specific agent
+/memory insights coder
 ```
 
 ### Working Modes
@@ -430,6 +464,11 @@ async def main():
     report = r.propagate_toolset_to_agents(["delegation"])
     print(f"Updated {report['agents_updated']} agents")
 
+    # ── Long-Term Memory ───────────────────────
+    r.summarize_to_longterm("coder")              # save session to LTM
+    results = r.search_longterm_memory("auth")    # semantic search
+    insights = r.get_insights("coder")            # important insights
+
 asyncio.run(main())
 ```
 
@@ -478,6 +517,8 @@ Each migration:
 ```
 multi-agent/                           ← branch
 ├── agent_registry.py                  ← registry + orchestrator + RuleEngine
+├── memory/
+│   └── __init__.py                    ← LongTermMemory (ChromaDB)
 ├── agent_configs/
 │   ├── orchestrator.yaml              ← L0, main-session, critical_rules
 │   ├── coder.yaml                     ← L1, subtree-coder
