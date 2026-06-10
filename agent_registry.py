@@ -21,19 +21,21 @@ Usage:
     await registry.spawn("coder")
 
     # Call a sub-agent directly
-    response = await registry.call("coder", "session-id", "напиши сортировку")
+    response = await registry.call("coder", "session-id", "write sort function")
 
     # Stream from a sub-agent
-    async for chunk in registry.stream("coder", "session-id", "объясни"):
+    async for chunk in registry.stream("coder", "session-id", "explain"):
         print(chunk, end="")
 
     # Orchestrate across sub-agents
-    final = await registry.orchestrate("session-id", "сложный запрос")
+    final = await registry.orchestrate("session-id", "complex request")
 
     # List all agents
     for agent in registry.list():
         print(agent["agent_id"], agent["model"], agent["status"])
 """
+
+from __future__ import annotations
 
 import asyncio
 import json
