@@ -4077,6 +4077,66 @@ class AIAgent:
         result = self.run_conversation(message, stream_callback=stream_callback)
         return result["final_response"]
 
+    # ── Rule enforcement ───────────────────────────────────────
+
+    def _init_rule_checker(self, system_prompt: str) -> None:
+        """Initialise RuleChecker from system_prompt [CRITICAL RULES] block.
+
+        Called automatically by ``__init__`` via ``init_agent`` or
+        can be called later when the system prompt changes (e.g.
+        orchestrator sets ``ephemeral_system_prompt``).
+
+        Sets ``self._rule_checker`` to a ``RuleChecker`` instance,
+        or ``None`` if no rules are found.
+        """
+        from agent_registry import RuleChecker
+
+        checker = RuleChecker()
+        count = checker.parse_from_system_prompt(system_prompt or "")
+        self._rule_checker = checker if count > 0 else None
+
+        if self._rule_checker:
+            logging.debug(
+                f"RuleChecker initialised with {count} rules "
+                f"for session {getattr(self, 'session_id', '?')}"
+            )
+
+    def _enforce_rules(self, final_response: str) -> str:
+        """Check response against critical rules.  Returns (possibly
+        modified) response.
+
+        If a violation is detected the response is annotated with a
+        ``[⚠ VIOLATION]`` marker — this is informational only.  The
+        agent is NOT re-prompted here (that is done by
+        ``AgentRegistry.call()`` for sub-agents).  This method ensures
+        the main agent's violations are at least surfaced so the user
+        can see them and the agent can learn from them in future turns.
+
+        When no rules are configured this is a zero-cost no-op.
+        """
+        if not getattr(self, "_rule_checker", None):
+            return final_response  # no rules → no check
+
+        checker: RuleChecker = self._rule_checker  # type: ignore[name-defined]
+        violations = checker.check(final_response)
+
+        if not violations:
+            return final_response  # clean
+
+        # ── Annotate response with violation markers ──────────
+        violation_lines = "\n".join(f"  - {v}" for v in violations)
+        marker = (
+            f"\n\n[⚠ VIOLATION DETECTED]\n"
+            f"The following critical rules were violated:\n"
+            f"{violation_lines}\n"
+            f"Please follow ALL critical rules in future responses.\n"
+        )
+        logging.warning(
+            f"RuleChecker: {len(violations)} violation(s) in "
+            f"session {getattr(self, 'session_id', '?')}: {violations}"
+        )
+        return final_response + marker
+
     def _run_codex_app_server_turn(
         self,
         *,

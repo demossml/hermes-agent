@@ -4138,6 +4138,14 @@ def run_conversation(
             last_reasoning = msg["reasoning"]
             break
 
+    # ── Rule enforcement (main agent) ──────────────────────────
+    # Check final_response against critical_rules from the system
+    # prompt.  Violations are annotated with a marker so the user
+    # can see them.  Zero-cost when no rules are configured.
+    if final_response and not interrupted:
+        final_response = agent._enforce_rules(final_response)
+    # ───────────────────────────────────────────────────────────
+
     # Build result with interrupt info if applicable
     result = {
         "final_response": final_response,

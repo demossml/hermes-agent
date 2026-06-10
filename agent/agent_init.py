@@ -263,6 +263,8 @@ def init_agent(
     agent.verbose_logging = verbose_logging
     agent.quiet_mode = quiet_mode
     agent.ephemeral_system_prompt = ephemeral_system_prompt
+    # Initialise rule checker from system prompt (zero-cost if no rules)
+    agent._init_rule_checker(ephemeral_system_prompt)
     agent.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
     agent._user_id = user_id  # Platform user identifier (gateway sessions)
     agent._user_name = user_name
