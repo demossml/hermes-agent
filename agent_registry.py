@@ -44,6 +44,8 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 
 import yaml
 
+from memory import LongTermMemory, COLLECTION_NAME, IMPORTANCE_HIGH, IMPORTANCE_MEDIUM
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_DIR = Path(__file__).parent / "agent_configs"
@@ -237,10 +239,171 @@ class AgentRegistry:
         self._tasks: dict[str, asyncio.Task] = {}  # agent_id -> running task
         self._instances: dict[str, Any] = {}       # agent_id -> AIAgent
         self._stats: dict[str, dict] = {}          # agent_id -> {calls, tokens, total_ms}
+        self._longterm_memory: LongTermMemory | None = None  # set via init_longterm_memory()
 
     def set_db(self, db):
         """Set SessionDB after init (avoids circular imports)."""
         self._db = db
+
+    def init_longterm_memory(
+        self, persist_dir: str | Path = "~/.hermes/longterm_memory"
+    ) -> bool:
+        """Initialise the long-term vector memory backend.
+
+        Call once after creating the registry.  If ChromaDB is not
+        installed the method logs a warning and returns ``False``,
+        but the registry remains fully functional — long-term memory
+        is an optional enhancement.
+
+        Returns ``True`` if the backend was initialised successfully.
+        """
+        self._longterm_memory = LongTermMemory(persist_dir=persist_dir)
+        if self._longterm_memory.enabled:
+            logger.info(
+                f"LongTermMemory ready: {self._longterm_memory.count()} "
+                f"entries in {COLLECTION_NAME}"
+            )
+            return True
+        else:
+            logger.warning(
+                "LongTermMemory is DISABLED (ChromaDB not available). "
+                "Install with: pip install chromadb"
+            )
+            return False
+
+    # ── Long-Term Memory helpers ────────────────────────────
+
+    def _retrieve_longterm_context(
+        self, agent_id: str, message: str, max_items: int = 3,
+    ) -> str:
+        """Search long-term memory and return relevant context.
+
+        Called before each agent invocation to inject past insights
+        into the conversation context.
+        """
+        if not self._longterm_memory or not self._longterm_memory.enabled:
+            return ""
+
+        cfg = self._agents.get(agent_id, {})
+        subtree = cfg.get("subtree_session_id", f"subtree-{agent_id}")
+
+        # Search subtree-specific memories
+        results = self._longterm_memory.search(
+            message,
+            subtree_id=subtree,
+            top_k=max_items,
+            min_importance=IMPORTANCE_MEDIUM,
+        )
+
+        if not results:
+            return ""
+
+        lines = ["[LONG-TERM MEMORY — relevant past context]"]
+        for r in results:
+            doc = r["document"]
+            meta = r.get("metadata", {})
+            task = meta.get("task_type", "general")
+            imp = meta.get("importance", 0)
+            marker = "🔴" if imp >= IMPORTANCE_HIGH else "🟡"
+            lines.append(f"{marker} [{task}] {doc[:400]}")
+        lines.append("[END LONG-TERM MEMORY]")
+
+        return "\n".join(lines)
+
+    def get_insights(
+        self, agent_id: str, top_k: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Return the most important recent insights for an agent."""
+        if not self._longterm_memory or not self._longterm_memory.enabled:
+            return []
+
+        cfg = self._agents.get(agent_id, {})
+        subtree = cfg.get("subtree_session_id", f"subtree-{agent_id}")
+        return self._longterm_memory.get_insights(
+            agent_id, subtree_id=subtree, top_k=top_k,
+        )
+
+    def search_longterm_memory(
+        self, query: str, agent_id: str | None = None,
+        top_k: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Search long-term memory by natural language query."""
+        if not self._longterm_memory or not self._longterm_memory.enabled:
+            return []
+
+        subtree = None
+        if agent_id:
+            cfg = self._agents.get(agent_id, {})
+            subtree = cfg.get("subtree_session_id")
+
+        return self._longterm_memory.search(
+            query, subtree_id=subtree, agent_id=agent_id, top_k=top_k,
+        )
+
+    def summarize_to_longterm(
+        self, agent_id: str,
+    ) -> dict[str, Any]:
+        """Force summarisation of current session to long-term memory.
+
+        Saves the recent subtree conversation as memories.
+        Returns a report dict.
+        """
+        if not self._longterm_memory or not self._longterm_memory.enabled:
+            return {"error": "Long-term memory is disabled", "stored": 0}
+
+        cfg = self._agents.get(agent_id, {})
+        subtree = cfg.get("subtree_session_id", f"subtree-{agent_id}")
+
+        messages = self.get_subtree_memory(agent_id, limit=100)
+        if not messages:
+            return {"error": "No messages in subtree", "stored": 0}
+
+        count = self._longterm_memory.summarize_session_to_longterm(
+            messages, agent_id=agent_id, subtree_id=subtree,
+        )
+
+        # Also store critical rules into long-term memory
+        rules = cfg.get("critical_rules", [])
+        for rule in rules:
+            self._longterm_memory.add_global_rule(rule, agent_id=agent_id)
+
+        return {"agent_id": agent_id, "stored": count, "rules_stored": len(rules)}
+
+    def _auto_summarize_to_longterm(
+        self, agent_id: str,
+    ) -> None:
+        """Trigger automatic summarisation every N messages.
+
+        Called from ``_save_turn()``.  Uses a simple counter tracked
+        in ``self._stats[agent_id]`` to decide when to summarise.
+        """
+        if not self._longterm_memory or not self._longterm_memory.enabled:
+            return
+
+        cfg = self._agents.get(agent_id, {})
+        # Summarise every 10 exchanges per agent
+        threshold = cfg.get("ltm_summarise_every", 10)
+
+        st = self._stats.setdefault(agent_id, {})
+        turn_count = st.get("ltm_turn_count", 0) + 1
+        st["ltm_turn_count"] = turn_count
+
+        if turn_count % threshold != 0:
+            return
+
+        subtree = cfg.get("subtree_session_id", f"subtree-{agent_id}")
+        messages = self.get_subtree_memory(agent_id, limit=50)
+        if not messages:
+            return
+
+        count = self._longterm_memory.summarize_session_to_longterm(
+            messages, agent_id=agent_id, subtree_id=subtree,
+        )
+        if count:
+            logger.info(
+                f"Agent '{agent_id}': auto-summarised {count} memories "
+                f"to long-term storage (turn {turn_count})"
+            )
 
     # ── Config management ────────────────────────────────────
 
@@ -1244,6 +1407,14 @@ class AgentRegistry:
 
                 msg = message if attempt == 0 else f"Please respond concisely: {message}"
 
+                # ── Long-term memory retrieval ────────────────────────
+                if attempt == 0:
+                    ltm_context = self._retrieve_longterm_context(
+                        agent_id, message,
+                    )
+                    if ltm_context:
+                        msg = ltm_context + "\n\n" + msg
+
                 # ── Rule reminder ──────────────────────────────────────
                 reminder_every = cfg.get("rule_reminder_every", 0)
                 if reminder_every > 0:
@@ -1456,6 +1627,9 @@ class AgentRegistry:
                 )
             self._db.append_message(subtree, "user", user_msg)
             self._db.append_message(subtree, "assistant", reply)
+
+            # Auto-summarise to long-term memory every N turns
+            self._auto_summarize_to_longterm(agent_id)
         except Exception as e:
             logger.warning(f"Failed to save turn for {agent_id}: {e}")
 
@@ -2229,6 +2403,8 @@ def get_registry(db=None) -> AgentRegistry:
     if _registry is None:
         _registry = AgentRegistry(db)
         _registry.load_all()
+        # Initialise long-term memory (best-effort, non-blocking)
+        _registry.init_longterm_memory()
     elif db is not None and _registry._db is None:
         _registry.set_db(db)
     return _registry

@@ -8441,6 +8441,8 @@ class HermesCLI:
             self._handle_agents_create(cmd_original)
         elif canonical == "subagents":
             self._handle_subagents(cmd_original)
+        elif canonical == "memory":
+            self._handle_memory(cmd_original)
         elif canonical == "agent-off":
             self._handle_agent_off()
         elif canonical == "hermes-update":
@@ -9674,6 +9676,91 @@ class HermesCLI:
             _cprint(report)
         except Exception as e:
             _cprint(f"  [red]Update failed: {e}[/]")
+
+    def _handle_memory(self, cmd: str):
+        """/memory <action> [args] — long-term memory management.
+
+        Actions:
+          search <query>    — search long-term memory
+          summarize         — force summarise current session to LTM
+          insights [id]     — show important insights
+        """
+        from agent_registry import get_registry
+
+        registry = get_registry()
+        active_agent = _active_subagent["name"] if _active_subagent else "orchestrator"
+
+        parts = cmd.split(None, 1)
+        action = parts[1] if len(parts) > 1 else ""
+
+        if not action:
+            _cprint("  /memory search|summarize|insights")
+            _cprint("  Examples:")
+            _cprint("    /memory search auth bug")
+            _cprint("    /memory summarize")
+            _cprint("    /memory insights")
+            _cprint("    /memory insights coder")
+            return
+
+        sub_parts = action.split(None, 1)
+        sub_action = sub_parts[0]
+        sub_args = sub_parts[1] if len(sub_parts) > 1 else ""
+
+        if sub_action == "search":
+            if not sub_args:
+                _cprint("  Usage: /memory search <query>")
+                return
+
+            results = registry.search_longterm_memory(
+                sub_args, agent_id=active_agent, top_k=5,
+            )
+            if not results:
+                _cprint("  [dim]No long-term memories found for this query.[/]")
+                return
+
+            _cprint(f"\n  [bold]Long-Term Memory — search: '{sub_args}'[/]\n")
+            for i, r in enumerate(results, 1):
+                doc = r["document"][:200]
+                meta = r.get("metadata", {})
+                dist = r.get("distance", 0)
+                imp = meta.get("importance", 0)
+                marker = "🔴" if imp >= 10 else "🟡"
+                _cprint(f"  {marker} [{i}] score={dist:.3f} | {doc}")
+                if len(r["document"]) > 200:
+                    _cprint(f"     [dim]...({len(r['document'])} chars)[/]")
+            _cprint("")
+
+        elif sub_action == "summarize":
+            _cprint(f"\n  [bold]Summarising '{active_agent}' to long-term memory...[/]")
+            report = registry.summarize_to_longterm(active_agent)
+            if report.get("error"):
+                _cprint(f"  [red]{report['error']}[/]")
+            else:
+                _cprint(f"  [green]✅ Stored {report['stored']} memories + {report.get('rules_stored', 0)} rules[/]")
+            _cprint("")
+
+        elif sub_action == "insights":
+            target = sub_args if sub_args else active_agent
+            insights = registry.get_insights(target, top_k=10)
+            if not insights:
+                _cprint("  [dim]No insights found for this agent.[/]")
+                return
+
+            _cprint(f"\n  [bold]Insights for '{target}':[/]\n")
+            for i, ins in enumerate(insights, 1):
+                doc = ins["document"][:250]
+                meta = ins.get("metadata", {})
+                ts = meta.get("timestamp", "")[:19]
+                imp = meta.get("importance", 0)
+                marker = "🔴" if imp >= 10 else "🟡"
+                _cprint(f"  {marker} [{i}] {doc}")
+                if ts:
+                    _cprint(f"     [dim]{ts}[/]")
+            _cprint("")
+
+        else:
+            _cprint(f"  Unknown action: {sub_action}")
+            _cprint("  /memory search|summarize|insights")
 
     def _handle_subagents(self, cmd: str):
         """/subagents <action> [args] — manage sub-agents.

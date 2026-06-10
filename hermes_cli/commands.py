@@ -259,6 +259,14 @@ COMMAND_REGISTRY: list[CommandDef] = [
         cli_only=True,
     ),
     CommandDef(
+        "memory",
+        "Long-term memory: search, summarize, insights. /memory <action>",
+        "Agents",
+        aliases=("mem",),
+        args_hint="<search|summarize|insights> [args...]",
+        cli_only=True,
+    ),
+    CommandDef(
         "hermes-update",
         "Update Multi-Agent: migrate configs preserving providers. /hermes-update [--dry-run] [--reset-llm]",
         "Agents",
