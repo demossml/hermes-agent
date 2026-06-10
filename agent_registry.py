@@ -64,7 +64,7 @@ DEFAULT_CONFIG_DIR = Path(__file__).parent / "agent_configs"
 # NEVER reorder or delete existing entries — migration IDs are
 # recorded inside agent YAML files and must remain valid forever.
 
-CURRENT_MIGRATION_VERSION = "20260612"
+CURRENT_MIGRATION_VERSION = "20260613"
 
 MIGRATIONS: list[dict] = [
     {
@@ -86,6 +86,14 @@ MIGRATIONS: list[dict] = [
         "id": "20260612_add_provider_fallback",
         "description": "Добавление fallback_models, priority, auto_select, LLM params",
         "apply": lambda cfg: _migrate_add_llm_params(cfg),
+    },
+    {
+        "id": "20260613_upgrade_agent_toolsets",
+        "description": (
+            "Апгрейд enabled_toolsets: orchestrator→None, "
+            "L1/L2→добавить delegation/messaging/terminal/file/web_search"
+        ),
+        "apply": lambda cfg: _migrate_upgrade_agent_toolsets(cfg),
     },
 ]
 
@@ -148,6 +156,71 @@ def _migrate_add_llm_params(cfg: dict) -> bool:
             changed = True
     return changed
 
+
+def _migrate_upgrade_agent_toolsets(cfg: dict) -> bool:
+    """Upgrade enabled_toolsets for existing agents.
+
+    IDEMPOTENT — running it repeatedly on an already-migrated config
+    is a no-op (no duplicates, no unnecessary changes).
+
+    Rules
+    -----
+    ┌───────────────────────┬──────────────────────────────────────┐
+    │ Agent                 │ Action                               │
+    ├───────────────────────┼──────────────────────────────────────┤
+    │ orchestrator          │ enabled_toolsets = None (full clone) │
+    │ L1/L2, toolsets=None  │ leave as None (already full clone)   │
+    │ L1/L2, toolsets=list  │ merge curated toolsets, deduplicate  │
+    │ L1/L2, toolsets=[]    │ add curated toolsets (was sandboxed)  │
+    └───────────────────────┴──────────────────────────────────────┘
+
+    Curated toolsets for sub-agents (L1+):
+    ``["delegation", "messaging", "terminal", "file", "web_search"]``
+
+    These are the minimum tools a sub-agent needs to be productive
+    out-of-the-box — delegate tasks, send messages, work with files,
+    run shell commands, and search the web.
+    """
+    # orchestrator always has full tool access
+    agent_id = cfg.get("agent_id", "unknown")
+    if agent_id == "orchestrator":
+        if cfg.get("enabled_toolsets") is None:
+            return False  # already full clone, no change needed
+        cfg["enabled_toolsets"] = None
+        return True
+
+    # ── Sub-agents (level ≥ 1) ─────────────────────────────────
+    CURATED = [
+        "delegation",
+        "messaging",
+        "terminal",
+        "file",
+        "web_search",
+    ]
+
+    current = cfg.get("enabled_toolsets")
+
+    # If already None → full clone, nothing to add
+    if current is None:
+        return False
+
+    # If current is a list → merge, deduplicate
+    if isinstance(current, list):
+        # Preserve order: existing first, then curated (only new ones)
+        merged = list(dict.fromkeys(current))  # deduplicate existing
+        added_any = False
+        for tool in CURATED:
+            if tool not in merged:
+                merged.append(tool)
+                added_any = True
+        if added_any:
+            cfg["enabled_toolsets"] = merged
+            return True
+        return False
+
+    # Defensive: non-list, non-None (malformed YAML) → curated set
+    cfg["enabled_toolsets"] = list(CURATED)
+    return True
 
 class AgentRegistry:
     """Registry and orchestrator for sub-agents.
