@@ -46,7 +46,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 
 import yaml
 
-from memory import LongTermMemory, COLLECTION_NAME, IMPORTANCE_HIGH, IMPORTANCE_MEDIUM
+from memory import LongTermMemory, COLLECTION_NAME, IMPORTANCE_HIGH, IMPORTANCE_MEDIUM, HAS_CHROMA
 
 logger = logging.getLogger(__name__)
 
@@ -2517,6 +2517,129 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
             f"{report['agents_skipped']} skipped"
         )
         return report
+
+    # ── Health check (doctor) ────────────────────────────────
+
+    def doctor(self) -> dict:
+        """Run a health check on the multi-agent system.
+
+        Returns a dict with status of each subsystem::
+
+            {
+                "status": "healthy",
+                "agents": 5,
+                "orchestrator": True,
+                "longterm_memory": False,
+                "chromadb_installed": False,
+                "active_subagents": 0,
+                "total_calls": 0,
+                "total_violations": 0,
+            }
+        """
+        report: dict = {
+            "status": "healthy",
+            "agents": len(self._agents),
+            "orchestrator": "orchestrator" in self._agents,
+            "longterm_memory": (
+                self._longterm_memory is not None
+                and self._longterm_memory.enabled
+            ),
+            "chromadb_installed": HAS_CHROMA if hasattr(self, '_longterm_memory') and self._longterm_memory else False,
+            "active_subagents": sum(
+                1 for aid, t in self._tasks.items() if not t.done()
+            ),
+            "total_calls": sum(
+                s.get("calls", 0) for s in self._stats.values()
+            ),
+            "total_violations": sum(
+                s.get("violations", 0) for s in self._stats.values()
+            ),
+        }
+
+        # Determine overall status
+        issues = []
+        if not report["orchestrator"]:
+            issues.append("No orchestrator registered")
+            report["status"] = "degraded"
+        if report["agents"] == 0:
+            issues.append("No agents registered")
+            report["status"] = "degraded"
+
+        report["issues"] = issues
+
+        # Human-readable summary
+        lines = [
+            f"Multi-Agent Doctor",
+            f"  Status:    {report['status'].upper()}",
+            f"  Agents:    {report['agents']} registered",
+            f"  Orchestrator: {'✅' if report['orchestrator'] else '❌'}",
+            f"  LTM:       {'✅ enabled' if report['longterm_memory'] else '⚠ disabled (pip install chromadb)'}",
+            f"  Active:    {report['active_subagents']} running",
+            f"  Calls:     {report['total_calls']} total",
+            f"  Violations:{report['total_violations']} total",
+        ]
+        if issues:
+            lines.append(f"  Issues:    {', '.join(issues)}")
+
+        report["summary"] = "\n".join(lines)
+        return report
+
+    # ── Fast routing (keyword-based, no LLM) ─────────────────
+
+    # Keyword → agent mapping for route_fast()
+    ROUTE_KEYWORDS: dict[str, str] = {
+        "напиши код": "coder",
+        "напиши функцию": "coder",
+        "напиши": "coder",
+        "write code": "coder",
+        "implement": "coder",
+        "bug": "coder",
+        "fix": "coder",
+        "refactor": "coder",
+        "найди": "researcher",
+        "поищи": "researcher",
+        "research": "researcher",
+        "find": "researcher",
+        "search": "researcher",
+        "проверь": "reviewer",
+        "review": "reviewer",
+        "check": "reviewer",
+        "audit": "reviewer",
+        "объясни": "summarizer",
+        "кратко": "summarizer",
+        "summarize": "summarizer",
+        "summary": "summarizer",
+        "переведи": "summarizer",
+        "translate": "summarizer",
+    }
+
+    def route_fast(self, message: str) -> str | None:
+        """Route a task to the best agent using keyword matching.
+
+        Zero LLM cost.  Returns agent_id on match, None if no match
+        (caller should fall back to LLM orchestration).
+
+        Usage::
+
+            agent_id = registry.route_fast("напиши сортировку")
+            if agent_id:
+                return await registry.call(agent_id, sid, msg)
+            # Fall back to full orchestration
+            return await registry.orchestrate(sid, msg)
+        """
+        msg_lower = message.lower()
+
+        for keyword, agent_id in self.ROUTE_KEYWORDS.items():
+            if keyword in msg_lower:
+                # Verify agent exists
+                if agent_id in self._agents:
+                    logger.debug(
+                        f"route_fast: '{message[:60]}...' → {agent_id} "
+                        f"(keyword: '{keyword}')"
+                    )
+                    return agent_id
+
+        return None
 
 
 # ── Singleton ────────────────────────────────────────────────
