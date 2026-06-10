@@ -2137,6 +2137,86 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
         except Exception as e:
             logger.error(f"Agent {agent_id} task error: {e}", exc_info=True)
 
+    def propagate_toolset_to_agents(
+        self, toolset_names: List[str],
+    ) -> dict:
+        """Propagate newly-enabled toolsets to all existing sub-agents.
+
+        When the user runs ``hermes tools enable delegation`` (or any
+        other toolset), this function automatically adds those toolsets
+        to every L1+ agent that has a restricted (non-None)
+        ``enabled_toolsets`` list.
+
+        Agents with ``enabled_toolsets: None`` (full clone — all tools)
+        are skipped because they already have everything.
+
+        Idempotent — running it twice won't create duplicates.
+
+        Returns a report::
+
+            {
+                "agents_updated": 3,
+                "agents_skipped": 1,       # full-clone agents
+                "toolsets_propagated": ["delegation"],
+                "errors": [],
+            }
+        """
+        report: dict = {
+            "agents_updated": 0,
+            "agents_skipped": 0,
+            "toolsets_propagated": list(toolset_names),
+            "errors": [],
+        }
+
+        for agent_id, cfg in self._agents.items():
+            # orchestrator always has full tool access — skip
+            if agent_id == "orchestrator":
+                report["agents_skipped"] += 1
+                continue
+
+            ets = cfg.get("enabled_toolsets")
+
+            # None = full clone, already has everything
+            if ets is None:
+                report["agents_skipped"] += 1
+                continue
+
+            # [] or ["terminal", ...] → add missing toolsets
+            if isinstance(ets, list):
+                added_any = False
+                for ts in toolset_names:
+                    if ts not in ets:
+                        ets.append(ts)
+                        added_any = True
+                if added_any:
+                    cfg["enabled_toolsets"] = ets
+                    self._instances.pop(agent_id, None)  # clear cache
+                    try:
+                        self._persist_agent_config(agent_id)
+                        report["agents_updated"] += 1
+                        logger.info(
+                            f"Propagated {toolset_names} to agent "
+                            f"'{agent_id}' → {ets}"
+                        )
+                    except Exception as e:
+                        report["errors"].append(f"{agent_id}: {e}")
+                        logger.error(
+                            f"Failed to persist {agent_id} after "
+                            f"toolset propagation: {e}"
+                        )
+                else:
+                    report["agents_skipped"] += 1
+            else:
+                # Malformed — skip
+                report["agents_skipped"] += 1
+
+        logger.info(
+            f"propagate_toolset_to_agents: {toolset_names} → "
+            f"{report['agents_updated']} updated, "
+            f"{report['agents_skipped']} skipped"
+        )
+        return report
+
 
 # ── Singleton ────────────────────────────────────────────────
 

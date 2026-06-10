@@ -3239,6 +3239,56 @@ def _print_tools_list(enabled_toolsets: set, mcp_servers: dict, platform: str = 
                 _print_info(f"{srv_name}  {color('all tools enabled', Colors.DIM)}")
 
 
+def _propagate_to_multiagent(toolset_names: list[str]) -> None:
+    """Propagate newly-enabled toolsets to existing multi-agent configs.
+
+    Called automatically by ``hermes tools enable``.  Opens the agent
+    registry, adds the new toolsets to every L1+ agent that has a
+    restricted list, and persists the changes to disk.
+
+    Best-effort — failures are logged but never block the parent
+    ``hermes tools enable`` command.
+    """
+    try:
+        from agent_registry import AgentRegistry
+
+        # Resolve the agent_configs directory relative to the Hermes
+        # installation (same logic as the default in AgentRegistry).
+        hermes_root = Path(__file__).resolve().parent.parent  # repo root
+        config_dir = hermes_root / "agent_configs"
+
+        if not config_dir.exists():
+            logging.debug(
+                f"_propagate_to_multiagent: no agent_configs at {config_dir}"
+            )
+            return
+
+        registry = AgentRegistry(config_dir=config_dir)
+        count = registry.load_all()
+        if count == 0:
+            logging.debug("_propagate_to_multiagent: no agents loaded")
+            return
+
+        report = registry.propagate_toolset_to_agents(toolset_names)
+
+        updated = report.get("agents_updated", 0)
+        skipped = report.get("agents_skipped", 0)
+        errors = report.get("errors", [])
+
+        if updated:
+            _print_success(
+                f"Multi-agent: propagated {toolset_names} to "
+                f"{updated} agent(s) ({skipped} skipped)"
+            )
+        if errors:
+            for err in errors:
+                _print_error(f"Multi-agent propagation error: {err}")
+
+    except Exception as e:
+        # Never let propagation failures block the main command
+        logging.warning(f"_propagate_to_multiagent failed: {e}")
+
+
 def tools_disable_enable_command(args):
     """Enable, disable, or list tools for a platform.
 
@@ -3293,6 +3343,13 @@ def tools_disable_enable_command(args):
             _print_error(f"MCP server '{srv}' not found in config")
 
     save_config(config)
+
+    # ── Propagate newly-enabled toolsets to multi-agent configs ──
+    # When the user enables a toolset like delegation or messaging,
+    # automatically add it to all existing sub-agents so they
+    # become productive "clones" immediately after git pull.
+    if action == "enable" and toolset_targets:
+        _propagate_to_multiagent(toolset_targets)
 
     successful = [
         t for t in targets
