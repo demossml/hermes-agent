@@ -177,6 +177,14 @@ class AgentRegistry:
             cfg = yaml.safe_load(f)
         if not cfg.get("agent_id"):
             cfg["agent_id"] = Path(config_path).stem
+
+        # orchestrator always has full tool access
+        agent_id = cfg.get("agent_id", "")
+        if agent_id == "orchestrator":
+            if not cfg.get("enabled_toolsets"):
+                # Missing, None, empty list, empty string → full clone
+                cfg["enabled_toolsets"] = None
+
         return cfg
 
     def load_all(self, directory: str | Path | None = None) -> int:
@@ -228,6 +236,10 @@ class AgentRegistry:
         # enabled_toolsets: the canonical tool field.
         # None = full clone (all tools).  [] = sandboxed.
         config.setdefault("enabled_toolsets", None)
+
+        # orchestrator always has full tool access
+        if agent_id == "orchestrator":
+            config["enabled_toolsets"] = None
 
         # ── LLM configuration ──────────────────────────────────────
         config.setdefault("provider", "current")
@@ -1968,30 +1980,34 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
                     runtime = {}
 
             # ── Resolve enabled_toolsets ──────────────────────────
-            # cfg["enabled_toolsets"] is the canonical tool field.
-            #
-            #   None       → pass None to AIAgent → ALL tools (full clone)
-            #   []         → pass []   to AIAgent → zero tools (sandboxed)
-            #   ["t1","t2"]→ pass list to AIAgent → restricted set
-            #
-            # IMPORTANT: we CANNOT use `cfg.get(...) or None` because
-            # empty list [] is falsy in Python and would be collapsed
-            # to None, turning an explicit "no tools" request into
-            # "all tools".  Always use an explicit `is None` check.
-            raw_toolsets = cfg.get("enabled_toolsets")
-            if raw_toolsets is None:
-                enabled_toolsets = None         # full clone
-            elif isinstance(raw_toolsets, list):
-                enabled_toolsets = raw_toolsets  # [] or ["terminal",...]
-            else:
-                # Defensive: non-list, non-None garbage from a
-                # malformed YAML → treat as full clone with warning.
-                logger.warning(
-                    f"Agent '{agent_id}': enabled_toolsets is "
-                    f"{type(raw_toolsets).__name__} (expected list or None). "
-                    f"Falling back to full clone."
-                )
+            # orchestrator always has full tool access
+            if agent_id == "orchestrator":
                 enabled_toolsets = None
+            else:
+                # cfg["enabled_toolsets"] is the canonical tool field.
+                #
+                #   None       → pass None to AIAgent → ALL tools (full clone)
+                #   []         → pass []   to AIAgent → zero tools (sandboxed)
+                #   ["t1","t2"]→ pass list to AIAgent → restricted set
+                #
+                # IMPORTANT: we CANNOT use `cfg.get(...) or None` because
+                # empty list [] is falsy in Python and would be collapsed
+                # to None, turning an explicit "no tools" request into
+                # "all tools".  Always use an explicit `is None` check.
+                raw_toolsets = cfg.get("enabled_toolsets")
+                if raw_toolsets is None:
+                    enabled_toolsets = None         # full clone
+                elif isinstance(raw_toolsets, list):
+                    enabled_toolsets = raw_toolsets  # [] or ["terminal",...]
+                else:
+                    # Defensive: non-list, non-None garbage from a
+                    # malformed YAML → treat as full clone with warning.
+                    logger.warning(
+                        f"Agent '{agent_id}': enabled_toolsets is "
+                        f"{type(raw_toolsets).__name__} (expected list or None). "
+                        f"Falling back to full clone."
+                    )
+                    enabled_toolsets = None
 
             self._instances[agent_id] = AIAgent(
                 model=runtime.get("model") or cfg.get("model", ""),
