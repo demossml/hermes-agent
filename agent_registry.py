@@ -910,7 +910,8 @@ class AgentRegistry:
                 f"agents with parent_id='{caller_id}', not '{parent_id}'"
             )
 
-    def create(self, agent_id: str, config: dict, caller_id: str = "orchestrator") -> dict:
+    def create(self, agent_id: str, config: dict, caller_id: str = "orchestrator",
+               full_clone: bool = True) -> dict:
         """Create and register a new agent at runtime.
 
         Permission rules:
@@ -918,10 +919,22 @@ class AgentRegistry:
         - caller.level ≥ 1 → allowed ONLY if parent_id == caller_id
 
         Toolset behaviour (enabled_toolsets):
-        - key ABSENT in config  → None (FULL CLONE — all tools inherited)
-        - None explicitly        → None (same as above)
-        - [] explicitly          → empty list (sandboxed — no tools)
-        - ["terminal","file"]    → restricted to those toolsets
+
+        When ``full_clone=True`` (default) and ``enabled_toolsets`` is
+        NOT explicitly provided by the caller, the agent receives a
+        curated "full-stack" toolset so it is productive out-of-the-box:
+        ``["delegation", "messaging", "terminal", "file", "web_search",
+        "skills", "browser"]``.
+
+        ┌─────────────────────────────┬──────────────────────────────────┐
+        │ enabled_toolsets in config  │ Result                           │
+        ├─────────────────────────────┼──────────────────────────────────┤
+        │ Explicit list               │ Used as-is (including [])        │
+        │ (e.g. ["terminal","file"]) │                                  │
+        │ Explicit None               │ None (ALL tools — unrestricted)  │
+        │ Key absent + full_clone=T   │ Curated full-stack default       │
+        │ Key absent + full_clone=F   │ None (ALL tools — legacy)        │
+        └─────────────────────────────┴──────────────────────────────────┘
 
         Other auto-computed fields:
         - level = parent_level + 1 (unless explicit)
@@ -932,6 +945,10 @@ class AgentRegistry:
 
         Saves config to agent_configs/{agent_id}.yaml so it
         survives restarts and hot-reloads.
+
+        Also runs ``migrate_agent_config()`` automatically after
+        registration so the new agent is always at the latest
+        migration version.
         """
         import uuid
 
@@ -967,13 +984,29 @@ class AgentRegistry:
         config["parent_id"] = parent_id
         config["subtree_session_id"] = subtree_session_id
 
-        # ── Tools: full clone by default ───────────────────────────
-        # If the caller didn't specify a toolset at all, the agent
-        # becomes a FULL CLONE (None = AIAgent loads every available
-        # tool).  Explicit [] means sandboxed (no tools).
-        # Explicit ["terminal", …] means restricted to those.
-        if "enabled_toolsets" not in config:
-            config["enabled_toolsets"] = None   # full clone
+        # ── Tools: full-stack clone by default ─────────────────────
+        # When full_clone=True (default) and the caller didn't supply
+        # an explicit toolset, the new agent gets a curated "full-stack"
+        # toolset so it's immediately productive.
+        #
+        # If the caller explicitly provided enabled_toolsets (including
+        # None or []) we always respect that — no override.
+        FULL_CLONE_TOOLSETS = [
+            "delegation",    # can delegate to other sub-agents
+            "messaging",     # can send messages cross-platform
+            "terminal",      # shell access
+            "file",          # read/write files
+            "web_search",    # web search
+            "skills",        # skill management
+            "browser",       # browser automation
+        ]
+        if "enabled_toolsets" in config:
+            # Caller explicitly set something — honour it (even None or [])
+            pass
+        elif full_clone:
+            config["enabled_toolsets"] = list(FULL_CLONE_TOOLSETS)
+        else:
+            config["enabled_toolsets"] = None   # ALL tools (legacy)
 
         # ── LLM inheritance from parent ────────────────────────────
         # Child agents inherit provider, model, temperature, etc.
@@ -991,6 +1024,11 @@ class AgentRegistry:
 
         # ── Register & persist ────────────────────────────────────
         self.register(agent_id, config)
+
+        # ── Auto-migrate to latest version ─────────────────────────
+        # Ensures the new agent starts with all migrations applied,
+        # regardless of what register() set via defaults.
+        migration_report = self.migrate_agent_config(agent_id)
 
         yaml_path = self._config_dir / f"{agent_id}.yaml"
         try:
@@ -1010,8 +1048,14 @@ class AgentRegistry:
                 f"(level={config.get('level')}, parent={parent_id}, "
                 f"provider={config.get('provider')}/{config.get('model', '?')}, "
                 f"tools={tools_desc}, "
+                f"full_clone={full_clone}, "
                 f"session={subtree_session_id}) → {yaml_path}"
             )
+            if migration_report.get("migrations_applied"):
+                logger.info(
+                    f"Agent '{agent_id}': auto-migrated — "
+                    f"{migration_report['migrations_applied']}"
+                )
         except Exception as e:
             logger.warning(
                 f"Failed to persist agent config for '{agent_id}': {e}"
