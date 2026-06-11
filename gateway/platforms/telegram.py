@@ -5278,6 +5278,38 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         return getattr(update, "effective_message", None) or getattr(update, "message", None)
 
+    async def _save_to_chat_history(self, msg, message_type: str = "text") -> None:
+        """Persist a Telegram message to DuckDB chat history.
+
+        Non-blocking — runs ``save_message_async`` as a fire-and-forget
+        task.  Failures are silent (logged at DEBUG level).
+        """
+        try:
+            from hermes_cli.chat_history_integration import save_message_async
+
+            chat = msg.chat
+            user = msg.from_user
+            await save_message_async(
+                platform="telegram",
+                chat_id=str(chat.id),
+                message_id=str(msg.message_id),
+                text=msg.text or msg.caption or "",
+                chat_title=getattr(chat, "title", "") or "",
+                sender_id=str(user.id) if user else "",
+                sender_name=user.full_name if user else "",
+                sender_username=user.username if user else "",
+                reply_to_id=str(msg.reply_to_message.message_id)
+                if msg.reply_to_message else "",
+                message_type=message_type,
+                has_media=bool(getattr(msg, "photo", None)
+                               or getattr(msg, "video", None)
+                               or getattr(msg, "voice", None)
+                               or getattr(msg, "document", None)),
+                timestamp=msg.date,
+            )
+        except Exception:
+            pass  # DuckDB not installed or transient failure
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
 
@@ -5288,6 +5320,8 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
+        # Persist to chat history (non-blocking)
+        asyncio.create_task(self._save_to_chat_history(msg, "text"))
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
@@ -5304,6 +5338,7 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
+        asyncio.create_task(self._save_to_chat_history(msg, "command"))
         if not self._should_process_message(msg, is_command=True):
             return
         await self._ensure_forum_commands(msg)
@@ -5500,6 +5535,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle incoming media messages, downloading images to local cache."""
         if not update.message:
             return
+        asyncio.create_task(self._save_to_chat_history(update.message, "media"))
         if not self._should_process_message(update.message):
             if self._should_observe_unmentioned_group_message(update.message):
                 _m = update.message
