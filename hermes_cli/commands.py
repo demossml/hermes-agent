@@ -269,6 +269,14 @@ COMMAND_REGISTRY: list[CommandDef] = [
         cli_only=True,
     ),
     CommandDef(
+        "workflow",
+        "Code workflow control: stop, status, continue. /workflow <action>",
+        "Agents",
+        aliases=("wf",),
+        args_hint="<stop|status|continue>",
+        cli_only=True,
+    ),
+    CommandDef(
         "memory",
         "Long-term memory: search, summarize, insights. /memory <action>",
         "Agents",

@@ -7704,6 +7704,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_subagents(cmd_original)
         elif canonical == "memory":
             self._handle_memory(cmd_original)
+        elif canonical == "workflow":
+            self._handle_workflow(cmd_original)
         elif canonical == "agent-off":
             self._handle_agent_off()
         elif canonical == "hermes-update":
@@ -8306,7 +8308,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _cprint(f"  [bold red]Agent call failed: {e}[/]")
 
     def _handle_orchestrate(self, cmd: str):
-        """/orchestrate <message> — auto-delegation through orchestrator."""
+        """/orchestrate <message> — auto-delegation with code workflow detection."""
         from agent_registry import get_registry
 
         parts = cmd.strip().split(None, 1)
@@ -8316,11 +8318,56 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         message = parts[1]
         session_id = getattr(self, "session_id", "cli-orch")
+        registry = get_registry()
+
+        # ── Code task detection ──────────────────────────────
+        classification = registry.classify_code_task(message)
+        if classification["is_code_task"] and classification["confidence"] >= 0.7:
+            from workflow_tracker import start_workflow, get_active_workflow
+
+            existing = get_active_workflow()
+            if existing and existing.status in ("writing", "reviewing", "fixing"):
+                _cprint(f"\n  [bold yellow]⚠ Code workflow already running:[/]")
+                _cprint(f"  {existing.display_status}")
+                _cprint(f"  [dim]Use /workflow stop first, or wait for it to finish.[/]\n")
+                return
+
+            lang = classification.get("language", "")
+            _cprint(f"\n  [bold]🚀 Code workflow starting...[/]")
+            _cprint(f"  Task: {message[:100]}...")
+            if lang:
+                _cprint(f"  Language: {lang}")
+            _cprint("")
+
+            tracker = start_workflow(registry, message, language=lang or None)
+            _cprint(f"  {tracker.display_status}")
+
+            # Wait for completion with status updates
+            import asyncio
+            async def wait_with_status():
+                last_status = ""
+                while tracker.status in ("starting", "writing", "reviewing", "fixing"):
+                    await asyncio.sleep(2)
+                    if tracker.status != last_status:
+                        _cprint(f"  {tracker.display_status}")
+                        last_status = tracker.status
+
+            try:
+                self._run_async(wait_with_status(), timeout=300)
+            except Exception:
+                pass
+
+            if tracker._result:
+                from workflow_tracker import format_workflow_result
+                _cprint(format_workflow_result(tracker))
+            return
+
+        # ── Normal orchestration (non-code task) ─────────────
         _cprint(f"  [orchestrator] analysing...")
 
         try:
             reply = self._run_async(
-                get_registry().orchestrate(session_id, message),
+                registry.orchestrate(session_id, message),
                 timeout=300,
             )
             _cprint(f"  [orchestrator] {reply}")
@@ -8385,6 +8432,49 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _cprint(report)
         except Exception as e:
             _cprint(f"  [red]Update failed: {e}[/]")
+
+    def _handle_workflow(self, cmd: str):
+        """/workflow <action> — code workflow control.
+
+        Actions:
+          status    — show current workflow status
+          stop      — stop the running workflow
+          continue  — resume a stopped workflow
+        """
+        from workflow_tracker import get_active_workflow, format_workflow_result
+
+        parts = cmd.split(None, 1)
+        action = parts[1] if len(parts) > 1 else "status"
+
+        wf = get_active_workflow()
+
+        if action == "status":
+            if wf:
+                _cprint(f"\n  {wf.display_status}\n")
+                if wf._result:
+                    _cprint(format_workflow_result(wf))
+            else:
+                _cprint("  [dim]No active code workflow.[/]")
+
+        elif action == "stop":
+            if wf and wf.status not in ("passed", "failed", "stopped"):
+                wf.request_stop()
+                _cprint(f"\n  [bold yellow]⏹️ Workflow {wf.task_id} stopping...[/]\n")
+            elif wf:
+                _cprint(f"  [dim]Workflow already {wf.status}.[/]")
+            else:
+                _cprint("  [dim]No active workflow to stop.[/]")
+
+        elif action == "continue":
+            if wf and wf.status == "stopped":
+                _cprint(f"  [dim]Workflow {wf.task_id} was stopped. Start a new one.[/]")
+            elif wf:
+                _cprint(f"  [dim]Workflow is already {wf.status}.[/]")
+            else:
+                _cprint("  [dim]No stopped workflow to continue.[/]")
+
+        else:
+            _cprint(f"  /workflow status|stop|continue")
 
     def _handle_memory(self, cmd: str):
         """/memory <action> [args] — long-term memory management.
