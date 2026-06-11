@@ -366,6 +366,16 @@ class AgentRegistry:
         self._instances: dict[str, Any] = {}       # agent_id -> AIAgent
         self._stats: dict[str, dict] = {}          # agent_id -> {calls, tokens, total_ms}
         self._longterm_memory: LongTermMemory | None = None  # set via init_longterm_memory()
+        self._chat_history = None  # ChatHistoryDB singleton — lazy init
+
+    @property
+    def chat_history(self):
+        """Lazy-init ChatHistoryDB singleton."""
+        if self._chat_history is None:
+            from memory.chat_history import ChatHistoryDB
+            self._chat_history = ChatHistoryDB()
+            self._chat_history.initialize_db()
+        return self._chat_history
 
 
     def set_db(self, db):
