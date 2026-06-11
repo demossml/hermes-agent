@@ -85,6 +85,7 @@ class ChatHistoryDB:
                     message_type      TEXT,
                     has_media         BOOLEAN DEFAULT FALSE,
                     timestamp         TIMESTAMP,
+                    embedding         FLOAT[],
                     created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -166,14 +167,15 @@ class ChatHistoryDB:
                     links_json = json.dumps(found, ensure_ascii=False)
 
             ts = message.get("timestamp") or datetime.now(timezone.utc)
+            vec = message.get("embedding")
 
             self._conn.execute(
                 """INSERT INTO group_messages
                    (platform, chat_id, chat_title, message_id,
                     sender_id, sender_name, sender_username,
                     text, has_link, links, reply_to_id,
-                    message_type, has_media, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    message_type, has_media, timestamp, embedding)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     message.get("platform", ""),
                     message.get("chat_id", ""),
@@ -189,6 +191,7 @@ class ChatHistoryDB:
                     message.get("message_type"),
                     bool(message.get("has_media", False)),
                     ts,
+                    vec,
                 ],
             )
 
@@ -238,6 +241,287 @@ class ChatHistoryDB:
                 pass
 
         return saved
+
+    # ── Vectorization & semantic search ──────────────────────
+
+    _vectorizer = None
+    _vectorizer_model = "paraphrase-multilingual-MiniLM-L12-v2"
+    _embedding_cache: dict[str, list[float]] = {}
+    _cache_max_size: int = 10000
+
+    @classmethod
+    def _get_vectorizer(cls):
+        """Lazy-load the sentence-transformers model.
+
+        Returns the model or None if not installed.
+        """
+        if cls._vectorizer is not None:
+            return cls._vectorizer
+
+        try:
+            from sentence_transformers import SentenceTransformer
+            cls._vectorizer = SentenceTransformer(cls._vectorizer_model)
+            logger.info(
+                "Vectorizer loaded: %s", cls._vectorizer_model
+            )
+        except ImportError:
+            logger.debug(
+                "sentence-transformers not installed — "
+                "semantic search disabled. pip install sentence-transformers"
+            )
+            cls._vectorizer = False  # sentinel: tried and failed
+        except Exception as e:
+            logger.warning("Failed to load vectorizer: %s", e)
+            cls._vectorizer = False
+
+        return cls._vectorizer if cls._vectorizer is not False else None
+
+    def _embed(self, text: str) -> list[float] | None:
+        """Generate an embedding vector for text.
+
+        Uses an in-memory cache keyed by the text hash.
+        Returns None if the vectorizer is unavailable.
+        """
+        if not text or not text.strip():
+            return None
+
+        # Cache hit
+        cache_key = str(hash(text))
+        if cache_key in self._embedding_cache:
+            return self._embedding_cache[cache_key]
+
+        model = self._get_vectorizer()
+        if not model:
+            return None
+
+        try:
+            vec = model.encode(text.strip(), normalize_embeddings=True)
+            result = vec.tolist()
+
+            # Cache management: evict oldest if full
+            if len(self._embedding_cache) >= self._cache_max_size:
+                oldest = next(iter(self._embedding_cache))
+                del self._embedding_cache[oldest]
+
+            self._embedding_cache[cache_key] = result
+            return result
+        except Exception as e:
+            logger.warning("Embedding failed: %s", e)
+            return None
+
+    def vectorize_and_save(
+        self, message: dict[str, Any]
+    ) -> int | None:
+        """Generate embedding, save message with vector. Returns row ID.
+
+        Same as save_message() but also generates and stores an
+        embedding vector in the ``embedding`` column.
+        """
+        if not self.ready:
+            return None
+
+        text = message.get("text") or ""
+        vec = self._embed(text) if text else None
+
+        try:
+            links = message.get("links")
+            has_link = False
+            links_json = None
+            if links:
+                has_link = True
+                links_json = (
+                    json.dumps(links, ensure_ascii=False)
+                    if isinstance(links, list) else str(links)
+                )
+            elif text:
+                found = self._extract_links(text)
+                if found:
+                    has_link = True
+                    links_json = json.dumps(found, ensure_ascii=False)
+
+            ts = message.get("timestamp") or datetime.now(timezone.utc)
+
+            self._conn.execute(
+                """INSERT INTO group_messages
+                   (platform, chat_id, chat_title, message_id,
+                    sender_id, sender_name, sender_username,
+                    text, has_link, links, reply_to_id,
+                    message_type, has_media, timestamp, embedding)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    message.get("platform", ""),
+                    message.get("chat_id", ""),
+                    message.get("chat_title"),
+                    message.get("message_id", ""),
+                    message.get("sender_id"),
+                    message.get("sender_name"),
+                    message.get("sender_username"),
+                    text,
+                    has_link,
+                    links_json,
+                    message.get("reply_to_id"),
+                    message.get("message_type"),
+                    bool(message.get("has_media", False)),
+                    ts,
+                    vec,
+                ],
+            )
+
+            row = self._conn.execute(
+                "SELECT currval('seq_group_messages_id')"
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+        except Exception as e:
+            logger.warning("vectorize_and_save failed: %s", e)
+            return None
+
+    def semantic_search(
+        self,
+        query: str,
+        chat_id: str | None = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Semantic search using cosine similarity on embeddings.
+
+        Args:
+            query:   Natural language search query
+            chat_id: Optional chat filter (None = search all chats)
+            limit:   Max results
+
+        Returns:
+            Messages ranked by cosine similarity, most similar first.
+            Each result includes a ``score`` field (0-1, higher = better).
+        """
+        if not self.ready:
+            return []
+
+        query_vec = self._embed(query)
+        if query_vec is None:
+            return []  # vectorizer unavailable
+
+        try:
+            # Fetch candidates with embeddings
+            if chat_id:
+                rows = self._conn.execute(
+                    """SELECT id, platform, chat_id, chat_title, message_id,
+                              sender_id, sender_name, sender_username, text,
+                              has_link, links, reply_to_id, message_type,
+                              has_media, timestamp, created_at, embedding
+                    FROM group_messages
+                    WHERE chat_id = ? AND embedding IS NOT NULL
+                    ORDER BY timestamp DESC
+                    LIMIT 500""",
+                    [chat_id],
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """SELECT id, platform, chat_id, chat_title, message_id,
+                              sender_id, sender_name, sender_username, text,
+                              has_link, links, reply_to_id, message_type,
+                              has_media, timestamp, created_at, embedding
+                    FROM group_messages
+                    WHERE embedding IS NOT NULL
+                    ORDER BY timestamp DESC
+                    LIMIT 500""",
+                ).fetchall()
+
+            # Compute cosine similarity (vectors are normalized, so
+            # cosine = dot product)
+            scored = []
+            for row in rows:
+                emb = row[16]  # embedding column
+                if emb is None:
+                    continue
+                # DuckDB returns FLOAT[] as list
+                if isinstance(emb, str):
+                    import ast
+                    emb = ast.literal_eval(emb)
+                score = _cosine_similarity(query_vec, emb)
+                msg = self._row_to_dict(row)
+                msg["score"] = round(score, 4)
+                scored.append(msg)
+
+            scored.sort(key=lambda x: x["score"], reverse=True)
+            return scored[:limit]
+
+        except Exception as e:
+            logger.warning("semantic_search failed: %s", e)
+            return []
+
+    def hybrid_search(
+        self,
+        query: str,
+        chat_id: str,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Combined keyword + semantic search.
+
+        Runs both FTS (ILIKE) and semantic search, then merges
+        results with a weighted score:
+
+            hybrid_score = 0.3 * keyword_score + 0.7 * semantic_score
+
+        Keyword matches that aren't in the semantic results still
+        appear (with semantic_score=0).  Semantic results without
+        keyword match also appear (with keyword_score=0).
+
+        Args:
+            query:   Search query
+            chat_id: Chat to search in
+            limit:   Max results
+
+        Returns:
+            Messages with ``hybrid_score``, ``keyword_score``,
+            ``semantic_score`` fields.
+        """
+        if not self.ready:
+            return []
+
+        # Run both searches
+        kw_results = self.search(
+            "telegram" if not chat_id else "telegram",
+            chat_id, query, limit=limit * 2,
+        )
+        sem_results = self.semantic_search(
+            query, chat_id=chat_id, limit=limit * 2,
+        )
+
+        # Build a merged map: message_id → scores
+        merged: dict[int, dict] = {}
+
+        # Keyword results
+        for i, msg in enumerate(kw_results):
+            mid = msg["id"]
+            merged[mid] = dict(msg)
+            merged[mid]["keyword_score"] = round(1.0 - i * 0.05, 4)
+            merged[mid]["semantic_score"] = 0.0
+
+        # Semantic results
+        for msg in sem_results:
+            mid = msg["id"]
+            if mid in merged:
+                merged[mid]["semantic_score"] = msg.get("score", 0)
+            else:
+                merged[mid] = dict(msg)
+                merged[mid]["keyword_score"] = 0.0
+                merged[mid]["semantic_score"] = msg.get("score", 0)
+
+        # Compute hybrid score
+        for mid, m in merged.items():
+            m["hybrid_score"] = round(
+                0.3 * m.get("keyword_score", 0) +
+                0.7 * m.get("semantic_score", 0),
+                4,
+            )
+
+        # Sort by hybrid score descending
+        result = sorted(
+            merged.values(),
+            key=lambda x: x["hybrid_score"],
+            reverse=True,
+        )
+        return result[:limit]
 
     @staticmethod
     def _extract_links(text: str) -> list[str]:
@@ -513,3 +797,18 @@ class ChatHistoryDB:
             "timestamp": str(row[14]) if row[14] else "",
             "created_at": str(row[15]) if row[15] else "",
         }
+
+
+# ── Module-level helpers ──────────────────────────────────────
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Compute cosine similarity between two vectors.
+
+    Vectors are assumed to be L2-normalized, so cosine = dot product.
+    Returns a float between -1 and 1 (higher = more similar).
+    """
+    if len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    return max(-1.0, min(1.0, dot))
