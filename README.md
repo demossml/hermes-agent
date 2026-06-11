@@ -42,6 +42,8 @@ This branch extends Hermes Agent with **multi-agent orchestration**, DAG pipelin
 - **Per-agent LLM config** — each agent on its own provider/model with inheritance, fallback, and auto-select
 - **Auto-propagation** — `hermes tools enable` automatically propagates toolsets to all existing agents
 - **Full Clone agents** — new sub-agents get ALL tools by default (complete Hermes capability)
+- **Code Workflow** — automated coder→tester pipeline with sandboxed test execution and auto-generated pytest suites
+- **Parallel workflows** — run multiple code tasks simultaneously, each with isolated coder+tester agents
 
 ---
 
@@ -269,6 +271,17 @@ User → Main Hermes Agent [level: 0, main-session]
                 ├── propagate_toolset_to_agents()
                 │    └── hermes tools enable → auto-propagation
                 │
+                ├── CodeGenerationWorkflow
+                │    ├── classify_code_task() — 55 patterns, EN+RU
+                │    ├── CoderAgent → write_code / fix_code
+                │    ├── TesterAgent → review_code + CodeRunner
+                │    │    ├── Sandboxed execution (subprocess, 15s)
+                │    │    ├── Auto-generate 5-8 pytest tests
+                │    │    ├── mypy type checking
+                │    │    └── Security scan (13 patterns)
+                │    ├── Stop: 2 confident passes or 1 at ≥95%
+                │    └── Parallel: multiple workflows simultaneously
+                │
                 ├── orchestrator [L0, main-session]
                 │    ├── critical_rules: routing, DELEGATE
                 │    ├── rule_reminder_every: 3
@@ -493,6 +506,76 @@ cd hermes-agent
 
 # Auto-delegate through the Orchestrator
 /orchestrate research algorithms and write a benchmark
+
+# Auto-detected code tasks launch the coder→tester pipeline
+/orchestrate write a prime number checker
+```
+
+### Code Workflow
+
+The Orchestrator can automatically detect code-related requests and launch a **coder→tester→fix** pipeline with real sandboxed execution.
+
+```bash
+/orchestrate write a function that checks if a number is prime
+```
+
+**How it works:**
+
+1. **Classify** — `classify_code_task()` detects code requests (55 EN/RU patterns)
+2. **Coder** writes production-quality code (docstrings, type hints, edge cases)
+3. **Tester** runs code in a sandbox + auto-generates 5-8 pytest tests
+4. **Review** — if code fails real tests, Coder fixes and resubmits
+5. **Stop criteria** — 2 consecutive confident passes, or max 5 iterations
+
+```
+🚀 Code workflow starting…
+✍️  Coder writing code…
+🔍 Tester reviewing (real execution + analysis)…
+   → pytest: 5 passed, 0 failed
+   → mypy: PASS
+   → security: 0 issues
+✅ Code Workflow PASSED after 1 iteration
+```
+
+**Tester agent capabilities:**
+- Real sandboxed execution (subprocess, 15s timeout)
+- Auto-generates quality pytest tests (5-8 cases: normal, boundary, error)
+- Type checking with mypy
+- Security scan (13 patterns: eval, exec, secrets, injection)
+- Structured output: Syntax, Tests, Types, Security, Performance, Style
+
+### Parallel Workflows
+
+Run multiple code tasks simultaneously — each with its own isolated coder+tester pair.
+
+```bash
+/orchestrate write a sorting function
+/orchestrate create a User class with JSON serialization
+/orchestrate write unit tests for the auth module
+```
+
+```bash
+/workflows
+  ✍️  WRITING • 1/5 • coder-a1b2 → tester-a1b2  ◀ active
+  🔍 REVIEWING • 2/5 • coder-e5f6 → tester-e5f6
+
+/workflow switch e5f6          # focus another workflow
+/workflow show a1b2c3d4         # view final code + review
+/workflow stop                  # stop the active workflow
+/workflow delete a1b2c3d4       # delete a completed workflow
+/workflow list                  # show all stored workflow history
+```
+
+### Workflow Commands
+
+```bash
+/workflows                       # list all active workflows
+/workflow status                 # show current workflow progress
+/workflow switch <id>            # focus a different workflow
+/workflow show <id>              # view code + review + iteration history
+/workflow stop                   # stop the active workflow
+/workflow delete <id>            # delete workflow and all its iterations
+/workflow list                   # show all stored workflow history
 ```
 
 ### Per-Agent LLM Config
