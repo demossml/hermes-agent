@@ -8,9 +8,12 @@ integration for the CLI and gateway.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any
+
+from workflow_store import save_workflow, update_workflow_status, save_workflow_result
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +100,9 @@ async def _run_workflow(tracker: WorkflowTracker) -> None:
     try:
         wf._ensure_agents()
         tracker.status = "writing"
+        save_workflow(tracker.task_id, tracker.task_description,
+                      language=wf.language, status="writing", iteration=1,
+                      coder_id=wf.coder_id, tester_id=wf.tester_id)
 
         # Phase 1: Write
         tracker.iteration = 1
@@ -110,10 +116,12 @@ async def _run_workflow(tracker: WorkflowTracker) -> None:
         for wf.iteration in range(1, tracker.max_iterations + 1):
             if tracker.stopped:
                 tracker.status = "stopped"
+                update_workflow_status(tracker.task_id, "stopped", wf.iteration)
                 return
 
             tracker.iteration = wf.iteration
             tracker.status = "reviewing"
+            update_workflow_status(tracker.task_id, "reviewing", wf.iteration)
             wf.current_review = await wf._call_tester(wf.current_code)
             wf.history.append({
                 "phase": f"review-{wf.iteration}",
@@ -122,13 +130,18 @@ async def _run_workflow(tracker: WorkflowTracker) -> None:
 
             if wf._is_passing(wf.current_review):
                 tracker.status = "passed"
-                wf.state = wf.__class__.PASSED if hasattr(wf.__class__, 'PASSED') else None
                 tracker._result = wf._build_result("passed")
+                save_workflow_result(
+                    tracker.task_id, "passed", wf.iteration,
+                    wf.current_code, wf.current_review,
+                    json.dumps(tracker._result, default=str),
+                )
                 logger.info(f"Workflow {tracker.task_id}: PASSED")
                 return
 
             if wf.iteration < tracker.max_iterations:
                 tracker.status = "fixing"
+                update_workflow_status(tracker.task_id, "fixing", wf.iteration)
                 wf.current_code = await wf._call_coder_fix(
                     wf.current_code, wf.current_review,
                 )
@@ -139,6 +152,11 @@ async def _run_workflow(tracker: WorkflowTracker) -> None:
             else:
                 tracker.status = "failed"
                 tracker._result = wf._build_result("failed")
+                save_workflow_result(
+                    tracker.task_id, "failed", wf.iteration,
+                    wf.current_code, wf.current_review,
+                    json.dumps(tracker._result, default=str),
+                )
 
     except asyncio.CancelledError:
         tracker.status = "stopped"

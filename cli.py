@@ -8434,47 +8434,98 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _cprint(f"  [red]Update failed: {e}[/]")
 
     def _handle_workflow(self, cmd: str):
-        """/workflow <action> — code workflow control.
+        """/workflow <action> [id] — code workflow control.
 
         Actions:
-          status    — show current workflow status
-          stop      — stop the running workflow
-          continue  — resume a stopped workflow
+          list              — show all workflows
+          status [id]       — current workflow status
+          show <id>         — show final code
+          stop [id]         — stop a workflow
+          resume <id>       — resume a stopped workflow
         """
         from workflow_tracker import get_active_workflow, format_workflow_result
+        from workflow_store import list_workflows, get_workflow
 
-        parts = cmd.split(None, 1)
+        parts = cmd.split(None, 2)
         action = parts[1] if len(parts) > 1 else "status"
 
-        wf = get_active_workflow()
+        if action == "list":
+            wfs = list_workflows(limit=20)
+            if not wfs:
+                _cprint("  [dim]No workflows found.[/]")
+                return
+            _cprint("\n  [bold]Workflows:[/]\n")
+            for w in wfs:
+                icon = {"passed": "✅", "failed": "❌", "in_progress": "🔄",
+                        "stopped": "⏹️", "reviewing": "🔍"}.get(w["status"], "⏳")
+                _cprint(
+                    f"  {icon} {w['id'][:12]}  {w['status']:12}  "
+                    f"iter {w['iteration']}/{w['max_iter']}  "
+                    f"{w['task'][:60]}"
+                )
+            _cprint("")
 
-        if action == "status":
+        elif action == "show":
+            wf_id = parts[2] if len(parts) > 2 else ""
+            if not wf_id:
+                _cprint("  Usage: /workflow show <id>")
+                return
+            w = get_workflow(wf_id)
+            if not w:
+                _cprint(f"  [red]Workflow {wf_id} not found.[/]")
+                return
+            _cprint(f"\n  [bold]Workflow {wf_id}[/]")
+            _cprint(f"  Status: {w['status']} | Iteration: {w['iteration']}/{w['max_iter']}")
+            _cprint(f"  Task: {w['task'][:100]}")
+            if w["final_code"]:
+                _cprint(f"\n  [bold]## Code[/]")
+                _cprint(f"  {w['final_code'][:2000]}")
+            if w["final_review"]:
+                _cprint(f"\n  [bold]## Review[/]")
+                _cprint(f"  {w['final_review'][:1000]}")
+            _cprint("")
+
+        elif action == "stop":
+            wf_id = parts[2] if len(parts) > 2 else ""
+            if wf_id:
+                wf = get_active_workflow()  # only active can be stopped
+                _cprint(f"  [dim]Use /workflow stop (no id) to stop the active workflow.[/]")
+            else:
+                wf = get_active_workflow()
+                if wf and wf.status not in ("passed", "failed", "stopped"):
+                    wf.request_stop()
+                    _cprint(f"\n  [bold yellow]⏹️ Workflow {wf.task_id} stopping...[/]\n")
+                elif wf:
+                    _cprint(f"  [dim]Workflow already {wf.status}.[/]")
+                else:
+                    _cprint("  [dim]No active workflow to stop.[/]")
+
+        elif action == "resume":
+            wf_id = parts[2] if len(parts) > 2 else ""
+            if not wf_id:
+                _cprint("  Usage: /workflow resume <id>")
+                return
+            w = get_workflow(wf_id)
+            if not w:
+                _cprint(f"  [red]Workflow {wf_id} not found.[/]")
+                return
+            if w["status"] in ("passed", "failed"):
+                _cprint(f"  [dim]Workflow {wf_id} is already {w['status']}. Use /orchestrate to start a new task.[/]")
+            else:
+                _cprint(f"  [dim]Workflow {wf_id} status: {w['status']}. Resume not yet supported.[/]")
+
+        elif action == "status":
+            wf = get_active_workflow()
             if wf:
                 _cprint(f"\n  {wf.display_status}\n")
                 if wf._result:
                     _cprint(format_workflow_result(wf))
             else:
                 _cprint("  [dim]No active code workflow.[/]")
-
-        elif action == "stop":
-            if wf and wf.status not in ("passed", "failed", "stopped"):
-                wf.request_stop()
-                _cprint(f"\n  [bold yellow]⏹️ Workflow {wf.task_id} stopping...[/]\n")
-            elif wf:
-                _cprint(f"  [dim]Workflow already {wf.status}.[/]")
-            else:
-                _cprint("  [dim]No active workflow to stop.[/]")
-
-        elif action == "continue":
-            if wf and wf.status == "stopped":
-                _cprint(f"  [dim]Workflow {wf.task_id} was stopped. Start a new one.[/]")
-            elif wf:
-                _cprint(f"  [dim]Workflow is already {wf.status}.[/]")
-            else:
-                _cprint("  [dim]No stopped workflow to continue.[/]")
+                _cprint("  [dim]Use /workflow list to see all workflows.[/]")
 
         else:
-            _cprint(f"  /workflow status|stop|continue")
+            _cprint("  /workflow list|status|show <id>|stop|resume <id>")
 
     def _handle_memory(self, cmd: str):
         """/memory <action> [args] — long-term memory management.
