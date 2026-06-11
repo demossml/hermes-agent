@@ -339,6 +339,21 @@ TOOLSETS = {
         "tools": [],
         "includes": ["web", "vision", "image_gen"]
     },
+
+    "profile": {
+        "description": (
+            "Profile orchestration — manage clone profiles: read memory, "
+            "view tools, change config, list sessions. Opt-in per clone "
+            "via profile.allow_orchestration: true in config.yaml."
+        ),
+        "tools": [
+            "profile_memory",
+            "profile_tools",
+            "profile_config",
+            "profile_sessions",
+        ],
+        "includes": []
+    },
     
     # ==========================================================================
     # Full Hermes toolsets (CLI + messaging platforms)
