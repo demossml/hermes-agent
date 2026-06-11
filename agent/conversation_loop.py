@@ -308,14 +308,11 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     except Exception as exc:
         logger.warning("on_session_start hook failed: %s", exc)
 
-    # ── Chat rules injection (DuckDB, zero LLM token overhead) ──
-    # Injects group-specific rules into the system prompt BEFORE the
-    # LLM call.  One SQL query — microseconds latency.
+    # ── Chat rules injection (DuckDB) ────────────────────────────
     try:
         from hermes_cli.chat_rules import inject_rules_into_prompt
         _source = getattr(agent, "_gateway_source", None)
         if _source is None:
-            # Reconstruct from agent attributes
             from types import SimpleNamespace
             _platform = getattr(agent, "platform", None)
             _chat_id = getattr(agent, "_chat_id", None)
@@ -323,8 +320,29 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 _source = SimpleNamespace(platform=_platform, chat_id=_chat_id)
         inject_rules_into_prompt(agent, _source)
     except Exception:
-        pass  # DuckDB not installed — silent, no impact
-    # ──────────────────────────────────────────────────────────────
+        pass
+
+    # ── Auto-load recent chat context ────────────────────────────
+    try:
+        _auto_load = getattr(agent, "_auto_load_chat_context", False)
+        if _auto_load:
+            _chat_id = getattr(agent, "_chat_id", None)
+            if _chat_id:
+                from memory.chat_history import ChatHistoryDB
+                _cdb = ChatHistoryDB()
+                if _cdb.initialize_db():
+                    _recent = _cdb.get_recent("telegram", str(_chat_id), limit=10)
+                    if _recent:
+                        _lines = ["[RECENT CHAT CONTEXT]"] + [
+                            f"{m.get('sender_name','unknown')}: {(m.get('text',''))[:200]}"
+                            for m in reversed(_recent)
+                        ]
+                        _ctx = "\n".join(_lines)
+                        if isinstance(user_message, str):
+                            user_message = _ctx + "\n\n" + user_message
+    except Exception:
+        pass
+    # ─────────────────────────────────────────────────────────────
 
     # Cold-start credits seed (L3) — fallback for the first-turn path. The TUI/
     # desktop build seeds at session OPEN (see seed_credits_at_session_start in

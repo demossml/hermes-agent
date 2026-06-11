@@ -238,3 +238,100 @@ registry.register(
     ),
     requires_env=[],
 )
+
+
+# ── Tool 2: get_recent_chat_context ───────────────────────────
+
+
+def _get_recent_chat_context(
+    *,
+    chat_id: str = "",
+    limit: int = 20,
+    task_id: str = "",
+) -> str:
+    """Return recent messages from a chat as context for the agent.
+
+    Args:
+        chat_id: Chat identifier (required).
+        limit:   Max messages (1-50, default 20).
+
+    Returns:
+        JSON array of recent messages formatted as context.
+    """
+    if not chat_id:
+        return json.dumps({"error": "chat_id is required"})
+
+    limit = max(1, min(limit, 50))
+
+    try:
+        from memory.chat_history import ChatHistoryDB
+
+        db = ChatHistoryDB()
+        db.initialize_db()
+
+        platform = "telegram"
+        clean_id = chat_id
+        if ":" in chat_id:
+            platform, clean_id = chat_id.split(":", 1)
+
+        messages = db.get_recent(platform, clean_id, limit=limit)
+
+        if not messages:
+            return json.dumps({
+                "chat_id": chat_id,
+                "count": 0,
+                "context": "No recent messages found.",
+            })
+
+        # Build a readable context block
+        lines = [f"[RECENT CHAT CONTEXT — last {len(messages)} messages]"]
+        for m in reversed(messages):  # chronological order
+            sender = m.get("sender_name") or m.get("sender_username") or "unknown"
+            text = (m.get("text") or "")[:300]
+            lines.append(f"{sender}: {text}")
+
+        context = "\n".join(lines)
+
+        return json.dumps({
+            "chat_id": chat_id,
+            "count": len(messages),
+            "context": context,
+        }, ensure_ascii=False, indent=2)
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+registry.register(
+    name="get_recent_chat_context",
+    toolset="memory",
+    schema={
+        "name": "get_recent_chat_context",
+        "description": (
+            "Get recent messages from a chat as context. "
+            "Returns the last N messages in chronological order, "
+            "formatted for inclusion in the agent's context."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "string",
+                    "description": "Chat identifier (required).",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max messages (1-50, default 20).",
+                    "default": 20,
+                },
+            },
+            "required": ["chat_id"],
+        },
+    },
+    handler=lambda args, **kw: _get_recent_chat_context(
+        chat_id=args.get("chat_id", ""),
+        limit=args.get("limit", 20),
+        task_id=kw.get("task_id", ""),
+    ),
+    requires_env=[],
+)
