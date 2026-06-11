@@ -12,6 +12,7 @@ Usage::
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -178,11 +179,24 @@ class CodeGenerationWorkflow:
         )
 
     async def _call_tester(self, code: str) -> str:
-        """Ask tester to review code (no task context)."""
+        """Ask tester to review code (no task context) + run real tests."""
+        # ── Real execution first ────────────────────────────
+        exec_report = ""
+        try:
+            from code_runner import get_runner
+            runner = get_runner()
+            report = runner.run_full_check(code, language=self.language or "python")
+            exec_report = json.dumps(report, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
         msg = (
-            f"Review the following code. You do NOT know the original "
-            f"user task — judge the code on its own merits.\n\n"
-            f"```\n{code[:3000]}\n```"
+            f"FIRST — here are the ACTUAL test results from running this code "
+            f"in a sandbox. Use these results in your review.\n\n"
+            f"```json\n{exec_report}\n```\n\n"
+            f"Now review the code. You do NOT know the original user task "
+            f"— judge the code on its own merits.\n\n"
+            f"```\n{code[:2500]}\n```"
         )
         return await self.registry.call(
             self.tester_id, self.session_id or self.task_id, msg,
@@ -280,28 +294,33 @@ def _tester_config(task_id: str) -> dict:
     "system_prompt": (
         "You are a SENIOR CODE TESTER and SECURITY REVIEWER.\n"
         "You do NOT know the original user task — you only "
-        "see the code. Your job is to find EVERYTHING wrong "
-        "with it.\n\n"
+        "see the code AND the automated test results that were "
+        "already run in a sandbox.\n\n"
+        "⚠️ IMPORTANT: The code has ALREADY been executed in "
+        "a sandbox. The test results (pytest output, mypy, "
+        "security scan) are in the message above the code. "
+        "Use these REAL results — do NOT speculate about "
+        "whether the code runs or not.\n\n"
         "YOUR MISSION:\n"
-        "1. SECURITY: SQL injection, XSS, path traversal, "
-        "unsafe deserialization, hardcoded secrets, missing "
-        "input validation, insecure randomness.\n"
-        "2. CORRECTNESS: Logic errors, off-by-one, wrong "
-        "return types, broken edge cases, race conditions.\n"
-        "3. EDGE CASES: Empty inputs, None/null, zero, "
-        "negative numbers, very large inputs, unicode, "
-        "concurrent access.\n"
-        "4. PERFORMANCE: O(n²) where O(n) is possible, "
-        "unnecessary allocations, blocking I/O, missing "
-        "caching opportunities.\n"
-        "5. STYLE: Naming conventions, missing type hints, "
-        "undocumented functions, inconsistent formatting, "
-        "dead code, overly complex logic.\n\n"
+        "1. SYNTAX: Check the actual execution output. Did it "
+        "compile? Any syntax errors?\n"
+        "2. TESTS: Did pytest pass? How many passed/failed? "
+        "Quote the actual test output.\n"
+        "3. EDGE CASES: What inputs would break this code? "
+        "Empty lists? None? Negative numbers?\n"
+        "4. TYPES: Did mypy find type errors? Quote them.\n"
+        "5. SECURITY: Any dangerous patterns (eval, exec, "
+        "subprocess, hardcoded secrets)?\n"
+        "6. PERFORMANCE: O(n²)? Unnecessary allocations?\n"
+        "7. STYLE: Naming, docstrings, type hints, PEP 8.\n\n"
         "OUTPUT FORMAT:\n"
         "## Review Result: ✅ PASS or ❌ FAIL\n\n"
+        "### Execution Results\n"
+        "- Syntax: PASS/FAIL (with error if any)\n"
+        "- Tests: X passed, Y failed\n"
+        "- Types: PASS/FAIL (with mypy output if any)\n"
+        "- Security: X issues found\n\n"
         "### Security Issues\n"
-        "- (specific issue with line reference if possible)\n\n"
-        "### Correctness Issues\n"
         "- (specific issue)\n\n"
         "### Edge Case Issues\n"
         "- (specific issue)\n\n"
@@ -310,14 +329,8 @@ def _tester_config(task_id: str) -> dict:
         "### Style Issues\n"
         "- (specific issue)\n\n"
         "### Summary\n"
-        "Brief overall assessment.\n\n"
-        "RULES:\n"
-        "- Be SPECIFIC. \"Code has issues\" is useless. "
-        "\"Line 12: missing null check on user input\" is useful.\n"
-        "- Every issue MUST have a suggested fix.\n"
-        "- Do NOT rewrite the code — describe what to fix.\n"
-        "- If the code is genuinely correct, say ✅ PASS "
-        "and briefly explain why."
+        "Brief overall assessment. Quote the actual test "
+        "output — do NOT make up results."
     ),
     "parent_id": "orchestrator",
     "description": "Dynamic tester for task {task_id}",
