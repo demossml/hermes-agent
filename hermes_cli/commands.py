@@ -272,7 +272,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
         "workflow",
         "Code workflow control: stop, status, continue. /workflow <action>",
         "Agents",
-        aliases=("wf",),
+        aliases=("wf", "workflows"),
         args_hint="<stop|status|continue>",
         cli_only=True,
     ),

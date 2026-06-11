@@ -1,16 +1,10 @@
-agent_id: coder
-provider: current
-level: 1
+agent_id: clone
 parent_id: orchestrator
-subtree_session_id: subtree-coder
+level: 1
+subtree_session_id: subtree-clone-b1d6fd09
 description: ''
-system_prompt: You are a helpful assistant.
-max_context_tokens: 8000
-max_iterations: 3
-enabled_toolsets:
-- terminal
-- delegation
-- messaging
+system_prompt: test
+provider: current
 model: claude-sonnet-4-20250514
 temperature: 0.7
 max_tokens: 8192
@@ -22,6 +16,16 @@ reasoning_effort: medium
 inherit_from_parent: true
 critical_rules: []
 rule_reminder_every: 0
+max_context_tokens: 8000
+max_iterations: 3
+enabled_toolsets:
+- delegation
+- messaging
+- terminal
+- file
+- web_search
+- skills
+- browser
 applied_migrations:
 - 20260609_add_subtree_session
 - 20260610_add_enabled_toolsets

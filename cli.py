@@ -7704,7 +7704,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_subagents(cmd_original)
         elif canonical == "memory":
             self._handle_memory(cmd_original)
-        elif canonical == "workflow":
+        elif canonical == "workflow" or canonical == "workflows":
             self._handle_workflow(cmd_original)
         elif canonical == "agent-off":
             self._handle_agent_off()
@@ -8323,14 +8323,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # ── Code task detection ──────────────────────────────
         classification = registry.classify_code_task(message)
         if classification["is_code_task"] and classification["confidence"] >= 0.7:
-            from workflow_tracker import start_workflow, get_active_workflow
-
-            existing = get_active_workflow()
-            if existing and existing.status in ("writing", "reviewing", "fixing"):
-                _cprint(f"\n  [bold yellow]⚠ Code workflow already running:[/]")
-                _cprint(f"  {existing.display_status}")
-                _cprint(f"  [dim]Use /workflow stop first, or wait for it to finish.[/]\n")
-                return
+            from workflow_tracker import start_workflow
 
             lang = classification.get("language", "")
             _cprint(f"\n  [bold]🚀 Code workflow starting...[/]")
@@ -8443,13 +8436,48 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
           stop [id]         — stop a workflow
           resume <id>       — resume a stopped workflow
         """
-        from workflow_tracker import get_active_workflow, format_workflow_result
+        from workflow_tracker import (
+            get_active_workflow, get_active_workflow_id, set_active_workflow,
+            get_all_workflows, format_workflow_result,
+        )
         from workflow_store import list_workflows, get_workflow
 
         parts = cmd.split(None, 2)
         action = parts[1] if len(parts) > 1 else "status"
+        active_id = get_active_workflow_id()
 
         if action == "list":
+            # Show live tracked workflows + stored history
+            live = get_all_workflows()
+            if not live:
+                _cprint("  [dim]No active workflows.[/]")
+                _cprint("  [dim]Use /workflow list to see all stored workflows.[/]")
+                return
+            _cprint(f"\n  [bold]Workflows ({len(live)}):[/]\n")
+            for t in live:
+                marker = " ◀ active" if t.task_id == active_id else ""
+                _cprint(f"  {t.display_status}{marker}")
+            _cprint("")
+
+        elif action == "switch":
+            wf_id = parts[2] if len(parts) > 2 else ""
+            if not wf_id:
+                _cprint("  Usage: /workflow switch <id>")
+                live = get_all_workflows()
+                if live:
+                    _cprint("  Available workflows:")
+                    for t in live:
+                        _cprint(f"    {t.task_id[:12]} — {t.task_description[:60]}")
+                return
+            live = get_all_workflows()
+            found = any(t.task_id.startswith(wf_id) for t in live)
+            if found:
+                set_active_workflow(wf_id)
+                _cprint(f"  [green]✓ Switched to workflow {wf_id[:12]}[/]")
+            else:
+                _cprint(f"  [red]Workflow {wf_id} not in active list.[/]")
+
+        elif action == "list-all":
             wfs = list_workflows(limit=20)
             if not wfs:
                 _cprint("  [dim]No workflows found.[/]")
@@ -8536,7 +8564,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 _cprint("  [dim]Use /workflow list to see all workflows.[/]")
 
         else:
-            _cprint("  /workflow list|status|show <id>|stop|resume <id>|delete <id>")
+            _cprint("  /workflow list|status|show <id>|switch <id>|stop|delete <id>")
 
     def _handle_memory(self, cmd: str):
         """/memory <action> [args] — long-term memory management.

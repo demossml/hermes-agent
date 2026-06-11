@@ -1,15 +1,41 @@
-# Researcher — исследует и анализирует информацию
 agent_id: researcher
 provider: current
 level: 1
 parent_id: orchestrator
 subtree_session_id: subtree-researcher
-description: "Исследует и анализирует информацию"
-system_prompt: |
-  Ты — агент-исследователь. Глубоко анализируешь темы,
+description: Исследует и анализирует информацию
+system_prompt: 'Ты — агент-исследователь. Глубоко анализируешь темы,
+
   находишь связи, предоставляешь исчерпывающие объяснения.
+
   Структурируй ответ по разделам.
+
   Используй search_files для поиска в кодовой базе, browser_navigate для веб-поиска.
+
+  '
 max_context_tokens: 8000
 max_iterations: 3
-enabled_toolsets: [search, web, browser]
+enabled_toolsets:
+- search
+- web
+- browser
+- delegation
+- messaging
+model: claude-sonnet-4-20250514
+temperature: 0.7
+max_tokens: 8192
+top_p: 0.95
+fallback_models: []
+priority: 2
+auto_select: none
+reasoning_effort: medium
+inherit_from_parent: true
+critical_rules: []
+rule_reminder_every: 0
+applied_migrations:
+- 20260609_add_subtree_session
+- 20260610_add_enabled_toolsets
+- 20260611_add_critical_rules
+- 20260612_add_provider_fallback
+- 20260613_upgrade_agent_toolsets
+migration_version: '20260613'

@@ -1,25 +1,57 @@
-# Reviewer — проверяет код написанный coder
 agent_id: reviewer
 provider: current
 level: 1
 parent_id: orchestrator
 subtree_session_id: subtree-reviewer
-description: "Проверяет код написанный coder"
-system_prompt: |
-  Ты — агент code reviewer. Ты получаешь код от другого агента.
+description: Проверяет код написанный coder
+system_prompt: 'Ты — агент code reviewer. Ты получаешь код от другого агента.
+
 
   Проверь по четырём критериям:
+
   1. Корректность — есть ли логические баги или ошибки
+
   2. Граничные случаи — пустой список, None, отрицательные числа, пустая строка
+
   3. Читаемость — понятны ли имена, есть ли docstring
+
   4. Одно конкретное улучшение (если есть)
 
+
   Формат ответа:
+
   ✓ Что хорошо: <одна строка>
+
   ✗ Проблемы: <список или "нет проблем">
+
   ↗ Улучшение: <конкретное предложение или "не требуется">
 
+
   Будь краток — максимум 10 строк. Не переписывай весь код.
+
+  '
 max_context_tokens: 6000
 max_iterations: 2
-enabled_toolsets: [file, search]
+enabled_toolsets:
+- file
+- search
+- delegation
+- messaging
+model: claude-sonnet-4-20250514
+temperature: 0.7
+max_tokens: 8192
+top_p: 0.95
+fallback_models: []
+priority: 2
+auto_select: none
+reasoning_effort: medium
+inherit_from_parent: true
+critical_rules: []
+rule_reminder_every: 0
+applied_migrations:
+- 20260609_add_subtree_session
+- 20260610_add_enabled_toolsets
+- 20260611_add_critical_rules
+- 20260612_add_provider_fallback
+- 20260613_upgrade_agent_toolsets
+migration_version: '20260613'

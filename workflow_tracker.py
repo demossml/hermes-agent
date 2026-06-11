@@ -23,6 +23,17 @@ logger = logging.getLogger(__name__)
 # ── Global tracker ────────────────────────────────────────────
 
 _workflows: dict[str, "WorkflowTracker"] = {}
+_active_workflow_id: str | None = None  # currently focused workflow
+
+
+def set_active_workflow(task_id: str | None) -> None:
+    """Set which workflow is currently focused for display."""
+    global _active_workflow_id
+    _active_workflow_id = task_id
+
+
+def get_active_workflow_id() -> str | None:
+    return _active_workflow_id
 
 
 @dataclass
@@ -89,6 +100,7 @@ def start_workflow(
         max_iterations=manager.max_iterations,
     )
     _workflows[manager.task_id] = tracker
+    set_active_workflow(manager.task_id)  # auto-focus new workflow
 
     # Start in background
     asyncio.create_task(_run_workflow(tracker))
@@ -186,3 +198,16 @@ def format_workflow_result(tracker: WorkflowTracker) -> str:
         "",
     ]
     return "\n".join(lines)
+
+
+def get_all_workflows() -> list[WorkflowTracker]:
+    """Return all tracked workflows (active and completed)."""
+    return list(_workflows.values())
+
+
+def get_active_workflows() -> list[WorkflowTracker]:
+    """Return workflows that are still running."""
+    return [
+        t for t in _workflows.values()
+        if t.status in ("starting", "writing", "reviewing", "fixing")
+    ]
