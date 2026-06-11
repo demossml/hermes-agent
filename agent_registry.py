@@ -2816,183 +2816,42 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
         language: str | None = None,
         session_id: str = "",
     ) -> str:
-        """Create isolated coder + tester agents and run a code task.
+        """Run the full coder→tester→fix pipeline via CodeGenerationWorkflow.
 
-        1. Creates ``coder-{id}`` with full task context
-        2. Creates ``tester-{id}`` with strict review instructions
-        3. Coder writes the code → Tester reviews it
-        4. Returns the final result with review feedback
-
-        Both agents have fully isolated memory (separate
-        ``subtree_session_id``).  They see only their own branch.
-
-        Args:
-            task_description: The user's code request
-            language: Optional language hint (python, js, etc.)
-            session_id: Session for result tracking
-
-        Returns:
-            Combined result from coder + tester.
+        See ``code_workflow.py`` for the state machine implementation.
         """
-        import uuid
+        from code_workflow import CodeGenerationWorkflow
 
-        task_id = uuid.uuid4().hex[:8]
-        coder_id = f"coder-{task_id}"
-        tester_id = f"tester-{task_id}"
-        lang = language or ""
-        lang_hint = f"\nLanguage: {lang}" if lang else ""
-
-        # ── Create coder agent ──────────────────────────────
-        if coder_id not in self._agents:
-            self.create(coder_id, {
-                "system_prompt": (
-                    "You are an expert SOFTWARE ENGINEER. Your ONLY job is "
-                    "to write production-quality code.\n\n"
-                    "REQUIREMENTS:\n"
-                    "- Output CODE ONLY. No explanations, no commentary, "
-                    "no markdown headers unless the task explicitly asks "
-                    "for documentation.\n"
-                    "- Every function and class MUST have a docstring "
-                    "describing parameters, return values, and behaviour.\n"
-                    "- Use type hints on ALL function signatures.\n"
-                    "- Handle edge cases: empty inputs, None values, "
-                    "invalid types, boundary conditions.\n"
-                    "- Raise descriptive exceptions for invalid inputs.\n"
-                    "- Follow the language's standard style guide "
-                    "(PEP 8 for Python, etc.).\n"
-                    "- Write readable, self-documenting code with "
-                    "meaningful variable names.\n"
-                    "- Prefer standard library over external dependencies "
-                    "unless the task specifies otherwise.\n\n"
-                    "A separate tester agent will review your code. "
-                    "They will find bugs if you are sloppy — don't be."
-                ),
-                "parent_id": "orchestrator",
-                "description": f"Dynamic coder for task {task_id}",
-                "max_iterations": 8,
-                "critical_rules": [
-                    "Output CODE ONLY — no explanations, no markdown.",
-                    "Every function and class must have a docstring.",
-                    "All function signatures must have type hints.",
-                    "Handle edge cases: empty inputs, None, invalid types.",
-                ],
-                "rule_reminder_every": 0,
-            })
-            logger.info(
-                f"start_code_workflow: created {coder_id} "
-                f"(subtree={self._agents[coder_id].get('subtree_session_id','?')[:20]}...)"
-            )
-
-        # ── Create tester agent ─────────────────────────────
-        if tester_id not in self._agents:
-            self.create(tester_id, {
-                "system_prompt": (
-                    "You are a SENIOR CODE TESTER and SECURITY REVIEWER.\n"
-                    "You do NOT know the original user task — you only "
-                    "see the code. Your job is to find EVERYTHING wrong "
-                    "with it.\n\n"
-                    "YOUR MISSION:\n"
-                    "1. SECURITY: SQL injection, XSS, path traversal, "
-                    "unsafe deserialization, hardcoded secrets, missing "
-                    "input validation, insecure randomness.\n"
-                    "2. CORRECTNESS: Logic errors, off-by-one, wrong "
-                    "return types, broken edge cases, race conditions.\n"
-                    "3. EDGE CASES: Empty inputs, None/null, zero, "
-                    "negative numbers, very large inputs, unicode, "
-                    "concurrent access.\n"
-                    "4. PERFORMANCE: O(n²) where O(n) is possible, "
-                    "unnecessary allocations, blocking I/O, missing "
-                    "caching opportunities.\n"
-                    "5. STYLE: Naming conventions, missing type hints, "
-                    "undocumented functions, inconsistent formatting, "
-                    "dead code, overly complex logic.\n\n"
-                    "OUTPUT FORMAT:\n"
-                    "## Review Result: ✅ PASS or ❌ FAIL\n\n"
-                    "### Security Issues\n"
-                    "- (specific issue with line reference if possible)\n\n"
-                    "### Correctness Issues\n"
-                    "- (specific issue)\n\n"
-                    "### Edge Case Issues\n"
-                    "- (specific issue)\n\n"
-                    "### Performance Issues\n"
-                    "- (specific issue)\n\n"
-                    "### Style Issues\n"
-                    "- (specific issue)\n\n"
-                    "### Summary\n"
-                    "Brief overall assessment.\n\n"
-                    "RULES:\n"
-                    "- Be SPECIFIC. \"Code has issues\" is useless. "
-                    "\"Line 12: missing null check on user input\" is useful.\n"
-                    "- Every issue MUST have a suggested fix.\n"
-                    "- Do NOT rewrite the code — describe what to fix.\n"
-                    "- If the code is genuinely correct, say ✅ PASS "
-                    "and briefly explain why."
-                ),
-                "parent_id": "orchestrator",
-                "description": f"Dynamic tester for task {task_id}",
-                "max_iterations": 5,
-                "critical_rules": [
-                    "Report specific issues with suggested fixes.",
-                    "Check security, correctness, edge cases, performance, style.",
-                    "Use the exact output format: Review Result, sections, Summary.",
-                ],
-                "rule_reminder_every": 0,
-            })
-            logger.info(
-                f"start_code_workflow: created {tester_id} "
-                f"(subtree={self._agents[tester_id].get('subtree_session_id','?')[:20]}...)"
-            )
-
-        # ── Phase 1: Coder writes ───────────────────────────
-        logger.info(f"start_code_workflow: {coder_id} writing code...")
-        coder_msg = f"Code task{lang_hint}:\n\n{task_description}"
-        code_result = await self.call(
-            coder_id, session_id or task_id, coder_msg,
-            caller_id="orchestrator",
+        workflow = CodeGenerationWorkflow(
+            registry=self,
+            task=task_description,
+            language=language,
+            session_id=session_id,
         )
+        result = await workflow.run()
 
-        # ── Phase 2: Tester reviews (NO task context) ────────
-        logger.info(f"start_code_workflow: {tester_id} reviewing code...")
-        tester_msg = (
-            f"Review the following code. You do NOT know the original "
-            f"user task — judge the code on its own merits.\n\n"
-            f"```\n{code_result[:3000]}\n```"
-        )
-        review_result = await self.call(
-            tester_id, session_id or task_id, tester_msg,
-            caller_id="orchestrator",
-        )
-
-        # ── Phase 3: Coder fixes if needed ──────────────────
-        if "❌" in review_result or "FAIL" in review_result.upper():
-            logger.info(
-                f"start_code_workflow: {coder_id} fixing issues..."
-            )
-            fix_msg = (
-                f"Your code was reviewed. Fix ALL issues listed below.\n\n"
-                f"Review feedback:\n{review_result}\n\n"
-                f"Original task:\n{task_description}\n\n"
-                f"Rewrite the code with all fixes applied. Output code only."
-            )
-            fixed_code = await self.call(
-                coder_id, session_id or task_id, fix_msg,
-                caller_id="orchestrator",
-            )
-            final = (
-                f"## Code (revised after review)\n\n{fixed_code}\n\n"
-                f"## Review\n\n{review_result}"
-            )
-        else:
-            final = (
-                f"## Code\n\n{code_result}\n\n"
-                f"## Review\n\n{review_result}"
-            )
+        status = result["status"]
+        code = result["code"]
+        review = result["review"]
+        iters = result["iterations"]
 
         logger.info(
-            f"start_code_workflow: task {task_id} complete. "
-            f"Agents: {coder_id}, {tester_id}"
+            f"start_code_workflow: {workflow.task_id} → {status} "
+            f"after {iters} iteration(s)"
         )
-        return final
+
+        if status == "passed":
+            return (
+                f"## Code (✅ passed review after {iters} iteration(s))\n\n"
+                f"{code}\n\n"
+                f"## Review\n\n{review}"
+            )
+        else:
+            return (
+                f"## Code (❌ max iterations reached — {iters} attempts)\n\n"
+                f"{code}\n\n"
+                f"## Last Review\n\n{review}"
+            )
 
 
 # ── Singleton ────────────────────────────────────────────────
