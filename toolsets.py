@@ -215,7 +215,7 @@ TOOLSETS = {
     
     "memory": {
         "description": "Persistent memory across sessions (personal notes + user profile)",
-        "tools": ["memory"],
+        "tools": ["memory", "search_chat_history"],
         "includes": []
     },
 
