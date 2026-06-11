@@ -308,6 +308,24 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     except Exception as exc:
         logger.warning("on_session_start hook failed: %s", exc)
 
+    # ── Chat rules injection (DuckDB, zero LLM token overhead) ──
+    # Injects group-specific rules into the system prompt BEFORE the
+    # LLM call.  One SQL query — microseconds latency.
+    try:
+        from hermes_cli.chat_rules import inject_rules_into_prompt
+        _source = getattr(agent, "_gateway_source", None)
+        if _source is None:
+            # Reconstruct from agent attributes
+            from types import SimpleNamespace
+            _platform = getattr(agent, "platform", None)
+            _chat_id = getattr(agent, "_chat_id", None)
+            if _platform and _chat_id:
+                _source = SimpleNamespace(platform=_platform, chat_id=_chat_id)
+        inject_rules_into_prompt(agent, _source)
+    except Exception:
+        pass  # DuckDB not installed — silent, no impact
+    # ──────────────────────────────────────────────────────────────
+
     # Cold-start credits seed (L3) — fallback for the first-turn path. The TUI/
     # desktop build seeds at session OPEN (see seed_credits_at_session_start in
     # tui_gateway), so this call is usually a no-op there (idempotent: skips when
