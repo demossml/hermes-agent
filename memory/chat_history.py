@@ -118,7 +118,138 @@ class ChatHistoryDB:
         """True if the database is initialized and connected."""
         return self._conn is not None
 
+    def get_connection(self):
+        """Return the DuckDB connection, auto-initializing if needed.
+
+        Returns None if DuckDB is not installed or initialization fails.
+        """
+        if not self.ready:
+            self.initialize_db()
+        return self._conn
+
     # ── Write ───────────────────────────────────────────────
+
+    def save_message(self, message: dict[str, Any]) -> int | None:
+        """Save a single message from a dict.
+
+        The dict may contain any subset of the group_messages columns.
+        Missing keys use defaults.  Extra keys are ignored.
+
+        Args:
+            message: Dict with keys matching group_messages columns.
+                     Common keys: platform, chat_id, message_id, text,
+                     sender_name, timestamp, etc.
+
+        Returns:
+            Row ID on success, None on failure.
+        """
+        if not self.ready:
+            return None
+
+        try:
+            text = message.get("text") or ""
+            links = message.get("links")
+
+            # Auto-detect links from text
+            has_link = False
+            links_json = None
+            if links:
+                has_link = True
+                if isinstance(links, list):
+                    links_json = json.dumps(links, ensure_ascii=False)
+                else:
+                    links_json = str(links)
+            elif text:
+                found = self._extract_links(text)
+                if found:
+                    has_link = True
+                    links_json = json.dumps(found, ensure_ascii=False)
+
+            ts = message.get("timestamp") or datetime.now(timezone.utc)
+
+            self._conn.execute(
+                """INSERT INTO group_messages
+                   (platform, chat_id, chat_title, message_id,
+                    sender_id, sender_name, sender_username,
+                    text, has_link, links, reply_to_id,
+                    message_type, has_media, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    message.get("platform", ""),
+                    message.get("chat_id", ""),
+                    message.get("chat_title"),
+                    message.get("message_id", ""),
+                    message.get("sender_id"),
+                    message.get("sender_name"),
+                    message.get("sender_username"),
+                    text,
+                    has_link,
+                    links_json,
+                    message.get("reply_to_id"),
+                    message.get("message_type"),
+                    bool(message.get("has_media", False)),
+                    ts,
+                ],
+            )
+
+            row = self._conn.execute(
+                "SELECT currval('seq_group_messages_id')"
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+        except Exception as e:
+            logger.warning("save_message failed: %s", e)
+            return None
+
+    def batch_save_messages(
+        self, messages: list[dict[str, Any]]
+    ) -> int:
+        """Save multiple messages efficiently in a single transaction.
+
+        Args:
+            messages: List of message dicts (same format as save_message).
+
+        Returns:
+            Number of messages successfully saved.
+        """
+        if not self.ready:
+            return 0
+
+        if not messages:
+            return 0
+
+        saved = 0
+        try:
+            # Use a single transaction for performance
+            self._conn.execute("BEGIN TRANSACTION")
+            for msg in messages:
+                row_id = self.save_message(msg)
+                if row_id is not None:
+                    saved += 1
+            self._conn.execute("COMMIT")
+            logger.debug(
+                "batch_save: %d/%d messages saved", saved, len(messages)
+            )
+        except Exception as e:
+            logger.warning("batch_save_messages failed: %s", e)
+            try:
+                self._conn.execute("ROLLBACK")
+            except Exception:
+                pass
+
+        return saved
+
+    @staticmethod
+    def _extract_links(text: str) -> list[str]:
+        """Extract URLs from text using regex.
+
+        Matches http/https links. Returns list of unique URLs.
+        """
+        if not text:
+            return []
+        found = re.findall(r"https?://[^\s<>\"')\]]+", text)
+        # Deduplicate while preserving order
+        return list(dict.fromkeys(found))
 
     def insert_message(
         self,
