@@ -2662,6 +2662,7 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
         ("напиши класс", "python"),
         ("напиши модуль", "python"),
         ("write a function", "python"),
+        ("write a", "python"),
         ("write code", "python"),
         ("write a script", "python"),
         ("write a class", "python"),
@@ -2752,12 +2753,18 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
         """
         msg_lower = message.lower()
 
-        # Check explicit code patterns
+        # Check explicit code patterns — word-based matching
         matched_pattern = None
         detected_lang = None
+        msg_words = set(
+            w.strip('.,;:!?()[]{}"\'«»…—-')
+            for w in msg_lower.split()
+        )
 
         for pattern, lang in cls._CODE_PATTERNS:
-            if pattern in msg_lower:
+            # Match if ALL words in the pattern appear in the message
+            pattern_words = pattern.split()
+            if all(w in msg_words for w in pattern_words):
                 matched_pattern = pattern
                 detected_lang = lang
                 break
