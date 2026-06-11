@@ -13,7 +13,10 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from workflow_store import save_workflow, update_workflow_status, save_workflow_result
+from workflow_store import (
+    save_workflow, update_workflow_status, save_workflow_result,
+    save_iteration,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +114,7 @@ async def _run_workflow(tracker: WorkflowTracker) -> None:
             return
         wf.current_code = await wf._call_coder(wf.task)
         wf.history.append({"phase": "write", "code": wf.current_code[:500]})
+        save_iteration(tracker.task_id, 1, "write", code=wf.current_code)
 
         # Phase 2-4: Review + fix
         for wf.iteration in range(1, tracker.max_iterations + 1):
@@ -127,6 +131,10 @@ async def _run_workflow(tracker: WorkflowTracker) -> None:
                 "phase": f"review-{wf.iteration}",
                 "review": wf.current_review[:500],
             })
+            save_iteration(
+                tracker.task_id, wf.iteration, f"review-{wf.iteration}",
+                code=wf.current_code, review=wf.current_review,
+            )
 
             if wf._is_passing(wf.current_review):
                 tracker.status = "passed"
@@ -149,6 +157,10 @@ async def _run_workflow(tracker: WorkflowTracker) -> None:
                     "phase": f"fix-{wf.iteration}",
                     "code": wf.current_code[:500],
                 })
+                save_iteration(
+                    tracker.task_id, wf.iteration, f"fix-{wf.iteration}",
+                    code=wf.current_code,
+                )
             else:
                 tracker.status = "failed"
                 tracker._result = wf._build_result("failed")

@@ -8514,6 +8514,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             else:
                 _cprint(f"  [dim]Workflow {wf_id} status: {w['status']}. Resume not yet supported.[/]")
 
+        elif action == "delete":
+            wf_id = parts[2] if len(parts) > 2 else ""
+            if not wf_id:
+                _cprint("  Usage: /workflow delete <id>")
+                return
+            from workflow_store import delete_workflow
+            if delete_workflow(wf_id):
+                _cprint(f"  [green]✓ Workflow {wf_id} deleted.[/]")
+            else:
+                _cprint(f"  [red]Workflow {wf_id} not found.[/]")
+
         elif action == "status":
             wf = get_active_workflow()
             if wf:
@@ -8525,7 +8536,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 _cprint("  [dim]Use /workflow list to see all workflows.[/]")
 
         else:
-            _cprint("  /workflow list|status|show <id>|stop|resume <id>")
+            _cprint("  /workflow list|status|show <id>|stop|resume <id>|delete <id>")
 
     def _handle_memory(self, cmd: str):
         """/memory <action> [args] — long-term memory management.

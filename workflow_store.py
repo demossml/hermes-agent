@@ -46,6 +46,26 @@ def _get_conn():
     _conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_workflows_status ON workflows (status, updated_at DESC)"
     )
+    # Per-iteration history
+    _conn.execute(
+        "CREATE SEQUENCE IF NOT EXISTS seq_wf_iter_id START 1"
+    )
+    _conn.execute("""
+        CREATE TABLE IF NOT EXISTS workflow_iterations (
+            id            BIGINT PRIMARY KEY DEFAULT nextval('seq_wf_iter_id'),
+            workflow_id   TEXT NOT NULL,
+            iteration     INTEGER NOT NULL,
+            phase         TEXT NOT NULL,
+            code          TEXT,
+            review        TEXT,
+            test_code     TEXT,
+            exec_report   TEXT,
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    _conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wf_iter ON workflow_iterations (workflow_id, iteration)"
+    )
     return _conn
 
 
@@ -157,6 +177,62 @@ def save_workflow_result(
         """, [status, iteration, final_code, final_review, result_json, task_id])
         return True
     except Exception:
+        return False
+
+
+def save_iteration(
+    workflow_id: str,
+    iteration: int,
+    phase: str,
+    code: str = "",
+    review: str = "",
+    test_code: str = "",
+    exec_report: str = "",
+) -> bool:
+    """Save one iteration's code + review + test results."""
+    try:
+        conn = _get_conn()
+        conn.execute("""
+            INSERT INTO workflow_iterations
+                (workflow_id, iteration, phase, code, review, test_code, exec_report)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, [workflow_id, iteration, phase, code, review, test_code, exec_report])
+        return True
+    except Exception as e:
+        logger.debug("save_iteration: %s", e)
+        return False
+
+
+def get_iterations(workflow_id: str) -> list[dict]:
+    """Get all iterations for a workflow, ordered by iteration."""
+    try:
+        conn = _get_conn()
+        rows = conn.execute(
+            "SELECT * FROM workflow_iterations WHERE workflow_id = ? ORDER BY iteration, id",
+            [workflow_id],
+        ).fetchall()
+        return [
+            {
+                "id": r[0], "workflow_id": r[1], "iteration": r[2],
+                "phase": r[3], "code": r[4] or "", "review": r[5] or "",
+                "test_code": r[6] or "", "exec_report": r[7] or "",
+                "created_at": str(r[8]) if r[8] else "",
+            }
+            for r in rows
+        ]
+    except Exception:
+        return []
+
+
+def delete_workflow(task_id: str) -> bool:
+    """Delete a workflow and all its iterations."""
+    try:
+        conn = _get_conn()
+        conn.execute("DELETE FROM workflow_iterations WHERE workflow_id = ?", [task_id])
+        conn.execute("DELETE FROM workflows WHERE id = ?", [task_id])
+        return True
+    except Exception as e:
+        logger.debug("delete_workflow: %s", e)
         return False
 
 
