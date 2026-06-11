@@ -21,7 +21,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-MAX_ITERATIONS = 4
+MAX_ITERATIONS = 5
 
 
 class WorkflowState(Enum):
@@ -87,16 +87,19 @@ class CodeGenerationWorkflow:
                 "coder_id": str,
                 "tester_id": str,
                 "history": [...],
+                "stop_reason": str,
             }
         """
         self._ensure_agents()
         self.state = WorkflowState.WRITING
+        consecutive_passes = 0
+        stop_reason = ""
 
         # Phase 1: Initial code generation
         self.current_code = await self._call_coder(self.task)
         self.history.append({"phase": "write", "code": self.current_code[:500]})
 
-        # Phase 2-4: Review + fix loop
+        # Phase 2+: Review + fix loop (dynamic, max 5)
         for self.iteration in range(1, self.max_iterations + 1):
             self.state = WorkflowState.REVIEWING
             self.current_review = await self._call_tester(self.current_code)
@@ -105,36 +108,147 @@ class CodeGenerationWorkflow:
                 "review": self.current_review[:500],
             })
 
-            if self._is_passing(self.current_review):
+            # ── Smart stop criteria ─────────────────────────
+            passing = self._is_passing(self.current_review)
+            confidence = self._assess_confidence(self.current_review)
+
+            if passing:
+                consecutive_passes += 1
+            else:
+                consecutive_passes = 0
+
+            # Stop: 2 consecutive confident passes
+            if consecutive_passes >= 2 and confidence >= 0.8:
                 self.state = WorkflowState.PASSED
+                stop_reason = f"2 consecutive confident passes (confidence={confidence:.0%})"
                 logger.info(
                     f"CodeGenerationWorkflow {self.task_id}: "
-                    f"PASSED after {self.iteration} iteration(s)"
+                    f"PASSED after {self.iteration} iteration(s) — {stop_reason}"
                 )
                 return self._build_result("passed")
 
-            # Failed — try to fix
-            if self.iteration < self.max_iterations:
-                self.state = WorkflowState.FIXING
-                logger.info(
-                    f"CodeGenerationWorkflow {self.task_id}: "
-                    f"iteration {self.iteration}/{self.max_iterations} — fixing..."
-                )
-                self.current_code = await self._call_coder_fix(
-                    self.current_code, self.current_review,
-                )
-                self.history.append({
-                    "phase": f"fix-{self.iteration}",
-                    "code": self.current_code[:500],
-                })
-            else:
+            # Stop: single pass with very high confidence
+            if passing and confidence >= 0.95 and self.iteration >= 2:
+                self.state = WorkflowState.PASSED
+                stop_reason = f"very high confidence pass (confidence={confidence:.0%})"
+                return self._build_result("passed")
+
+            # Stop: definitive failure (3+ iterations, no improvement)
+            if not passing and self.iteration >= 3:
+                prev_review = self.history[-2].get("review", "") if len(self.history) >= 2 else ""
+                if self._reviews_similar(self.current_review, prev_review):
+                    self.state = WorkflowState.FAILED
+                    stop_reason = "no improvement after 3 iterations"
+                    logger.warning(
+                        f"CodeGenerationWorkflow {self.task_id}: "
+                        f"FAILED — {stop_reason}"
+                    )
+                    return self._build_result("failed")
+
+            # ── Should we continue? ─────────────────────────
+            if self.iteration >= self.max_iterations:
                 self.state = WorkflowState.FAILED
+                stop_reason = f"max iterations ({self.max_iterations}) reached"
                 logger.warning(
-                    f"CodeGenerationWorkflow {self.task_id}: "
-                    f"FAILED after {self.max_iterations} iterations"
+                    f"CodeGenerationWorkflow {self.task_id}: {stop_reason}"
                 )
+                break
+
+            if not self.should_continue():
+                self.state = WorkflowState.FAILED
+                stop_reason = "should_continue() returned False"
+                break
+
+            # Failed — try to fix
+            self.state = WorkflowState.FIXING
+            logger.info(
+                f"CodeGenerationWorkflow {self.task_id}: "
+                f"iteration {self.iteration}/{self.max_iterations} "
+                f"(confidence={confidence:.0%}) — fixing..."
+            )
+            self.current_code = await self._call_coder_fix(
+                self.current_code, self.current_review,
+            )
+            self.history.append({
+                "phase": f"fix-{self.iteration}",
+                "code": self.current_code[:500],
+            })
 
         return self._build_result("failed")
+
+    def should_continue(self) -> bool:
+        """Dynamic decision: should the workflow do another iteration?
+
+        Returns False when max iterations reached or no progress
+        is being made.
+        """
+        if self.iteration >= self.max_iterations:
+            return False
+        return True
+
+    # ── Confidence assessment ────────────────────────────────
+
+    @staticmethod
+    def _assess_confidence(review: str) -> float:
+        """Estimate tester's confidence in their assessment (0-1).
+
+        High confidence signals:
+        - Actual execution results quoted (pytest output, exit codes)
+        - Specific line references
+        - Multiple test cases mentioned
+        - No hedging language ('might', 'maybe', 'could be')
+
+        Low confidence signals:
+        - Vague language
+        - No execution results mentioned
+        - Hedging words
+        """
+        review_upper = review.upper()
+
+        # Base confidence
+        confidence = 0.5
+
+        # Boost: execution results present
+        exec_signals = [
+            "PASSED", "FAILED", "exit code", "pytest",
+            "stdout", "stderr", "ran ", "test_",
+            "PASS", "FAIL",
+        ]
+        exec_count = sum(1 for s in exec_signals if s in review_upper)
+        confidence += min(0.3, exec_count * 0.05)
+
+        # Boost: specific line references
+        line_refs = sum(1 for c in review if c.isdigit() and "line" in review.lower())
+        if line_refs:
+            confidence += 0.1
+
+        # Penalty: hedging language
+        hedging = ["might", "maybe", "could be", "possibly", "probably", "perhaps"]
+        hedge_count = sum(1 for h in hedging if h in review.lower())
+        confidence -= min(0.2, hedge_count * 0.05)
+
+        # Penalty: no actual data
+        if "PASS" not in review_upper and "FAIL" not in review_upper:
+            confidence -= 0.15
+
+        return max(0.0, min(1.0, confidence))
+
+    @staticmethod
+    def _reviews_similar(a: str, b: str) -> bool:
+        """Check if two reviews are substantially similar.
+
+        Returns True if the feedback hasn't changed meaningfully —
+        indicating no progress between iterations.
+        """
+        if not a or not b:
+            return False
+        # Simple Jaccard-like word overlap
+        words_a = set(a.lower().split())
+        words_b = set(b.lower().split())
+        if not words_a or not words_b:
+            return False
+        overlap = len(words_a & words_b) / max(len(words_a), len(words_b))
+        return overlap > 0.7
 
     # ── Agent management ────────────────────────────────────
 
