@@ -157,6 +157,42 @@ class TesterAgent(WorkflowAgent):
 
         return await self.send(msg, session_id)
 
+    def generate_and_run_tests(
+        self, code: str, function_name: str = "",
+    ) -> dict[str, Any]:
+        """Auto-generate quality pytest tests and run them in a sandbox.
+
+        Returns::
+
+            {
+                "test_code": str,       # the generated test code
+                "test_count": int,      # number of test functions
+                "passed": int,          # tests passed
+                "failed": int,          # tests failed
+                "pytest_output": str,   # raw pytest output
+                "success": bool,        # all tests passed
+            }
+        """
+        try:
+            from code_workflow.runner import get_runner
+            runner = get_runner()
+            result = runner.run_tests(code, function_name=function_name)
+            return {
+                "test_code": result.get("test_code", ""),
+                "test_count": result.get("test_count", 0),
+                "passed": result.get("passed", 0),
+                "failed": result.get("failed", 0),
+                "pytest_output": result.get("stdout", ""),
+                "success": result.get("success", False),
+            }
+        except Exception as e:
+            logger.debug("generate_and_run_tests failed: %s", e)
+            return {
+                "test_code": "", "test_count": 0,
+                "passed": 0, "failed": 0,
+                "pytest_output": str(e), "success": False,
+            }
+
     def _build_config(self) -> dict:
         return {
             "system_prompt": _TESTER_PROMPT,
