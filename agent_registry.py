@@ -2651,6 +2651,186 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
 
         return None
 
+    # ── Code task detection ────────────────────────────────────
+
+    # Patterns that indicate a code-related request
+    _CODE_PATTERNS: list[tuple[str, str]] = [
+        # (keyword, language hint)
+        ("напиши функцию", "python"),
+        ("напиши код", "python"),
+        ("напиши скрипт", "python"),
+        ("напиши класс", "python"),
+        ("напиши модуль", "python"),
+        ("write a function", "python"),
+        ("write code", "python"),
+        ("write a script", "python"),
+        ("write a class", "python"),
+        ("создай функцию", "python"),
+        ("создай класс", "python"),
+        ("создай скрипт", "python"),
+        ("create a function", "python"),
+        ("create a class", "python"),
+        ("реализуй алгоритм", "python"),
+        ("implement algorithm", "python"),
+        ("implement a function", "python"),
+        ("реализуй функцию", "python"),
+        ("исправь код", "python"),
+        ("исправь ошибку", "python"),
+        ("почини код", "python"),
+        ("fix the code", "python"),
+        ("fix this code", "python"),
+        ("fix the bug", "python"),
+        ("debug", "python"),
+        ("отрефактори", "python"),
+        ("рефакторинг", "python"),
+        ("refactor", "python"),
+        ("добавь фичу", "python"),
+        ("добавь функцию", "python"),
+        ("add a feature", "python"),
+        ("add feature", "python"),
+        ("оптимизируй", "python"),
+        ("optimize", "python"),
+        ("напиши тест", "python"),
+        ("напиши тесты", "python"),
+        ("write a test", "python"),
+        ("write tests", "python"),
+        ("javascript", "javascript"),
+        ("typescript", "typescript"),
+        ("напиши на js", "javascript"),
+        ("write in js", "javascript"),
+        ("html", "html"),
+        ("css", "css"),
+        ("sql", "sql"),
+        ("bash", "bash"),
+        ("shell script", "bash"),
+        ("regex", "regex"),
+        ("regular expression", "regex"),
+        ("python", "python"),
+        ("rust", "rust"),
+        ("golang", "go"),
+        ("go lang", "go"),
+        ("java", "java"),
+        ("c++", "cpp"),
+        ("c#", "csharp"),
+    ]
+
+    _CODE_INDICATORS: list[str] = [
+        "```",
+        "def ",
+        "class ",
+        "import ",
+        "from ",
+        "function ",
+        "const ",
+        "let ",
+        "var ",
+        "return ",
+        "async ",
+        "await ",
+        "print(",
+    ]
+
+    @classmethod
+    def is_code_task(cls, message: str) -> bool:
+        """Quick check: is this a code-related request?"""
+        result = cls.classify_code_task(message)
+        return result["is_code_task"]
+
+    @classmethod
+    def classify_code_task(cls, message: str) -> dict:
+        """Classify a user message as code-related or not.
+
+        Returns::
+
+            {
+                "is_code_task": bool,
+                "task_description": str,
+                "language": str | None,
+                "matched_pattern": str | None,
+                "confidence": float (0-1),
+            }
+        """
+        msg_lower = message.lower()
+
+        # Check explicit code patterns
+        matched_pattern = None
+        detected_lang = None
+
+        for pattern, lang in cls._CODE_PATTERNS:
+            if pattern in msg_lower:
+                matched_pattern = pattern
+                detected_lang = lang
+                break
+
+        # Check code indicators in the message (user pasted code)
+        has_code_indicators = sum(
+            1 for ind in cls._CODE_INDICATORS if ind in message
+        )
+
+        is_code = matched_pattern is not None or has_code_indicators >= 3
+
+        # Build task description
+        if matched_pattern:
+            task_desc = message.strip()
+        elif has_code_indicators >= 3:
+            task_desc = f"Code fix/improvement: {message[:200]}"
+        else:
+            task_desc = message.strip()
+
+        # Confidence: explicit pattern = high, indicators only = medium
+        if matched_pattern:
+            confidence = 0.9
+        elif has_code_indicators >= 5:
+            confidence = 0.7
+        elif has_code_indicators >= 3:
+            confidence = 0.5
+        else:
+            confidence = 0.0
+
+        # Language detection from common indicators
+        if not detected_lang:
+            if "javascript" in msg_lower or "const " in message or "let " in message:
+                detected_lang = "javascript"
+            elif "typescript" in msg_lower:
+                detected_lang = "typescript"
+            elif "def " in message or "import " in message:
+                detected_lang = "python"
+            elif "function " in message and ":" not in message.split("function ", 1)[1][:20]:
+                detected_lang = "javascript"
+            elif "<?php" in msg_lower:
+                detected_lang = "php"
+            elif "<html" in msg_lower or "<div" in msg_lower:
+                detected_lang = "html"
+
+        return {
+            "is_code_task": is_code,
+            "task_description": task_desc,
+            "language": detected_lang,
+            "matched_pattern": matched_pattern,
+            "confidence": confidence,
+        }
+
+    async def start_code_workflow(self, task_description: str, language: str | None = None) -> str:
+        """Route a code task through the coder agent.
+
+        If a coder agent exists, delegates to it.  Otherwise falls
+        back to the orchestrator's direct response.
+        """
+        target = "coder" if "coder" in self._agents else None
+
+        if target is None:
+            # No coder — handle directly
+            return f"Code task received: {task_description[:100]}..."
+
+        lang_hint = f" (use {language})" if language else ""
+        msg = f"Code task{lang_hint}: {task_description}"
+
+        logger.info(
+            f"start_code_workflow: routing to '{target}' — "
+            f"'{task_description[:80]}...'"
+        )
+        return await self.call(target, "code-workflow", msg, caller_id="orchestrator")
+
 
 # ── Singleton ────────────────────────────────────────────────
 
