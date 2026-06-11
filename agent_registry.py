@@ -2846,19 +2846,35 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
         if coder_id not in self._agents:
             self.create(coder_id, {
                 "system_prompt": (
-                    "You are a CODE WRITING agent. Your ONLY job is to write "
-                    "clean, correct, well-documented code. Follow the task "
-                    "description exactly. Do NOT explain your code unless "
-                    "asked. Do NOT test your own code — a separate tester "
-                    "agent will do that. Output code only."
+                    "You are an expert SOFTWARE ENGINEER. Your ONLY job is "
+                    "to write production-quality code.\n\n"
+                    "REQUIREMENTS:\n"
+                    "- Output CODE ONLY. No explanations, no commentary, "
+                    "no markdown headers unless the task explicitly asks "
+                    "for documentation.\n"
+                    "- Every function and class MUST have a docstring "
+                    "describing parameters, return values, and behaviour.\n"
+                    "- Use type hints on ALL function signatures.\n"
+                    "- Handle edge cases: empty inputs, None values, "
+                    "invalid types, boundary conditions.\n"
+                    "- Raise descriptive exceptions for invalid inputs.\n"
+                    "- Follow the language's standard style guide "
+                    "(PEP 8 for Python, etc.).\n"
+                    "- Write readable, self-documenting code with "
+                    "meaningful variable names.\n"
+                    "- Prefer standard library over external dependencies "
+                    "unless the task specifies otherwise.\n\n"
+                    "A separate tester agent will review your code. "
+                    "They will find bugs if you are sloppy — don't be."
                 ),
                 "parent_id": "orchestrator",
                 "description": f"Dynamic coder for task {task_id}",
                 "max_iterations": 8,
                 "critical_rules": [
-                    "Write code ONLY. No explanations.",
-                    "Always add docstrings and type hints.",
-                    "Handle edge cases and errors.",
+                    "Output CODE ONLY — no explanations, no markdown.",
+                    "Every function and class must have a docstring.",
+                    "All function signatures must have type hints.",
+                    "Handle edge cases: empty inputs, None, invalid types.",
                 ],
                 "rule_reminder_every": 0,
             })
@@ -2871,21 +2887,54 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
         if tester_id not in self._agents:
             self.create(tester_id, {
                 "system_prompt": (
-                    "You are a STRICT code tester and reviewer. Your job:\n"
-                    "1. Read the code carefully\n"
-                    "2. Test it mentally — does it solve the problem?\n"
-                    "3. Find bugs, edge cases, style issues, performance problems\n"
-                    "4. Report: ✅ PASS or ❌ FAIL with specific issues\n"
-                    "5. If FAIL: suggest specific fixes\n\n"
-                    "Be thorough. Be precise. Be constructive."
+                    "You are a SENIOR CODE TESTER and SECURITY REVIEWER.\n"
+                    "You do NOT know the original user task — you only "
+                    "see the code. Your job is to find EVERYTHING wrong "
+                    "with it.\n\n"
+                    "YOUR MISSION:\n"
+                    "1. SECURITY: SQL injection, XSS, path traversal, "
+                    "unsafe deserialization, hardcoded secrets, missing "
+                    "input validation, insecure randomness.\n"
+                    "2. CORRECTNESS: Logic errors, off-by-one, wrong "
+                    "return types, broken edge cases, race conditions.\n"
+                    "3. EDGE CASES: Empty inputs, None/null, zero, "
+                    "negative numbers, very large inputs, unicode, "
+                    "concurrent access.\n"
+                    "4. PERFORMANCE: O(n²) where O(n) is possible, "
+                    "unnecessary allocations, blocking I/O, missing "
+                    "caching opportunities.\n"
+                    "5. STYLE: Naming conventions, missing type hints, "
+                    "undocumented functions, inconsistent formatting, "
+                    "dead code, overly complex logic.\n\n"
+                    "OUTPUT FORMAT:\n"
+                    "## Review Result: ✅ PASS or ❌ FAIL\n\n"
+                    "### Security Issues\n"
+                    "- (specific issue with line reference if possible)\n\n"
+                    "### Correctness Issues\n"
+                    "- (specific issue)\n\n"
+                    "### Edge Case Issues\n"
+                    "- (specific issue)\n\n"
+                    "### Performance Issues\n"
+                    "- (specific issue)\n\n"
+                    "### Style Issues\n"
+                    "- (specific issue)\n\n"
+                    "### Summary\n"
+                    "Brief overall assessment.\n\n"
+                    "RULES:\n"
+                    "- Be SPECIFIC. \"Code has issues\" is useless. "
+                    "\"Line 12: missing null check on user input\" is useful.\n"
+                    "- Every issue MUST have a suggested fix.\n"
+                    "- Do NOT rewrite the code — describe what to fix.\n"
+                    "- If the code is genuinely correct, say ✅ PASS "
+                    "and briefly explain why."
                 ),
                 "parent_id": "orchestrator",
                 "description": f"Dynamic tester for task {task_id}",
                 "max_iterations": 5,
                 "critical_rules": [
-                    "Be strict and thorough in your review.",
-                    "Report specific issues, not vague complaints.",
-                    "Suggest concrete fixes for every issue found.",
+                    "Report specific issues with suggested fixes.",
+                    "Check security, correctness, edge cases, performance, style.",
+                    "Use the exact output format: Review Result, sections, Summary.",
                 ],
                 "rule_reminder_every": 0,
             })
@@ -2902,12 +2951,12 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
             caller_id="orchestrator",
         )
 
-        # ── Phase 2: Tester reviews ─────────────────────────
+        # ── Phase 2: Tester reviews (NO task context) ────────
         logger.info(f"start_code_workflow: {tester_id} reviewing code...")
         tester_msg = (
-            f"Review this code. Be strict.\n\n"
-            f"Original task:\n{task_description}\n\n"
-            f"Code to review:\n```\n{code_result[:3000]}\n```"
+            f"Review the following code. You do NOT know the original "
+            f"user task — judge the code on its own merits.\n\n"
+            f"```\n{code_result[:3000]}\n```"
         )
         review_result = await self.call(
             tester_id, session_id or task_id, tester_msg,
