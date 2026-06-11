@@ -2823,42 +2823,26 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
         language: str | None = None,
         session_id: str = "",
     ) -> str:
-        """Run the full coder→tester→fix pipeline via CodeGenerationWorkflow.
+        """Run the full coder→tester→fix pipeline.
 
-        See ``code_workflow.py`` for the state machine implementation.
+        See ``code_workflow/manager.py`` for the implementation.
         """
-        from code_workflow import CodeGenerationWorkflow
+        from code_workflow.manager import CodeWorkflowManager
 
-        workflow = CodeGenerationWorkflow(
+        manager = CodeWorkflowManager(
             registry=self,
             task=task_description,
             language=language,
             session_id=session_id,
         )
-        result = await workflow.run()
-
-        status = result["status"]
-        code = result["code"]
-        review = result["review"]
-        iters = result["iterations"]
+        result = await manager.run()
 
         logger.info(
-            f"start_code_workflow: {workflow.task_id} → {status} "
-            f"after {iters} iteration(s)"
+            f"start_code_workflow: {result['task_id']} → "
+            f"{result['status']} after {result['iterations']} iteration(s) — "
+            f"{result['stop_reason']}"
         )
-
-        if status == "passed":
-            return (
-                f"## Code (✅ passed review after {iters} iteration(s))\n\n"
-                f"{code}\n\n"
-                f"## Review\n\n{review}"
-            )
-        else:
-            return (
-                f"## Code (❌ max iterations reached — {iters} attempts)\n\n"
-                f"{code}\n\n"
-                f"## Last Review\n\n{review}"
-            )
+        return result["display"]
 
 
 # ── Singleton ────────────────────────────────────────────────

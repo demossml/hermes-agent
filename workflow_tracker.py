@@ -75,20 +75,20 @@ def start_workflow(
     language: str | None = None,
 ) -> WorkflowTracker:
     """Start a code workflow and return a tracker for status display."""
-    from code_workflow import CodeGenerationWorkflow
+    from code_workflow.manager import CodeWorkflowManager
 
-    wf = CodeGenerationWorkflow(
+    manager = CodeWorkflowManager(
         registry=registry, task=task, language=language,
     )
     tracker = WorkflowTracker(
-        task_id=wf.task_id,
+        task_id=manager.task_id,
         task_description=task,
-        workflow=wf,
-        coder_id=wf.coder_id,
-        tester_id=wf.tester_id,
-        max_iterations=wf.max_iterations,
+        workflow=manager,
+        coder_id=manager.coder.agent_id,
+        tester_id=manager.tester.agent_id,
+        max_iterations=manager.max_iterations,
     )
-    _workflows[wf.task_id] = tracker
+    _workflows[manager.task_id] = tracker
 
     # Start in background
     asyncio.create_task(_run_workflow(tracker))
@@ -96,86 +96,50 @@ def start_workflow(
 
 
 async def _run_workflow(tracker: WorkflowTracker) -> None:
-    """Run the workflow, updating tracker status at each phase."""
-    wf = tracker.workflow
-    reg = wf.registry
+    """Run the workflow via CodeWorkflowManager, polling for status."""
+    manager = tracker.workflow
 
     try:
-        wf._ensure_agents()
-        tracker.status = "writing"
-        save_workflow(tracker.task_id, tracker.task_description,
-                      language=wf.language, status="writing", iteration=1,
-                      coder_id=wf.coder_id, tester_id=wf.tester_id)
+        # Start manager.run() in background
+        task = asyncio.create_task(manager.run())
 
-        # Phase 1: Write
-        tracker.iteration = 1
-        tracker.status = "writing"
-        if tracker.stopped:
-            return
-        wf.current_code = await wf._call_coder(wf.task)
-        wf.history.append({"phase": "write", "code": wf.current_code[:500]})
-        save_iteration(tracker.task_id, 1, "write", code=wf.current_code)
-
-        # Phase 2-4: Review + fix
-        for wf.iteration in range(1, tracker.max_iterations + 1):
+        # Poll for status updates
+        last_status = ""
+        while not task.done():
+            await asyncio.sleep(2)
+            status = manager.state.value
+            if status != last_status:
+                tracker.status = status
+                tracker.iteration = manager.iteration or 1
+                save_workflow(
+                    tracker.task_id, tracker.task_description,
+                    language=manager.language,
+                    status=status, iteration=manager.iteration or 1,
+                    coder_id=manager.coder.agent_id,
+                    tester_id=manager.tester.agent_id,
+                )
+                last_status = status
             if tracker.stopped:
+                task.cancel()
                 tracker.status = "stopped"
-                update_workflow_status(tracker.task_id, "stopped", wf.iteration)
+                update_workflow_status(tracker.task_id, "stopped", manager.iteration)
                 return
 
-            tracker.iteration = wf.iteration
-            tracker.status = "reviewing"
-            update_workflow_status(tracker.task_id, "reviewing", wf.iteration)
-            wf.current_review = await wf._call_tester(wf.current_code)
-            wf.history.append({
-                "phase": f"review-{wf.iteration}",
-                "review": wf.current_review[:500],
-            })
-            save_iteration(
-                tracker.task_id, wf.iteration, f"review-{wf.iteration}",
-                code=wf.current_code, review=wf.current_review,
-            )
-
-            if wf._is_passing(wf.current_review):
-                tracker.status = "passed"
-                tracker._result = wf._build_result("passed")
-                save_workflow_result(
-                    tracker.task_id, "passed", wf.iteration,
-                    wf.current_code, wf.current_review,
-                    json.dumps(tracker._result, default=str),
-                )
-                logger.info(f"Workflow {tracker.task_id}: PASSED")
-                return
-
-            if wf.iteration < tracker.max_iterations:
-                tracker.status = "fixing"
-                update_workflow_status(tracker.task_id, "fixing", wf.iteration)
-                wf.current_code = await wf._call_coder_fix(
-                    wf.current_code, wf.current_review,
-                )
-                wf.history.append({
-                    "phase": f"fix-{wf.iteration}",
-                    "code": wf.current_code[:500],
-                })
-                save_iteration(
-                    tracker.task_id, wf.iteration, f"fix-{wf.iteration}",
-                    code=wf.current_code,
-                )
-            else:
-                tracker.status = "failed"
-                tracker._result = wf._build_result("failed")
-                save_workflow_result(
-                    tracker.task_id, "failed", wf.iteration,
-                    wf.current_code, wf.current_review,
-                    json.dumps(tracker._result, default=str),
-                )
+        # Task done — get result
+        result = task.result()
+        tracker._result = result
+        tracker.status = result["status"]
+        save_workflow_result(
+            tracker.task_id, result["status"], result["iterations"],
+            result["code"], result["review"],
+            json.dumps(result, default=str),
+        )
 
     except asyncio.CancelledError:
         tracker.status = "stopped"
     except Exception as e:
-        logger.error(f"Workflow {tracker.task_id} error: {e}")
+        logger.error("Workflow %s error: %s", tracker.task_id, e)
         tracker.status = "failed"
-        tracker._result = {"status": "failed", "error": str(e)}
 
 
 def get_workflow(task_id: str) -> WorkflowTracker | None:
