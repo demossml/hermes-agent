@@ -2810,26 +2810,140 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
             "confidence": confidence,
         }
 
-    async def start_code_workflow(self, task_description: str, language: str | None = None) -> str:
-        """Route a code task through the coder agent.
+    async def start_code_workflow(
+        self,
+        task_description: str,
+        language: str | None = None,
+        session_id: str = "",
+    ) -> str:
+        """Create isolated coder + tester agents and run a code task.
 
-        If a coder agent exists, delegates to it.  Otherwise falls
-        back to the orchestrator's direct response.
+        1. Creates ``coder-{id}`` with full task context
+        2. Creates ``tester-{id}`` with strict review instructions
+        3. Coder writes the code → Tester reviews it
+        4. Returns the final result with review feedback
+
+        Both agents have fully isolated memory (separate
+        ``subtree_session_id``).  They see only their own branch.
+
+        Args:
+            task_description: The user's code request
+            language: Optional language hint (python, js, etc.)
+            session_id: Session for result tracking
+
+        Returns:
+            Combined result from coder + tester.
         """
-        target = "coder" if "coder" in self._agents else None
+        import uuid
 
-        if target is None:
-            # No coder — handle directly
-            return f"Code task received: {task_description[:100]}..."
+        task_id = uuid.uuid4().hex[:8]
+        coder_id = f"coder-{task_id}"
+        tester_id = f"tester-{task_id}"
+        lang = language or ""
+        lang_hint = f"\nLanguage: {lang}" if lang else ""
 
-        lang_hint = f" (use {language})" if language else ""
-        msg = f"Code task{lang_hint}: {task_description}"
+        # ── Create coder agent ──────────────────────────────
+        if coder_id not in self._agents:
+            self.create(coder_id, {
+                "system_prompt": (
+                    "You are a CODE WRITING agent. Your ONLY job is to write "
+                    "clean, correct, well-documented code. Follow the task "
+                    "description exactly. Do NOT explain your code unless "
+                    "asked. Do NOT test your own code — a separate tester "
+                    "agent will do that. Output code only."
+                ),
+                "parent_id": "orchestrator",
+                "description": f"Dynamic coder for task {task_id}",
+                "max_iterations": 8,
+                "critical_rules": [
+                    "Write code ONLY. No explanations.",
+                    "Always add docstrings and type hints.",
+                    "Handle edge cases and errors.",
+                ],
+                "rule_reminder_every": 0,
+            })
+            logger.info(
+                f"start_code_workflow: created {coder_id} "
+                f"(subtree={self._agents[coder_id].get('subtree_session_id','?')[:20]}...)"
+            )
+
+        # ── Create tester agent ─────────────────────────────
+        if tester_id not in self._agents:
+            self.create(tester_id, {
+                "system_prompt": (
+                    "You are a STRICT code tester and reviewer. Your job:\n"
+                    "1. Read the code carefully\n"
+                    "2. Test it mentally — does it solve the problem?\n"
+                    "3. Find bugs, edge cases, style issues, performance problems\n"
+                    "4. Report: ✅ PASS or ❌ FAIL with specific issues\n"
+                    "5. If FAIL: suggest specific fixes\n\n"
+                    "Be thorough. Be precise. Be constructive."
+                ),
+                "parent_id": "orchestrator",
+                "description": f"Dynamic tester for task {task_id}",
+                "max_iterations": 5,
+                "critical_rules": [
+                    "Be strict and thorough in your review.",
+                    "Report specific issues, not vague complaints.",
+                    "Suggest concrete fixes for every issue found.",
+                ],
+                "rule_reminder_every": 0,
+            })
+            logger.info(
+                f"start_code_workflow: created {tester_id} "
+                f"(subtree={self._agents[tester_id].get('subtree_session_id','?')[:20]}...)"
+            )
+
+        # ── Phase 1: Coder writes ───────────────────────────
+        logger.info(f"start_code_workflow: {coder_id} writing code...")
+        coder_msg = f"Code task{lang_hint}:\n\n{task_description}"
+        code_result = await self.call(
+            coder_id, session_id or task_id, coder_msg,
+            caller_id="orchestrator",
+        )
+
+        # ── Phase 2: Tester reviews ─────────────────────────
+        logger.info(f"start_code_workflow: {tester_id} reviewing code...")
+        tester_msg = (
+            f"Review this code. Be strict.\n\n"
+            f"Original task:\n{task_description}\n\n"
+            f"Code to review:\n```\n{code_result[:3000]}\n```"
+        )
+        review_result = await self.call(
+            tester_id, session_id or task_id, tester_msg,
+            caller_id="orchestrator",
+        )
+
+        # ── Phase 3: Coder fixes if needed ──────────────────
+        if "❌" in review_result or "FAIL" in review_result.upper():
+            logger.info(
+                f"start_code_workflow: {coder_id} fixing issues..."
+            )
+            fix_msg = (
+                f"Your code was reviewed. Fix ALL issues listed below.\n\n"
+                f"Review feedback:\n{review_result}\n\n"
+                f"Original task:\n{task_description}\n\n"
+                f"Rewrite the code with all fixes applied. Output code only."
+            )
+            fixed_code = await self.call(
+                coder_id, session_id or task_id, fix_msg,
+                caller_id="orchestrator",
+            )
+            final = (
+                f"## Code (revised after review)\n\n{fixed_code}\n\n"
+                f"## Review\n\n{review_result}"
+            )
+        else:
+            final = (
+                f"## Code\n\n{code_result}\n\n"
+                f"## Review\n\n{review_result}"
+            )
 
         logger.info(
-            f"start_code_workflow: routing to '{target}' — "
-            f"'{task_description[:80]}...'"
+            f"start_code_workflow: task {task_id} complete. "
+            f"Agents: {coder_id}, {tester_id}"
         )
-        return await self.call(target, "code-workflow", msg, caller_id="orchestrator")
+        return final
 
 
 # ── Singleton ────────────────────────────────────────────────
