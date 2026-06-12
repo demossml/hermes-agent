@@ -2306,6 +2306,22 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
         """
         prompt = cfg.get("system_prompt", "You are a helpful assistant.")
         rules = cfg.get("critical_rules", [])
+
+        # ── Isolated database info ──────────────────────────────
+        import os
+        _home = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+        _profile = os.environ.get("HERMES_PROFILE", "default")
+        if _profile not in ("default", ""):
+            _db_hint = (
+                f"\n\n## Your Isolated Database\n"
+                f"You work ONLY with your personal database:\n"
+                f"Path: {_home}/profiles/{_profile}/data/evotor.duckdb\n\n"
+                f"You do NOT have access to other clones' or the main "
+                f"profile's databases. You only see your own "
+                f"observer_groups and messages."
+            )
+            prompt += _db_hint
+
         if rules:
             prompt += "\n\n[CRITICAL RULES]\n"
             for i, rule in enumerate(rules, 1):
