@@ -18,7 +18,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from code_workflow.agents import CoderAgent, TesterAgent
+from code_workflow.agents import CoderAgent, TesterAgent, PromptEngineer
 from code_workflow.state import WorkflowState
 
 logger = logging.getLogger(__name__)
@@ -53,6 +53,7 @@ class CodeWorkflowManager:
     # ── Internal state ─────────────────────────────────────
     state: WorkflowState = WorkflowState.IDLE
     task_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    prompt_engineer: PromptEngineer | None = None
     coder: CoderAgent | None = None
     tester: TesterAgent | None = None
     coder_session_id: str = ""
@@ -64,8 +65,10 @@ class CodeWorkflowManager:
     history: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self):
+        pe_id = f"prompt-eng-{self.task_id}"
         coder_id = f"coder-{self.task_id}"
         tester_id = f"tester-{self.task_id}"
+        self.prompt_engineer = PromptEngineer(pe_id, self.registry, self.task_id)
         self.coder = CoderAgent(coder_id, self.registry, self.task_id, self.language)
         self.tester = TesterAgent(tester_id, self.registry, self.task_id)
 
@@ -90,10 +93,22 @@ class CodeWorkflowManager:
         """
         self._ensure_agents()
 
+        # ── Phase 0: Prompt engineering ─────────────────────
+        self.state = WorkflowState.PROMPTING
+        self._notify("prompting")
+        engineered_prompt = await self.prompt_engineer.engineer_prompt(
+            self.task, self.language,
+        )
+        logger.debug(
+            "PromptEngineer output (%d chars): %s…",
+            len(engineered_prompt), engineered_prompt[:120],
+        )
+        self._record("prompting", code=engineered_prompt[:500])
+
         # ── Phase 1: Initial code generation ────────────────
         self.state = WorkflowState.WRITING
         self._notify("writing")
-        self.current_code = await self.coder.write_code(self.task, self.session_id)
+        self.current_code = await self.coder.write_code(engineered_prompt, self.session_id)
         self._record("write", code=self.current_code)
 
         # ── Phase 2+: Review → Fix loop ─────────────────────
@@ -163,6 +178,7 @@ class CodeWorkflowManager:
     # ── Helpers ─────────────────────────────────────────────
 
     def _ensure_agents(self) -> None:
+        self.prompt_engineer.ensure_created()
         self.coder.ensure_created()
         self.tester.ensure_created()
 
@@ -222,6 +238,7 @@ class CodeWorkflowManager:
     def _notify(phase: str) -> None:
         """Log a human-friendly progress message."""
         msgs = {
+            "prompting": "🎯 Prompt Engineer optimising the request…",
             "writing":   "✍️  Coder writing code…",
             "reviewing": "🔍 Tester reviewing code (real execution + analysis)…",
             "fixing":    "🔧 Coder fixing issues found in review…",
@@ -252,7 +269,8 @@ class CodeWorkflowManager:
             f"{icon} Code Workflow {'PASSED' if status == 'passed' else 'FAILED'} "
             f"after {iters}",
             f"   Stop reason: {reason}",
-            f"   Agents: {self.coder.agent_id} → {self.tester.agent_id}",
+            f"   Agents: {self.prompt_engineer.agent_id} → "
+            f"{self.coder.agent_id} → {self.tester.agent_id}",
             "",
             "## Code",
             self.current_code[:3000],

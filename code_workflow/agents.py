@@ -114,6 +114,66 @@ class CoderAgent(WorkflowAgent):
 
 
 # ═══════════════════════════════════════════════════════════════
+# Prompt Engineer
+# ═══════════════════════════════════════════════════════════════
+
+
+class PromptEngineer(WorkflowAgent):
+    """Expert at crafting the perfect coding prompt for the Coder.
+
+    Takes the user's raw request and produces a detailed,
+    structured prompt covering: requirements, edge cases,
+    type hints, docstrings, error handling, language best
+    practices, and test expectations.
+    """
+
+    agent_type = "prompt_engineer"
+
+    def __init__(self, agent_id: str, registry: Any, task_id: str):
+        super().__init__(agent_id, registry, task_id)
+        self.subtree_session_id = f"subtree-{agent_id}-{task_id}"
+
+    async def engineer_prompt(
+        self, user_request: str, language: str | None = None,
+    ) -> str:
+        """Transform a raw user request into a polished coder prompt."""
+        lang_hint = f"\nTarget language: {language}" if language else ""
+        msg = (
+            f"Transform this raw request into a detailed, "
+            f"professional coding prompt for an expert software "
+            f"engineer.{lang_hint}\n\n"
+            f"Your prompt MUST include:\n"
+            f"- Precise task description\n"
+            f"- Input/output specifications with types\n"
+            f"- Edge cases to handle (empty, None, invalid)\n"
+            f"- Required docstrings and type hints\n"
+            f"- Error handling expectations\n"
+            f"- Language-specific best practices\n"
+            f"- Performance constraints (if applicable)\n\n"
+            f"Output ONLY the prompt text. No explanations.\n\n"
+            f"User request:\n{user_request}"
+        )
+        return await self.send(msg)
+
+    def _build_config(self) -> dict:
+        return {
+            "system_prompt": _PROMPT_ENGINEER_PROMPT,
+            "parent_id": "orchestrator",
+            "subtree_session_id": self.subtree_session_id,
+            "description": f"Prompt engineer for task {self.task_id}",
+            "max_iterations": 3,
+            "normal_tools": [],
+            "critical_rules": [
+                "Output ONLY the prompt text — no commentary.",
+                "Include: task description, input/output types, "
+                "edge cases, docstrings, error handling.",
+                "Adapt style to the target language's conventions.",
+            ],
+            "rule_reminder_every": 0,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════
 # Tester
 # ═══════════════════════════════════════════════════════════════
 
@@ -289,4 +349,24 @@ _TESTER_PROMPT = (
     "### Summary\n"
     "Brief overall assessment. Quote the actual test "
     "output — do NOT make up results."
+)
+
+
+_PROMPT_ENGINEER_PROMPT = (
+    "You are an EXPERT PROMPT ENGINEER for programming tasks.\n"
+    "Your job is to take a raw, underspecified user request "
+    "and turn it into a precise, complete prompt that a "
+    "senior software engineer can execute flawlessly.\n\n"
+    "Your prompts MUST include:\n"
+    "- EXACT task description — no ambiguity\n"
+    "- Input types, output types, and expected behaviour\n"
+    "- Edge cases: empty inputs, None, invalid types, "
+    "boundary values\n"
+    "- Required docstrings and type hints\n"
+    "- Error handling expectations (exceptions, fallbacks)\n"
+    "- Language-specific best practices (PEP 8, etc.)\n"
+    "- Performance notes if relevant (Big O, memory)\n\n"
+    "Output ONLY the prompt text. No 'Here is a prompt:' "
+    "prefixes — just the raw prompt that will be sent to the "
+    "coder."
 )
