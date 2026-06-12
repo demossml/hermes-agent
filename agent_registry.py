@@ -2833,6 +2833,106 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
             "confidence": confidence,
         }
 
+    async def start_code_task(
+        self,
+        user_request: str,
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        """Unified entry point for code tasks with full isolation.
+
+        Steps:
+        1. Classify: detect code task, language, confidence
+        2. PromptEngineer (if user explicitly asked)
+        3. Coder + Tester with strict isolation
+        4. Beautiful status display
+
+        Returns a dict with::
+
+            {
+                "display": str,      # human-readable result
+                "status": "passed" | "failed",
+                "code": str,
+                "review": str,
+                "iterations": int,
+                "agents": [str],     # all agent IDs used
+                "isolation": {       # verification report
+                    "coder_subtree": str,
+                    "tester_subtree": str,
+                    "tester_tools": list,
+                    "ok": bool,
+                },
+            }
+        """
+        # ── 1. Classify ─────────────────────────────────────
+        classification = self.classify_code_task(user_request)
+        is_code = classification.get("is_code_task", False)
+        language = classification.get("language")
+        confidence = classification.get("confidence", 0)
+
+        if not is_code or confidence < 0.5:
+            return {
+                "display": (
+                    f"Not a code task (confidence={confidence:.0%}). "
+                    f"Use /orchestrate for general delegation."
+                ),
+                "status": "skipped",
+                "code": "",
+                "review": "",
+                "iterations": 0,
+                "agents": [],
+                "isolation": {"ok": False},
+            }
+
+        # ── 2. PromptEngineer (conditional) ─────────────────
+        use_pe = self.wants_prompt_engineer(user_request)
+        task = user_request
+        agents_used = []
+
+        if use_pe:
+            from code_workflow.agents import PromptEngineer
+            import uuid
+            pe_id = f"prompt-eng-{uuid.uuid4().hex[:8]}"
+            pe = PromptEngineer(pe_id, self, pe_id)
+            pe.ensure_created()
+            task = await pe.engineer_prompt(user_request, language)
+            agents_used.append(pe_id)
+            logger.info(
+                "start_code_task: PromptEngineer produced %d-char prompt",
+                len(task),
+            )
+
+        # ── 3. Coder → Tester with isolation ───────────────
+        from code_workflow.manager import CodeWorkflowManager
+        import uuid as _uuid
+
+        manager = CodeWorkflowManager(
+            registry=self,
+            task=task,
+            language=language,
+            session_id=session_id,
+        )
+        wf_result = await manager.run()
+        display_text = wf_result.get("display", "")
+
+        # ── 4. Isolation report ─────────────────────────────
+        isolation = {
+            "coder_subtree": manager.coder_session_id[:32] if manager.coder_session_id else "N/A",
+            "tester_subtree": manager.tester_session_id[:32] if manager.tester_session_id else "N/A",
+            "tester_tools": [],  # enforced by TesterAgent._build_config
+            "different_subtrees": manager.coder_session_id != manager.tester_session_id,
+            "ok": manager.coder_session_id != manager.tester_session_id,
+        }
+
+        return {
+            "display": display_text,
+            "status": wf_result.get("status", "completed"),
+            "code": wf_result.get("code", ""),
+            "review": wf_result.get("review", ""),
+            "iterations": wf_result.get("iterations", 0),
+            "agents": agents_used,
+            "isolation": isolation,
+        }
+
     async def start_code_workflow(
         self,
         task_description: str,
