@@ -8332,22 +8332,41 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 _cprint(f"  Language: {lang}")
             _cprint("")
 
-            # ── Prompt Engineer detection ───────────────────
+            # ── Prompt Engineer (conditional) ───────────────
             if registry.wants_prompt_engineer(message):
-                _cprint(f"  🎯 Prompt Engineer requested…")
+                _cprint(f"  🎯 Prompt Engineer optimising your request…")
+
                 from code_workflow.agents import PromptEngineer
                 import uuid
                 task_id = uuid.uuid4().hex[:8]
                 pe = PromptEngineer(f"prompt-eng-{task_id}", registry, task_id)
                 pe.ensure_created()
+
                 engineered = self._run_async(
                     pe.engineer_prompt(message, lang or None), timeout=60,
                 )
-                _cprint(f"\n  [bold]Engineered Prompt:[/]")
-                _cprint(f"  {engineered[:500]}")
-                if len(engineered) > 500:
-                    _cprint(f"  [dim]…({len(engineered)} chars total)[/]")
-                _cprint(f"\n  [dim]Review the prompt. Send /approve to run it, or type a new request.[/]")
+
+                # ── Beautiful display ─────────────────────────
+                _cprint(f"\n  [bold cyan]━━━ Engineered Prompt ({len(engineered)} chars) ━━━[/]")
+                for line in engineered.strip().split("\n"):
+                    line = line.strip()
+                    if not line:
+                        _cprint("")
+                    elif line.startswith(("- ", "* ", "• ", "1.", "2.", "3.", "4.", "5.")):
+                        _cprint(f"  [green]{line}[/]")
+                    elif line.startswith(("Input", "Output", "Edge", "Type", "Error", "Perf", "Style", "Task", "Require")):
+                        _cprint(f"  [bold yellow]{line}[/]")
+                    else:
+                        _cprint(f"  {line}")
+                _cprint(f"  [bold cyan]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/]")
+
+                _cprint(f"\n  [bold]What would you like to do?[/]")
+                _cprint(f"  [cyan]/approve[/]     — run this prompt through coder+tester")
+                _cprint(f"  [cyan]/edit <text>[/] — edit the prompt before running")
+                _cprint(f"  [cyan]/skip[/]       — skip PromptEngineer, use original request")
+                _cprint(f"  [dim]Or type a new request to start over.[/]")
+                _cprint("")
+
                 self._pending_prompt = {
                     "task": engineered,
                     "language": lang,
