@@ -213,6 +213,8 @@ Multi-agent: propagated ['delegation'] to 3 agent(s) (1 skipped)
 - **Colored hierarchy** — `level: 0` (blue), `level: 1` (green), `level: 2+` (yellow)
 - **@mention routing** — `@coder write a sorting function` in Telegram / Discord
 - **Slash commands** — `/agent`, `/orchestrate`, `/subagents`, `/agent-off`
+- **Telegram API 10.1** — native tables, slideshows for long responses, LaTeX rendering
+  - Config: `telegram.use_api_10_markup: true`
 
 ### Per-Agent LLM Configuration
 - **Individual provider** — each agent on its own provider (`anthropic` / `deepseek` / `openai`)
