@@ -2838,8 +2838,12 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
         task_description: str,
         language: str | None = None,
         session_id: str = "",
+        use_prompt_engineer: bool = False,
     ) -> str:
-        """Run the full coder→tester→fix pipeline.
+        """Run the full prompt_engineer→coder→tester→fix pipeline.
+
+        If ``use_prompt_engineer`` is True, a PromptEngineer first
+        optimises the raw request into a polished prompt for the Coder.
 
         See ``code_workflow/manager.py`` for the implementation.
         """
@@ -2859,6 +2863,25 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
             f"{result['stop_reason']}"
         )
         return result["display"]
+
+    @staticmethod
+    def wants_prompt_engineer(user_message: str) -> bool:
+        """Detect if user explicitly asked for prompt engineering.
+
+        Matches phrases like:
+        - сначала создай промпт / подготовь промпт / улучши запрос
+        - create a prompt first / improve the prompt / craft a prompt
+        """
+        msg = user_message.lower()
+        keywords = [
+            "создай промпт", "подготовь промпт", "сделай промпт",
+            "улучши запрос", "улучши промпт", "напиши промпт",
+            "сначала промпт", "промпт для кодера",
+            "create a prompt", "craft a prompt", "improve the prompt",
+            "prepare a prompt", "make a prompt", "prompt first",
+            "prompt engineer",
+        ]
+        return any(kw in msg for kw in keywords)
 
 
 # ── Singleton ────────────────────────────────────────────────

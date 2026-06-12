@@ -8332,6 +8332,28 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 _cprint(f"  Language: {lang}")
             _cprint("")
 
+            # ── Prompt Engineer detection ───────────────────
+            if registry.wants_prompt_engineer(message):
+                _cprint(f"  🎯 Prompt Engineer requested…")
+                from code_workflow.agents import PromptEngineer
+                import uuid
+                task_id = uuid.uuid4().hex[:8]
+                pe = PromptEngineer(f"prompt-eng-{task_id}", registry, task_id)
+                pe.ensure_created()
+                engineered = self._run_async(
+                    pe.engineer_prompt(message, lang or None), timeout=60,
+                )
+                _cprint(f"\n  [bold]Engineered Prompt:[/]")
+                _cprint(f"  {engineered[:500]}")
+                if len(engineered) > 500:
+                    _cprint(f"  [dim]…({len(engineered)} chars total)[/]")
+                _cprint(f"\n  [dim]Review the prompt. Send /approve to run it, or type a new request.[/]")
+                self._pending_prompt = {
+                    "task": engineered,
+                    "language": lang,
+                }
+                return
+
             tracker = start_workflow(registry, message, language=lang or None)
             _cprint(f"  {tracker.display_status}")
 
