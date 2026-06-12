@@ -61,3 +61,28 @@ def get_hermes_db_connection(profile_name: str | None = None, *, read_only: bool
 
     path = get_hermes_db_path(profile_name)
     return duckdb.connect(str(path), read_only=read_only)
+
+
+def get_observer_groups_path(profile_name: str | None = None) -> Path:
+    """Return the observer_groups.json path for a given profile.
+
+    Args:
+        profile_name: Profile/clone name.  ``None`` resolves from
+                      ``HERMES_PROFILE`` env var, defaulting to ``"default"``.
+
+    Returns:
+        Absolute path to ``<data_dir>/observer_groups.json``,
+        with parent directories created as needed.
+    """
+    home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+
+    if not profile_name:
+        profile_name = os.environ.get("HERMES_PROFILE", "default")
+
+    if profile_name in ("default", "") or not profile_name:
+        data_dir = home / "data"
+    else:
+        data_dir = home / "profiles" / profile_name / "data"
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir / "observer_groups.json"
