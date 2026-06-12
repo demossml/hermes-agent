@@ -55,6 +55,8 @@ class CodeWorkflowManager:
     task_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     coder: CoderAgent | None = None
     tester: TesterAgent | None = None
+    coder_session_id: str = ""
+    tester_session_id: str = ""
     current_code: str = ""
     current_review: str = ""
     iteration: int = 0
@@ -163,6 +165,51 @@ class CodeWorkflowManager:
     def _ensure_agents(self) -> None:
         self.coder.ensure_created()
         self.tester.ensure_created()
+
+        # Store validated session IDs
+        coder_cfg = self.registry._agents.get(self.coder.agent_id, {})
+        tester_cfg = self.registry._agents.get(self.tester.agent_id, {})
+        self.coder_session_id = coder_cfg.get("subtree_session_id", "")
+        self.tester_session_id = tester_cfg.get("subtree_session_id", "")
+
+        # ── Verify isolation ─────────────────────────────
+        self._verify_isolation()
+
+    def _verify_isolation(self) -> None:
+        """Verify coder and tester have different subtree_session_ids.
+
+        Logs a warning if isolation is compromised (shared subtrees).
+        Does not raise — the workflow continues but the fact is logged.
+        """
+        if not self.coder_session_id or not self.tester_session_id:
+            logger.debug(
+                "Isolation: session IDs not yet assigned "
+                "(coder=%s, tester=%s)",
+                bool(self.coder_session_id), bool(self.tester_session_id),
+            )
+            return
+
+        if self.coder_session_id == self.tester_session_id:
+            logger.warning(
+                "⚠ ISOLATION BROKEN: coder and tester share subtree "
+                "'%s'. They can read each other's memory.",
+                self.coder_session_id,
+            )
+        else:
+            logger.debug(
+                "Isolation OK: coder=%s… tester=%s…",
+                self.coder_session_id[:24], self.tester_session_id[:24],
+            )
+
+        # Verify tester has zero tools
+        tester_cfg = self.registry._agents.get(self.tester.agent_id, {})
+        tester_tools = tester_cfg.get("enabled_toolsets", None)
+        if tester_tools is not None and tester_tools != []:
+            logger.warning(
+                "⚠ Tester has tools configured: %s. "
+                "It may be able to read coder memory.",
+                tester_tools,
+            )
 
     def _record(self, phase: str, code: str = "", review: str = "") -> None:
         self.history.append({

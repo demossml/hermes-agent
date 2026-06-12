@@ -76,6 +76,7 @@ class CoderAgent(WorkflowAgent):
     ):
         super().__init__(agent_id, registry, task_id)
         self.language = language
+        self.subtree_session_id = f"subtree-{agent_id}-{task_id}"
 
     async def write_code(self, task: str, session_id: str = "") -> str:
         """Ask the coder to write code for a task."""
@@ -99,6 +100,7 @@ class CoderAgent(WorkflowAgent):
         return {
             "system_prompt": _CODER_PROMPT,
             "parent_id": "orchestrator",
+            "subtree_session_id": self.subtree_session_id,
             "description": f"Dynamic coder for task {self.task_id}",
             "max_iterations": 8,
             "critical_rules": [
@@ -120,6 +122,10 @@ class TesterAgent(WorkflowAgent):
     """Senior code tester + security reviewer with sandboxed execution."""
 
     agent_type = "tester"
+
+    def __init__(self, agent_id: str, registry: Any, task_id: str):
+        super().__init__(agent_id, registry, task_id)
+        self.subtree_session_id = f"subtree-{agent_id}-{task_id}"
 
     async def review_code(self, code: str, session_id: str = "") -> str:
         """Review code — run real tests first, then LLM review.
@@ -197,12 +203,20 @@ class TesterAgent(WorkflowAgent):
         return {
             "system_prompt": _TESTER_PROMPT,
             "parent_id": "orchestrator",
+            "subtree_session_id": self.subtree_session_id,
             "description": f"Dynamic tester for task {self.task_id}",
             "max_iterations": 5,
+            "enabled_toolsets": [],   # ⛔ ZERO tools — cannot read coder memory
             "critical_rules": [
+                "You do NOT know the original user request. "
+                "Judge ONLY the code provided to you.",
+                "NEVER ask the coder or user for context — "
+                "you work with the code text alone.",
                 "Report specific issues with suggested fixes.",
-                "Check security, correctness, edge cases, performance, style.",
-                "Use the exact output format: Review Result, sections, Summary.",
+                "Check security, correctness, edge cases, "
+                "performance, style.",
+                "Use the exact output format: Review Result, "
+                "sections, Summary.",
             ],
             "rule_reminder_every": 0,
         }
