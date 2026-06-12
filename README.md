@@ -791,6 +791,54 @@ multi-agent/                           ← branch
 
 ---
 
+## Profile & Clone Isolation
+
+Every Hermes clone (profile) gets its own **isolated DuckDB database** — no clone can see another clone's data, and no clone can access the main profile's database.
+
+### Architecture
+
+```
+~/.hermes/
+├── data/
+│   └── evotor.duckdb          ← main profile (default)
+│
+└── profiles/
+    ├── bot-1/
+    │   └── data/
+    │       ├── evotor.duckdb   ← bot-1's isolated DB
+    │       └── observer_groups.json
+    │
+    └── bot-2/
+        └── data/
+            └── evotor.duckdb   ← bot-2's isolated DB
+```
+
+### How It Works
+
+1. **Auto-creation** — `hermes update` automatically creates the database for every existing clone
+2. **System prompt** — clones see their DB path in their system prompt (`Your Isolated Database`)
+3. **Manual migration** — `python scripts/migrate_profile_db.py --profile bot-1` creates a DB for a specific clone
+4. **Utility** — `get_hermes_db_path(profile_name)` resolves the correct path for any profile
+
+### Check Status
+
+```bash
+hermes profile status
+# → Profile: default | DB: ~/.hermes/data/evotor.duckdb
+
+HERMES_PROFILE=bot-1 hermes profile status
+# → Profile: bot-1   | DB: ~/.hermes/profiles/bot-1/data/evotor.duckdb
+```
+
+### Isolation Guarantees
+
+- Clones use their own `evotor.duckdb` — they cannot `SELECT` from another clone's tables
+- Main profile (`default`) uses `~/.hermes/data/evotor.duckdb`
+- `observer_groups.json` is per-profile — each clone monitors its own groups
+- No shared state between profiles unless explicitly configured
+
+---
+
 ## License
 
 Based on [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent). MIT License.
