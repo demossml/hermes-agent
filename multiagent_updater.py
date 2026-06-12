@@ -277,6 +277,88 @@ def migrate_subtree_sessions(root: Path | None = None, dry_run: bool = False) ->
     return count
 
 
+def migrate_profile_dbs(root: Path | None = None, dry_run: bool = False) -> int:
+    """Create/migrate DuckDB databases for all existing profiles/clones.
+
+    Scans ``~/.hermes/profiles/`` and runs the schema migration
+    for each profile that has agent configs but no database.
+
+    Returns count of profiles migrated.
+    """
+    from pathlib import Path as _Path
+    home = _Path.home() / ".hermes"
+    profiles_dir = home / "profiles"
+    if not profiles_dir.exists():
+        return 0
+
+    count = 0
+    for profile_dir in sorted(profiles_dir.iterdir()):
+        if not profile_dir.is_dir():
+            continue
+        profile_name = profile_dir.name
+        data_dir = profile_dir / "data"
+        db_path = data_dir / "evotor.duckdb"
+
+        # Skip if already has a database
+        if db_path.exists() and db_path.stat().st_size > 0:
+            logger.debug("Profile '%s' already has a database, skipping", profile_name)
+            continue
+
+        if dry_run:
+            logger.info("[DRY-RUN] Would migrate profile: %s", profile_name)
+            count += 1
+            continue
+
+        try:
+            data_dir.mkdir(parents=True, exist_ok=True)
+
+            try:
+                import duckdb
+            except ImportError:
+                logger.debug("DuckDB not installed — skipping profiles")
+                continue
+
+            conn = duckdb.connect(str(db_path))
+
+            conn.execute("CREATE SEQUENCE IF NOT EXISTS seq_gm_id START 1")
+
+            # Minimal schema for clone operation
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS group_messages (
+                    id BIGINT PRIMARY KEY DEFAULT nextval('seq_gm_id'),
+                    platform TEXT, chat_id TEXT, chat_title TEXT,
+                    message_id TEXT, sender_id TEXT, sender_name TEXT,
+                    sender_username TEXT, text TEXT, has_link BOOLEAN,
+                    links TEXT, reply_to_id TEXT, message_type TEXT,
+                    has_media BOOLEAN, timestamp TIMESTAMP,
+                    embedding FLOAT[], created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS chat_rules (
+                    id INTEGER PRIMARY KEY, group_id TEXT NOT NULL,
+                    rule TEXT NOT NULL, priority INTEGER DEFAULT 0,
+                    active BOOLEAN DEFAULT TRUE
+                )
+            """)
+            conn.close()
+
+            # Create observer_groups.json if missing
+            groups_path = data_dir / "observer_groups.json"
+            if not groups_path.exists():
+                import json
+                groups_path.write_text("[]", encoding="utf-8")
+
+            logger.info("Migrated profile '%s': database ready", profile_name)
+            count += 1
+        except Exception as e:
+            logger.warning(
+                "Failed to migrate profile '%s': %s", profile_name, e
+            )
+
+    return count
+
+
 # ── Report ────────────────────────────────────────────────────
 
 
@@ -363,7 +445,12 @@ def run_update(
     if subtree_count:
         lines.append(f"🌳 Subtree sessions: {subtree_count} agents updated")
 
-    # 5. Success message
+    # 5. Migrate profile/clone databases
+    profile_count = migrate_profile_dbs(root, dry_run=dry_run)
+    if profile_count:
+        lines.append(f"🗄️  Profile databases: {profile_count} profiles migrated")
+
+    # 6. Success message
     if dry_run:
         lines.append("\n🔍 Dry-run complete. Run without --dry-run to apply changes.")
     else:
