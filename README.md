@@ -44,6 +44,9 @@ This branch extends Hermes Agent with **multi-agent orchestration**, DAG pipelin
 - **Full Clone agents** — new sub-agents get ALL tools by default (complete Hermes capability)
 - **Code Workflow** — automated coder→tester pipeline with sandboxed test execution and auto-generated pytest suites
 - **Parallel workflows** — run multiple code tasks simultaneously, each with isolated coder+tester agents
+- **DuckDB chat rules** — per-group rules stored in DuckDB, injected into prompts with zero LLM overhead
+- **DuckDB chat history** — all Telegram messages auto-saved with semantic search capability
+- **Telegram API 10.1** — native rich markup: tables, slideshows, LaTeX rendering
 
 ---
 
