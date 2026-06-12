@@ -895,6 +895,51 @@ class TelegramAdapter(BasePlatformAdapter):
             return default
         return bool(value)
 
+    def _is_api10_enabled(self) -> bool:
+        return self._coerce_bool_extra("use_api_10_markup", False)
+
+    def _build_api10_chunks(self, content: str):
+        """Convert content to API 10.1 blocks as sendable chunks."""
+        from gateway.platforms.telegram_markup_10 import convert_to_api10
+        blocks = convert_to_api10(content)
+        chunks = []
+        for block in blocks:
+            if block["type"] == "table":
+                chunks.append(self._render_table_block(block))
+            elif block["type"] == "slide":
+                chunks.append(block["content"])
+            elif block["type"] == "text":
+                formatted = self.format_message(block["content"])
+                sub = self.truncate_message(
+                    formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+                )
+                chunks.extend(sub)
+        return chunks if chunks else [content]
+
+    @staticmethod
+    def _render_table_block(block: dict) -> str:
+        """Render table as ASCII box-drawing inside code fence."""
+        header = block.get("header", [])
+        rows = block.get("rows", [])
+        if not header:
+            return ""
+        col_widths = [len(h) for h in header]
+        for row in rows:
+            for i, cell in enumerate(row):
+                if i < len(col_widths):
+                    col_widths[i] = max(col_widths[i], len(cell))
+        def pad(cell, w):
+            return cell + " " * (w - len(cell))
+        lines = []
+        lines.append("\u250c" + "\u252c".join("\u2500" * (w + 2) for w in col_widths) + "\u2510")
+        lines.append("\u2502 " + " \u2502 ".join(pad(h, col_widths[i]) for i, h in enumerate(header)) + " \u2502")
+        lines.append("\u251c" + "\u253c".join("\u2500" * (w + 2) for w in col_widths) + "\u2524")
+        for row in rows:
+            cells = [pad(row[i] if i < len(row) else "", col_widths[i]) for i in range(len(col_widths))]
+            lines.append("\u2502 " + " \u2502 ".join(cells) + " \u2502")
+        lines.append("\u2514" + "\u2534".join("\u2500" * (w + 2) for w in col_widths) + "\u2518")
+        return "```\n" + "\n".join(lines) + "\n```"
+
     def _link_preview_kwargs(self) -> Dict[str, Any]:
         if not getattr(self, "_disable_link_previews", False):
             return {}
@@ -1869,11 +1914,16 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         
         try:
-            # Format and split message if needed
-            formatted = self.format_message(content)
-            chunks = self.truncate_message(
-                formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
-            )
+            # ── API 10.1 rich markup ────────────────────────────
+            _use_api10 = self._is_api10_enabled()
+            if _use_api10:
+                chunks = self._build_api10_chunks(content)
+            else:
+                # Format and split message if needed
+                formatted = self.format_message(content)
+                chunks = self.truncate_message(
+                    formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+                )
             if len(chunks) > 1:
                 # truncate_message appends a raw " (1/2)" suffix. Escape the
                 # MarkdownV2-special parentheses so Telegram doesn't reject the
