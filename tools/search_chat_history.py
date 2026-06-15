@@ -62,6 +62,19 @@ def _search_chat_history(
             "error": "Chat history DB unavailable (DuckDB not installed?)",
         })
 
+    # ── Project isolation: auto-filter by caller's project ──
+    # Sub-agents can only see messages tagged with their project.
+    # Orchestrator sees everything.  Injected silently — the agent
+    # does not (and should not) control this parameter.
+    project_filter: str | None = None
+    try:
+        from projects.project_isolation import get_active_project_filter
+        # task_id carries the calling agent's identity
+        caller = task_id if task_id else "orchestrator"
+        project_filter = get_active_project_filter(caller)
+    except Exception:
+        pass
+
     # ── Build results ──────────────────────────────────────
     results: list[dict] = []
 

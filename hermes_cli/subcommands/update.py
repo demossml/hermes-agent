@@ -67,4 +67,10 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         default=False,
         help="Windows: proceed with the update even when another hermes.exe is detected. The concurrent process will likely cause WinError 32 warnings and may leave a reboot-deferred .exe replacement.",
     )
+    update_parser.add_argument(
+        "--multiagent",
+        action="store_true",
+        default=False,
+        help="Run multi-agent config migration and project setup after the git pull (auto-detected on multi-agent branch).",
+    )
     update_parser.set_defaults(func=cmd_update)

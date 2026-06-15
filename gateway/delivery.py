@@ -429,5 +429,93 @@ class DeliveryRouter:
         return result
 
 
+# ═══════════════════════════════════════════════════════════════
+# Response context prefix — centralized, platform-adaptive
+# ═══════════════════════════════════════════════════════════════
+
+_PLATFORM_BOLD: dict[str, tuple[str, str]] = {
+    "telegram": ("**", "**"),
+    "discord": ("**", "**"),
+    "slack": ("*", "*"),
+    "mattermost": ("**", "**"),
+    "matrix": ("**", "**"),
+    "signal": ("*", "*"),
+    "whatsapp": ("*", "*"),
+}
+
+# Emoji glyphs — set by per-project config key "prefix_emoji"
+_PREFIX_EMOJI_PROJECT = "📁"
+_PREFIX_EMOJI_ORCHESTRATOR = "⚕"
+
+
+def format_gateway_response_prefix(
+    platform: str,
+    agent_result: dict | None = None,
+) -> str:
+    """Return a compact context prefix for gateway response delivery.
+
+    Centralised — every platform goes through this function.
+
+    Format (per-platform bold applied):
+        ``**📁 Project: Name**\\n\\n``
+        ``**📁 Project: Name · agent**\\n\\n``
+        ``**⚕ Orchestrator**\\n\\n``
+        ``**⚕ Orchestrator · agent**\\n\\n``
+
+    Prefix is ALWAYS followed by a blank line (``\\n\\n``) to prevent
+    markdown interference with code blocks, tables, and headers.
+    """
+    try:
+        from projects.project_context import (
+            get_current_project_name, get_current_project_id,
+        )
+        pid = get_current_project_id()
+        pname = get_current_project_name()
+    except Exception:
+        pid, pname = None, None
+
+    # ── Global override ────────────────────────────────────
+    import os
+    if os.environ.get("HERMES_NO_PROJECT_PREFIX", "").strip() in ("1", "true", "yes"):
+        return ""
+
+    # ── Per-project config ──────────────────────────────────
+    use_emoji = True  # default: emoji on
+    if pid:
+        try:
+            from projects.project_manager import ProjectManager
+            pm = ProjectManager()
+            if not pm.get_show_project_prefix(pid):
+                return ""
+            use_emoji = pm.get_config(pid, "prefix_emoji", True)
+        except Exception:
+            pass
+
+    agent_id = ""
+    if agent_result:
+        agent_id = str(agent_result.get("caller_agent_id", "") or "").strip()
+
+    # ── Build compact prefix (emoji · short label · optional agent) ──
+    sep = " · "  # middle-dot separator, compact
+    if pid and pname:
+        emoji = _PREFIX_EMOJI_PROJECT if use_emoji else ""
+        label = pname
+        prefix = f"{emoji}{' ' if emoji else ''}{label}"
+        if agent_id and agent_id != "orchestrator":
+            prefix = f"{prefix}{sep}{agent_id}"
+    else:
+        emoji = _PREFIX_EMOJI_ORCHESTRATOR if use_emoji else ""
+        prefix = f"{emoji}{' ' if emoji else ''}Orchestrator"
+        if agent_id and agent_id != "orchestrator":
+            prefix = f"{prefix}{sep}{agent_id}"
+
+    # ── Platform bold + safety blank line ───────────────────
+    platform_lower = str(platform).lower()
+    b_open, b_close = _PLATFORM_BOLD.get(platform_lower, ("", ""))
+    if b_open:
+        return f"{b_open}{prefix}{b_close}\n\n"
+    return f"{prefix}\n\n"
+
+
 
 

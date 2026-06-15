@@ -3852,7 +3852,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             "active_background_tasks": 0,
             "active_background_processes": 0,
             "agent_name": _active_subagent["name"] if _active_subagent else None,
+            "project_name": None,
         }
+
+        # ── Active project (from ProjectContextMiddleware) ────
+        try:
+            from projects.project_context import get_current_project_name
+            pname = get_current_project_name()
+            if pname:
+                snapshot["project_name"] = pname
+        except Exception:
+            pass
 
         # Count live /background tasks. The dict entry is removed in the
         # task thread's finally block, so len() reflects truly-running tasks.
@@ -4137,6 +4147,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
             compressions = snapshot.get("compressions", 0)
             parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
+            if snapshot.get("project_name"):
+                parts.insert(0, f"[Project: {snapshot['project_name']}]")
             if snapshot.get("agent_name"):
                 parts.insert(0, f"[{snapshot['agent_name']}]")
             if compressions:
@@ -4234,6 +4246,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         ("class:status-bar-dim", " "),
                         (bar_style, percent_label),
                     ]
+                    if snapshot.get("project_name"):
+                        frags.insert(0, ("class:status-bar-dim", " │ "))
+                        frags.insert(0, ("class:status-bar-project", f"[Project: {snapshot['project_name']}]"))
+                    if snapshot.get("agent_name"):
+                        frags.insert(0, ("class:status-bar-dim", " │ "))
+                        frags.insert(0, ("class:status-bar-agent", f"[{snapshot['agent_name']}]"))
                     if compressions:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append((self._compression_count_style(compressions), f"🗜️ {compressions}"))
@@ -7708,6 +7726,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_workflow(cmd_original)
         elif canonical == "agent-off":
             self._handle_agent_off()
+        elif canonical in ("project", "proj"):
+            self._handle_project(cmd_original)
+        elif canonical in ("projects", "projs"):
+            self._handle_projects()
+        elif canonical in ("search", "find"):
+            self._handle_search(cmd_original)
+        elif canonical == "global":
+            self._handle_global(cmd_original)
         elif canonical == "hermes-update":
             self._handle_hermes_update(cmd_original)
 
@@ -8452,9 +8478,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _cprint(f"  [red]Create failed: {e}[/]")
 
     def _handle_hermes_update(self, cmd: str):
-        """/hermes-update [--dry-run] [--reset-llm] — update multi-agent installation."""
+        """/hermes-update [--dry-run] [--reset-llm] [--full] [--migrate] — update multi-agent installation."""
         dry_run = "--dry-run" in cmd
         reset_llm = "--reset-llm" in cmd
+        full = "--full" in cmd
+        migrate = "--migrate" in cmd
 
         if reset_llm:
             _cprint("  ⚠️  [yellow]--reset-llm: все LLM-настройки будут сброшены к дефолтам[/]")
@@ -8462,7 +8490,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         try:
             from multiagent_updater import run_update
 
-            report = run_update(dry_run=dry_run, reset_llm=reset_llm)
+            report = run_update(
+                dry_run=dry_run, reset_llm=reset_llm, full=full, migrate=migrate,
+            )
             _cprint(report)
         except Exception as e:
             _cprint(f"  [red]Update failed: {e}[/]")
@@ -9091,6 +9121,404 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _active_subagent = None
         else:
             _cprint("  Already in main agent mode")
+
+    def _handle_project(self, cmd: str):
+        """Handle /project — manage Hermes projects.
+
+        Subcommands:
+          /project                  — show current project
+          /project new <name>       — create new project
+          /project list             — list all projects
+          /project switch <id>      — switch active project
+          /project current          — show current project
+          /project rename <old> <new>  — rename project
+          /project delete <id>      — delete project (with confirmation)
+        """
+        from projects.project_context import get_project_context
+        ctx = get_project_context()
+
+        parts = cmd.strip().split(None, 1)
+        if len(parts) < 2:
+            self._project_show_current(ctx)
+            return
+
+        args = parts[1].strip()
+        if not args:
+            self._project_show_current(ctx)
+            return
+
+        # Parse subcommand: first word is the action
+        argv = args.split(None, 1)
+        action = argv[0].lower()
+        rest = argv[1] if len(argv) > 1 else ""
+
+        if action in ("new", "create"):
+            self._project_new(ctx, rest)
+        elif action in ("list", "ls"):
+            self._project_list(ctx, include_archived=("--archived" in rest))
+        elif action in ("switch", "use", "activate"):
+            self._project_switch(ctx, rest)
+        elif action == "current":
+            self._project_show_current(ctx)
+        elif action == "rename":
+            self._project_rename(ctx, rest)
+        elif action in ("delete", "remove", "rm"):
+            self._project_delete(ctx, rest)
+        elif action == "archive":
+            self._project_archive(ctx, rest)
+        elif action == "unarchive":
+            self._project_unarchive(ctx, rest)
+        elif action == "config":
+            self._project_config(ctx, rest)
+        else:
+            # Ambiguous: treat as switch if it looks like a project_id
+            all_projects = ctx.list_projects()
+            match = None
+            for p in all_projects:
+                if p["project_id"] == action or p["name"].lower() == action.lower():
+                    match = p["project_id"]
+                    break
+            if match:
+                self._project_switch(ctx, match)
+            else:
+                _cprint(f"\n  [red]Unknown subcommand:[/] {action}")
+                _cprint("  Usage: /project [new|list|switch|current|rename|delete]")
+                _cprint("  Try /project list to see all projects.")
+
+    def _project_show_current(self, ctx):
+        """Show the currently active project."""
+        current = ctx.get_current_project()
+        if current:
+            _cprint(f"\n  [bold]Active project:[/] {current['name']}")
+            _cprint(f"    ID:          {current['project_id']}")
+            _cprint(f"    Subtree:     {current['subtree_session_id']}")
+            _cprint(f"    ChromaDB:    {current['chroma_collection']}")
+            _cprint(f"    Directory:   {current['project_dir']}")
+            _cprint(f"    Created:     {current.get('created_at', '?')[:19]}")
+            # Prefix
+            try:
+                from projects.project_context import get_response_prefix
+                _pfx = get_response_prefix()
+                _cprint(f"    Prefix:      [bold green]{_pfx}[/]" if _pfx else f"    Prefix:      [dim]отключён[/]")
+            except Exception:
+                pass
+        else:
+            _cprint("\n  [dim]No active project.[/]")
+            _cprint("  Use [bold]/project new <name>[/] to create one.")
+            _cprint(f"  Prefix: [bold blue]⚕ Orchestrator[/]")
+
+    def _project_new(self, ctx, name: str):
+        """Create a new project."""
+        name = name.strip()
+        if not name:
+            _cprint("  [red]Usage:[/] /project new <name>")
+            return
+        try:
+            proj = ctx.create_project(name)
+            _cprint(f"\n  [bold green]✦ Project created[/]")
+            _cprint(f"    Name:        [bold]{proj['name']}[/]")
+            _cprint(f"    ID:          {proj['project_id']}")
+            _cprint(f"    Subtree:     {proj['subtree_session_id']}")
+            _cprint(f"    ChromaDB:    {proj['chroma_collection']}")
+            _cprint(f"    Directory:   {proj['project_dir']}")
+            _cprint(f"\n  [yellow]⟳ Run /reset to apply project context.[/]")
+        except ValueError as e:
+            _cprint(f"  [red]Error:[/] {e}")
+
+    def _project_list(self, ctx, include_archived: bool = False):
+        """List all projects with status indicators. /project list [--archived]."""
+        from projects.project_state import ProjectStateManager
+        psm = ProjectStateManager()
+
+        projects = ctx.manager.list_projects(include_archived=include_archived)
+        if not projects:
+            _cprint("\n  [dim]No projects yet.[/]")
+            _cprint("  Use [bold]/project new <name>[/] to create one.")
+            return
+
+        label = f"Projects ({len(projects)})"
+        if include_archived:
+            label += " [dim][incl. archived][/]"
+        _cprint(f"\n  [bold]{label}:[/]")
+        _cprint("  " + "─" * 50)
+        for p in projects:
+            pid = p["project_id"]
+            state = psm.get_project_state_summary(pid)
+            status_parts = []
+            if state:
+                wf = state.get("paused_workflow_count", 0)
+                ut = state.get("unfinished_tasks", 0)
+                if wf:
+                    status_parts.append(f"[yellow]{wf} paused WF[/]")
+                if ut:
+                    status_parts.append(f"[yellow]{ut} tasks[/]")
+            if p.get("archived"):
+                status_parts.append("[dim]archived[/]")
+            status_str = f"  [dim]({', '.join(status_parts)})[/]" if status_parts else ""
+
+            if p.get("_is_active"):
+                _cprint(f"  [bold green]▶ {p['name']}[/]  [dim]({pid}) ← ACTIVE[/] {status_str}")
+            else:
+                _cprint(f"  [dim]  {p['name']}  ({pid})[/] {status_str}")
+        _cprint("  " + "─" * 50)
+        _cprint(f"  /project list --archived  — показать архивные")
+
+    def _project_switch(self, ctx, target: str):
+        """Switch to a project by ID or name."""
+        target = target.strip()
+        if not target:
+            _cprint("  [red]Usage:[/] /project switch <project_id>")
+            return
+        try:
+            # Try exact ID first
+            proj = ctx.switch_project(target)
+        except ValueError:
+            # Try fuzzy match by name
+            projects = ctx.list_projects()
+            match = None
+            target_lower = target.lower()
+            for p in projects:
+                if p["name"].lower() == target_lower:
+                    match = p["project_id"]
+                    break
+            if not match:
+                # Partial match
+                for p in projects:
+                    if target_lower in p["name"].lower():
+                        match = p["project_id"]
+                        break
+            if match:
+                proj = ctx.switch_project(match)
+            else:
+                _cprint(f"  [red]Project not found:[/] {target}")
+                _cprint("  Use [bold]/project list[/] to see all projects.")
+                return
+        _cprint(f"\n  [bold green]✦ Switched to:[/] [bold]{proj['name']}[/]")
+        _cprint(f"    ID:          {proj['project_id']}")
+        _cprint(f"    Subtree:     {proj['subtree_session_id']}")
+        _cprint(f"    ChromaDB:    {proj['chroma_collection']}")
+        _cprint(f"    Directory:   {proj['project_dir']}")
+        # ── Show new prefix preview ───────────────────────────
+        try:
+            from projects.project_context import get_response_prefix
+            _pfx = get_response_prefix()
+            if _pfx:
+                _cprint(f"    Prefix:      [bold green]{_pfx}[/]  ← все ответы теперь с этим")
+            else:
+                _cprint(f"    Prefix:      [dim]отключён[/]")
+        except Exception:
+            pass
+
+        # ── Show state notifications ────────────────────────
+        notifications = proj.get("_notifications", [])
+        if notifications:
+            _cprint("")
+            for note in notifications:
+                _cprint(f"  [bold cyan]ℹ {note}[/]")
+
+        _cprint(f"\n  [yellow]⟳ Run /reset to apply project context.[/]")
+
+    def _project_rename(self, ctx, args: str):
+        """Rename a project: /project rename <old_name_or_id> <new_name>."""
+        argv = args.strip().split(None, 1)
+        if len(argv) < 2:
+            _cprint("  [red]Usage:[/] /project rename <project_id> <new_name>")
+            return
+        old, new_name = argv[0], argv[1]
+        try:
+            proj = ctx.rename_project(old, new_name)
+            _cprint(f"\n  [bold green]✦ Renamed:[/] {old} → [bold]{new_name}[/]")
+            _cprint(f"    ID (unchanged): {proj['project_id']}")
+        except ValueError as e:
+            _cprint(f"  [red]Error:[/] {e}")
+
+    def _project_delete(self, ctx, target: str):
+        """Delete a project with confirmation."""
+        target = target.strip()
+        if not target:
+            _cprint("  [red]Usage:[/] /project delete <project_id>")
+            return
+
+        # Resolve name → ID
+        proj = ctx.manager.get_project(target)
+        if not proj:
+            # Fuzzy match by name
+            for p in ctx.list_projects():
+                if p["name"].lower() == target.lower():
+                    proj = ctx.manager.get_project(p["project_id"])
+                    target = p["project_id"]
+                    break
+        if not proj:
+            _cprint(f"  [red]Project not found:[/] {target}")
+            return
+
+        _cprint(f"\n  [bold red]⚠ Delete project:[/] {proj['name']} ({proj['project_id']})")
+        _cprint(f"  This removes the metadata record. Files are preserved.")
+        _cprint(f"  [bold]Type the project name to confirm:[/] {proj['name']}")
+
+        # Read confirmation
+        try:
+            from prompt_toolkit.shortcuts import prompt
+            confirmation = prompt("  > ").strip()
+        except Exception:
+            confirmation = input("  > ").strip()
+
+        if confirmation == proj["name"]:
+            try:
+                result = ctx.delete_project_with_confirmation(
+                    target,
+                    force=(proj["project_id"] != ctx.active_project_id),
+                )
+                _cprint(f"  [green]✓ Project '{proj['name']}' deleted.[/]")
+            except ValueError as e:
+                _cprint(f"  [red]Error:[/] {e}")
+                _cprint(f"  Use [bold]/project switch <id>[/] first, then retry.")
+        else:
+            _cprint(f"  [dim]Cancelled — names don't match.[/]")
+
+    def _project_archive(self, ctx, target: str):
+        """Archive a project: /project archive <project_id>."""
+        target = target.strip()
+        if not target:
+            _cprint("  [red]Usage:[/] /project archive <project_id>")
+            return
+        try:
+            proj = ctx.manager.archive_project(target)
+            _cprint(f"\n  [bold yellow]📦 Archived:[/] {proj['name']} ({proj['project_id']})")
+            _cprint(f"  Use [bold]/project unarchive {proj['project_id']}[/] to restore.")
+        except ValueError as e:
+            _cprint(f"  [red]Error:[/] {e}")
+
+    def _project_unarchive(self, ctx, target: str):
+        """Unarchive a project: /project unarchive <project_id>."""
+        target = target.strip()
+        if not target:
+            _cprint("  [red]Usage:[/] /project unarchive <project_id>")
+            return
+        try:
+            proj = ctx.manager.unarchive_project(target)
+            _cprint(f"\n  [bold green]📂 Restored:[/] {proj['name']} ({proj['project_id']})")
+        except ValueError as e:
+            _cprint(f"  [red]Error:[/] {e}")
+
+    def _project_config(self, ctx, rest: str):
+        """Project config: /project config prefix|emoji on|off"""
+        parts = rest.strip().split()
+        if not parts:
+            _cprint("  [bold]Usage:[/] /project config [prefix|emoji] [on|off]")
+            return
+
+        current = ctx.manager.get_current_project()
+        if not current:
+            _cprint("  [red]No active project.[/] Use /project switch first.")
+            return
+
+        pid = current["project_id"]
+        key = parts[0]
+        if key not in ("prefix", "emoji"):
+            _cprint("  [bold]Usage:[/] /project config [prefix|emoji] [on|off]")
+            return
+
+        config_key = "show_project_prefix" if key == "prefix" else "prefix_emoji"
+        label = "Project prefix" if key == "prefix" else "Prefix emoji"
+
+        if len(parts) == 1:
+            enabled = ctx.manager.get_config(pid, config_key, True)
+            status = "[green]ON[/]" if enabled else "[red]OFF[/]"
+            _cprint(f"\n  {label}: {status}")
+            _cprint(f"  /project config {key} on   — включить")
+            _cprint(f"  /project config {key} off  — отключить")
+            if key == "prefix":
+                _cprint(f"  HERMES_NO_PROJECT_PREFIX=1  — глобально отключить")
+            return
+
+        value = parts[1].lower()
+        if value in ("on", "true", "1", "yes"):
+            ctx.manager.set_config(pid, config_key, True)
+            _cprint(f"\n  [bold green]✓[/] {label} [green]ON[/] for [bold]{current['name']}[/]")
+        elif value in ("off", "false", "0", "no"):
+            ctx.manager.set_config(pid, config_key, False)
+            _cprint(f"\n  [bold yellow]✓[/] {label} [red]OFF[/] for [bold]{current['name']}[/]")
+            if key == "emoji":
+                _cprint(f"  Prefix will show as: [bold]{current['name']}[/] (no emoji)")
+        else:
+            _cprint(f"  [red]Unknown:[/] {value}. Use on/off.")
+
+    def _handle_projects(self):
+        """Handle /projects — list all projects (convenience alias)."""
+        from projects.project_context import get_project_context
+        self._project_list(get_project_context())
+
+    def _handle_search(self, cmd: str):
+        """Handle /search <query> [--all] — search across projects."""
+        parts = cmd.strip().split(None, 1)
+        if len(parts) < 2:
+            _cprint("  [red]Usage:[/] /search <query> [--all]")
+            _cprint("  Examples:")
+            _cprint("    /search auth bug        — search current project")
+            _cprint("    /search refactor --all  — search all projects")
+            return
+
+        args = parts[1].strip()
+        scope = "current"
+        if args.endswith(" --all"):
+            scope = "all"
+            args = args[:-6].strip()
+        elif " --all " in args:
+            scope = "all"
+            args = args.replace(" --all ", " ").strip()
+
+        if not args:
+            _cprint("  [red]Query is required.[/]")
+            return
+
+        self._run_search(args, scope)
+
+    def _handle_global(self, cmd: str):
+        """Handle /global search <query> — search all projects."""
+        parts = cmd.strip().split(None, 2)
+        if len(parts) < 3 or parts[1] != "search":
+            _cprint("  [red]Usage:[/] /global search <query>")
+            return
+        self._run_search(parts[2].strip(), "all")
+
+    def _run_search(self, query: str, scope: str):
+        """Execute the search and display results."""
+        from projects.project_search import search_projects
+
+        _cprint(f"\n  [bold]Searching:[/] \"{query}\" [dim](scope: {scope})[/]\n")
+
+        results = search_projects(query, scope=scope, limit=10)
+        if not results:
+            _cprint("  [dim]No results found.[/]\n")
+            return
+
+        # Group by project
+        source_icons = {"ltm": "🧠", "workflows": "⚙", "files": "📄", "chat": "💬"}
+        current_project = None
+        try:
+            from projects.project_context import get_current_project_name
+            current_project = get_current_project_name()
+        except Exception:
+            pass
+
+        last_project = None
+        for r in results:
+            # Project header when switching
+            pid = r["project_id"]
+            if pid != last_project:
+                marker = " [green]◀ current[/]" if r["project_name"] == current_project else ""
+                _cprint(f"  [bold cyan]▸ {r['project_name']}[/] [dim]({pid})[/]{marker}")
+                last_project = pid
+
+            icon = source_icons.get(r["source"], "•")
+            score_bar = "█" * max(1, int(r["score"] * 10))
+            _cprint(f"    {icon} [bold]{r['title']}[/] [dim]{score_bar} {r['score']:.2f}[/]")
+            snippet = r["snippet"].replace("\n", " ")[:120]
+            _cprint(f"      [dim]{snippet}[/]")
+            _cprint("")
+
+        _cprint(f"  [dim]{len(results)} result(s)[/]\n")
 
     def _handle_fast_command(self, cmd: str):
         """Handle /fast — toggle fast mode (OpenAI Priority Processing / Anthropic Fast Mode)."""
@@ -11431,6 +11859,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     _resp_color = _maybe_remap_for_light_mode("#CD7F32")
                     _resp_text = _maybe_remap_for_light_mode("#FFF8DC")
 
+                # ── Project context prefix ──────────────────────────
+                try:
+                    from projects.project_context import (
+                        get_current_project_name,
+                        get_current_project_id,
+                    )
+                    pid = get_current_project_id()
+                    pname = get_current_project_name()
+                    if pid and pname:
+                        label = f"[bold green]📁 {pname}[/]  {label}"
+                    else:
+                        label = f"[bold blue]⚕ Orchestrator[/]  {label}"
+                except Exception:
+                    pass
+
                 is_error_response = result and (result.get("failed") or result.get("partial"))
                 already_streamed = self._stream_started and self._stream_box_opened and not is_error_response
                 if use_streaming_tts and _streaming_box_opened and not is_error_response:
@@ -13689,6 +14132,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             'status-bar-bad': 'bg:#1a1a2e #FF8C00 bold',
             'status-bar-critical': 'bg:#1a1a2e #FF6B6B bold',
             'status-bar-yolo': 'bg:#1a1a2e #FF4444 bold',
+            'status-bar-agent': 'bg:#1a1a2e #87CEEB bold',
+            'status-bar-project': 'bg:#1a1a2e #98FB98 bold',
             # Bronze horizontal rules around the input area
             'input-rule': '#CD7F32',
             # Clipboard image attachment badges

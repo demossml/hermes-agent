@@ -8532,6 +8532,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         display_reasoning = last_reasoning.strip()
                     response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
 
+            # ── Project context prefix (centralized, all gateways) ──
+            try:
+                from gateway.delivery import format_gateway_response_prefix
+                _pfx = format_gateway_response_prefix(
+                    platform=_gateway_platform_value(source.platform),
+                    agent_result=agent_result,
+                )
+                if _pfx:
+                    response = _pfx + response
+            except Exception:
+                pass  # best-effort
+
             # Runtime-metadata footer — only on the FINAL message of the turn.
             # Off by default (display.runtime_footer.enabled=false).  When
             # streaming already delivered the body, we can't mutate the sent

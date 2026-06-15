@@ -86,6 +86,7 @@ class ChatHistoryDB:
                     has_media         BOOLEAN DEFAULT FALSE,
                     timestamp         TIMESTAMP,
                     embedding         FLOAT[],
+                    project_id        TEXT DEFAULT NULL,
                     created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -102,6 +103,10 @@ class ChatHistoryDB:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_sender "
                 "ON group_messages (sender_id, chat_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_project "
+                "ON group_messages (project_id, timestamp)"
             )
 
             logger.debug(
@@ -174,8 +179,8 @@ class ChatHistoryDB:
                    (platform, chat_id, chat_title, message_id,
                     sender_id, sender_name, sender_username,
                     text, has_link, links, reply_to_id,
-                    message_type, has_media, timestamp, embedding)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    message_type, has_media, timestamp, embedding, project_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     message.get("platform", ""),
                     message.get("chat_id", ""),
@@ -192,6 +197,7 @@ class ChatHistoryDB:
                     bool(message.get("has_media", False)),
                     ts,
                     vec,
+                    message.get("project_id"),
                 ],
             )
 
@@ -346,8 +352,8 @@ class ChatHistoryDB:
                    (platform, chat_id, chat_title, message_id,
                     sender_id, sender_name, sender_username,
                     text, has_link, links, reply_to_id,
-                    message_type, has_media, timestamp, embedding)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    message_type, has_media, timestamp, embedding, project_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     message.get("platform", ""),
                     message.get("chat_id", ""),
@@ -364,6 +370,7 @@ class ChatHistoryDB:
                     bool(message.get("has_media", False)),
                     ts,
                     vec,
+                    message.get("project_id"),
                 ],
             )
 

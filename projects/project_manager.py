@@ -1,0 +1,290 @@
+"""
+Project Manager — multi-project isolation for Hermes Agent.
+
+Each project is a fully self-contained directory:
+
+    ~/.hermes/projects/<slug>/
+    ├── metadata.json
+    ├── data/                  (DuckDB + observers)
+    ├── memory/chroma/         (ChromaDB)
+    ├── state/workflows/       (snapshots)
+    └── agents/                (YAML configs)
+"""
+
+from __future__ import annotations
+
+import json, logging, re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+try:
+    import chromadb
+    from chromadb.config import Settings as ChromaSettings
+    HAS_CHROMA = True
+except ImportError:
+    HAS_CHROMA = False; ChromaSettings = None; chromadb = None  # type: ignore
+
+
+def _get_hermes_home() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+        return get_hermes_home()
+    except ImportError:
+        import os
+        return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+
+
+def _slugify(name: str) -> str:
+    slug = name.lower().strip()
+    translit = {"а":"a","б":"b","в":"v","г":"g","д":"d","е":"e","ё":"yo","ж":"zh","з":"z","и":"i","й":"y","к":"k","л":"l","м":"m","н":"n","о":"o","п":"p","р":"r","с":"s","т":"t","у":"u","ф":"f","х":"h","ц":"ts","ч":"ch","ш":"sh","щ":"sch","ъ":"","ы":"y","ь":"","э":"e","ю":"yu","я":"ya"}
+    for cyr, lat in translit.items():
+        slug = slug.replace(cyr, lat)
+    slug = re.sub(r"[^a-z0-9]+", "-", slug)
+    slug = re.sub(r"-{2,}", "-", slug)
+    return slug.strip("-") or "untitled-project"
+
+
+def _ensure_unique_id(base_slug: str, existing_ids: set[str]) -> str:
+    if base_slug not in existing_ids:
+        return base_slug
+    i = 2
+    while f"{base_slug}-{i}" in existing_ids:
+        i += 1
+    return f"{base_slug}-{i}"
+
+
+def _new_metadata(project_id: str, name: str) -> dict[str, Any]:
+    now = datetime.now(timezone.utc).isoformat()
+    return {"project_id": project_id, "name": name,
+            "subtree_session_id": f"project-{project_id}",
+            "chroma_collection": f"project_{project_id}",
+            "created_at": now, "updated_at": now}
+
+
+class ProjectManager:
+    """Manage Hermes projects with isolated memory and sessions."""
+
+    def __init__(self, hermes_home: str | Path | None = None):
+        self._home = Path(hermes_home) if hermes_home else _get_hermes_home()
+        self._projects_dir = self._home / "projects"
+        self._projects_dir.mkdir(parents=True, exist_ok=True)
+        self._current_file = self._projects_dir / ".current_project"
+
+    @property
+    def projects_dir(self) -> Path:
+        return self._projects_dir
+
+    def _project_dir(self, project_id: str) -> Path:
+        return self._projects_dir / project_id
+
+    def _metadata_path(self, project_id: str) -> Path:
+        return self._project_dir(project_id) / "metadata.json"
+
+    def _ensure_subdirs(self, project_id: str) -> None:
+        root = self._project_dir(project_id)
+        for sub in ["data", "memory/chroma", "state/workflows", "agents"]:
+            (root / sub).mkdir(parents=True, exist_ok=True)
+
+    def subdir_data(self, project_id: str) -> Path:
+        return self._project_dir(project_id) / "data"
+
+    def subdir_memory(self, project_id: str) -> Path:
+        return self._project_dir(project_id) / "memory" / "chroma"
+
+    def subdir_state(self, project_id: str) -> Path:
+        return self._project_dir(project_id) / "state"
+
+    def subdir_agents(self, project_id: str) -> Path:
+        return self._project_dir(project_id) / "agents"
+
+    def _read_metadata(self, project_id: str) -> dict[str, Any] | None:
+        path = self._metadata_path(project_id)
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"Failed to read metadata for '{project_id}': {e}")
+            return None
+
+    def _write_metadata(self, project_id: str, meta: dict[str, Any]) -> None:
+        path = self._metadata_path(project_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+
+    def _list_ids(self) -> list[str]:
+        if not self._projects_dir.exists():
+            return []
+        return sorted(d.name for d in self._projects_dir.iterdir()
+                      if d.is_dir() and (d / "metadata.json").exists()
+                      and not d.name.startswith("."))
+
+    def _read_current(self) -> str | None:
+        try:
+            if self._current_file.exists():
+                return self._current_file.read_text(encoding="utf-8").strip() or None
+        except OSError:
+            pass
+        return None
+
+    def _write_current(self, project_id: str) -> None:
+        self._current_file.write_text(project_id + "\n", encoding="utf-8")
+
+    def _ensure_chroma_collection(self, project_id: str) -> bool:
+        if not HAS_CHROMA:
+            return True
+        collection_name = f"project_{project_id}"
+        chroma_dir = self.subdir_memory(project_id)
+        chroma_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            client = chromadb.PersistentClient(path=str(chroma_dir),
+                settings=ChromaSettings(anonymized_telemetry=False))
+            client.get_or_create_collection(name=collection_name,
+                metadata={"hnsw:space": "cosine"})
+            return True
+        except Exception as e:
+            logger.warning(f"ChromaDB init failed for '{project_id}': {e}")
+            return False
+
+    # ── Public API ────────────────────────────────────────────
+
+    def create_project(self, name: str) -> dict[str, Any]:
+        name = name.strip()
+        if not name:
+            raise ValueError("Project name must not be empty")
+        existing = set(self._list_ids())
+        project_id = _ensure_unique_id(_slugify(name), existing)
+        self._ensure_subdirs(project_id)
+        meta = _new_metadata(project_id, name)
+        self._write_metadata(project_id, meta)
+        self._ensure_chroma_collection(project_id)
+        self._write_current(project_id)
+        meta["project_dir"] = str(self._project_dir(project_id))
+        logger.info(f"Project '{name}' created (id={project_id})")
+        return dict(meta)
+
+    def get_project(self, project_id: str) -> dict[str, Any] | None:
+        meta = self._read_metadata(project_id)
+        if meta:
+            meta["project_dir"] = str(self._project_dir(project_id))
+        return meta
+
+    def list_projects(self, include_archived: bool = False) -> list[dict[str, Any]]:
+        items = []
+        for pid in self._list_ids():
+            meta = self._read_metadata(pid)
+            if meta:
+                if not include_archived and meta.get("archived"):
+                    continue
+                meta["project_dir"] = str(self._project_dir(pid))
+                items.append(meta)
+        items.sort(key=lambda p: p.get("created_at", ""), reverse=True)
+        return items
+
+    def get_current_project(self) -> dict[str, Any] | None:
+        current_id = self._read_current()
+        if not current_id:
+            return None
+        return self._read_metadata(current_id)
+
+    def switch_project(self, project_id: str) -> dict[str, Any]:
+        meta = self._read_metadata(project_id)
+        if not meta:
+            available = ", ".join(self._list_ids()) or "(none)"
+            raise ValueError(f"Project '{project_id}' not found. Available: {available}")
+        meta["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self._write_metadata(project_id, meta)
+        self._write_current(project_id)
+        meta["project_dir"] = str(self._project_dir(project_id))
+        logger.info(f"Switched to project '{project_id}'")
+        return dict(meta)
+
+    def delete_project(self, project_id: str) -> bool:
+        meta = self._read_metadata(project_id)
+        if not meta:
+            return False
+        self._metadata_path(project_id).unlink(missing_ok=True)
+        if self._read_current() == project_id:
+            self._write_current("")
+        logger.info(f"Project '{project_id}' deleted")
+        return True
+
+    def rename_project(self, project_id: str, new_name: str) -> dict[str, Any]:
+        new_name = new_name.strip()
+        if not new_name:
+            raise ValueError("New project name must not be empty")
+        meta = self._read_metadata(project_id)
+        if not meta:
+            available = ", ".join(self._list_ids()) or "(none)"
+            raise ValueError(f"Project '{project_id}' not found. Available: {available}")
+        meta["name"] = new_name
+        meta["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self._write_metadata(project_id, meta)
+        meta["project_dir"] = str(self._project_dir(project_id))
+        logger.info(f"Project '{project_id}' renamed to '{new_name}'")
+        return dict(meta)
+
+    def archive_project(self, project_id: str) -> dict[str, Any]:
+        meta = self._read_metadata(project_id)
+        if not meta:
+            available = ", ".join(self._list_ids()) or "(none)"
+            raise ValueError(f"Project '{project_id}' not found. Available: {available}")
+        meta["archived"] = True
+        meta["archived_at"] = datetime.now(timezone.utc).isoformat()
+        meta["updated_at"] = meta["archived_at"]
+        self._write_metadata(project_id, meta)
+        if self._read_current() == project_id:
+            self._write_current("")
+        meta["project_dir"] = str(self._project_dir(project_id))
+        logger.info(f"Project '{project_id}' archived")
+        return dict(meta)
+
+    def unarchive_project(self, project_id: str) -> dict[str, Any]:
+        meta = self._read_metadata(project_id)
+        if not meta:
+            raise ValueError(f"Project '{project_id}' not found.")
+        meta.pop("archived", None)
+        meta.pop("archived_at", None)
+        meta["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self._write_metadata(project_id, meta)
+        meta["project_dir"] = str(self._project_dir(project_id))
+        logger.info(f"Project '{project_id}' unarchived")
+        return dict(meta)
+
+    # ── Per-project config ──────────────────────────────────
+
+    def get_config(self, project_id: str, key: str, default: Any = None) -> Any:
+        """Read a per-project config value from metadata."""
+        meta = self._read_metadata(project_id)
+        if not meta:
+            return default
+        return meta.get("config", {}).get(key, default)
+
+    def set_config(self, project_id: str, key: str, value: Any) -> dict[str, Any]:
+        """Set a per-project config value in metadata."""
+        meta = self._read_metadata(project_id)
+        if not meta:
+            raise ValueError(f"Project '{project_id}' not found.")
+        meta.setdefault("config", {})[key] = value
+        meta["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self._write_metadata(project_id, meta)
+        meta["project_dir"] = str(self._project_dir(project_id))
+        return dict(meta)
+
+    def get_show_project_prefix(self, project_id: str) -> bool:
+        """Check if the project prefix should be shown.
+        
+        Returns True by default (prefix is visible).  
+        Checks per-project config first, then global Hermes env.
+        """
+        import os
+        # Global override: HERMES_NO_PROJECT_PREFIX=1 disables everywhere
+        if os.environ.get("HERMES_NO_PROJECT_PREFIX", "").strip() in ("1", "true", "yes"):
+            return False
+        # Per-project config
+        return self.get_config(project_id, "show_project_prefix", True)

@@ -299,6 +299,37 @@ COMMAND_REGISTRY: list[CommandDef] = [
         args_hint="",
         cli_only=True,
     ),
+    CommandDef(
+        "project",
+        "Manage projects: /project [new|list|switch|current|rename|delete]",
+        "Agents",
+        aliases=("proj",),
+        args_hint="[new|list|switch|current|rename|delete] [args...]",
+        subcommands=("new", "create", "list", "ls", "switch", "use", "activate",
+                     "current", "rename", "delete", "remove", "rm",
+                     "archive", "unarchive", "config"),
+    ),
+    CommandDef(
+        "projects",
+        "List all projects",
+        "Agents",
+        aliases=("projs",),
+        args_hint="",
+    ),
+    CommandDef(
+        "search",
+        "Search across projects: /search <query> [--all]",
+        "Agents",
+        aliases=("find",),
+        args_hint="<query> [--all]",
+    ),
+    CommandDef(
+        "global",
+        "Global commands: /global search <query>",
+        "Agents",
+        args_hint="<search> [args...]",
+        subcommands=("search",),
+    ),
 ]
 
 

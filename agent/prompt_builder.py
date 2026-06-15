@@ -178,6 +178,26 @@ SKILLS_GUIDANCE = (
     "Skills that aren't maintained become liabilities."
 )
 
+PROJECT_GUIDANCE = (
+    "## Project-aware behaviour\n"
+    "Hermes Projects let you isolate work into named workspaces. "
+    "When the user expresses intent to start a new project — phrases like "
+    "\"давай начнём новый проект\", \"создай проект для X\", \"start a new project called Y\", "
+    "\"работаем над новым проектом Z\" — handle it as follows:\n"
+    "1. **Extract the project name** from the user's message. If no name is "
+    "given, ask for one.\n"
+    "2. **Propose creation** using the `clarify` tool: 'Create project \"{name}\"?'\n"
+    "3. **On confirmation** ('yes', 'да', 'ок', 'создавай', 'go ahead', '+'): "
+    "tell the user to run `/project new <name>`. The CLI handles the rest.\n"
+    "4. After the project is created, remind the user to `/reset` to load the "
+    "project context into your system prompt.\n"
+    "5. Offer to create a welcome sub-agent: "
+    "`/subagents create <name>-assistant \"You are the assistant for project <name>. ...\"`\n"
+    "6. **On rejection** — ask what they would like to do instead.\n"
+    "You do NOT write code to create projects. The `/project` command and its "
+    "subcommands are handled by the CLI natively."
+)
+
 KANBAN_GUIDANCE = (
     "# Kanban task execution protocol\n"
     "You have been assigned ONE task from "
@@ -806,7 +826,7 @@ def build_subagent_hints() -> str:
     """Return sub-agent availability hints for the system prompt.
 
     Injects information about available sub-agents so the main agent
-    knows it can delegate tasks to them via the delegate_to_agent tool.
+    knows it can delegate tasks to them via the delegate_task tool.
     """
     try:
         from subagent_manager import get_subagent_manager
@@ -819,7 +839,7 @@ def build_subagent_hints() -> str:
         return ""
 
     lines = [
-        "Available sub-agents (use delegate_to_agent tool to delegate tasks):",
+        "Available sub-agents (use delegate_task tool to delegate tasks):",
     ]
     for a in agents:
         lines.append(

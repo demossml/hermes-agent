@@ -7757,12 +7757,41 @@ def _finalize_update_output(state):
 def _resolve_update_branch(args) -> str:
     """Normalize ``args.branch`` into a non-empty branch name.
 
-    Centralizes the "default to main, accept --branch override, treat empty
-    or whitespace-only values as the default" parsing so every consumer of
-    ``--branch`` (check path, git-update path, ZIP-fallback path) agrees on
-    the same answer.
+    **MULTI-AGENT ENFORCEMENT**: Always updates from ``multi-agent`` branch.
+    ``main`` is blocked.  If the user passes ``--branch main`` explicitly,
+    the update is refused with a clear error.
+
+    Centralizes the ``--branch`` parsing so every consumer (check path,
+    git-update path, ZIP-fallback path) agrees on the same answer.
     """
-    return (getattr(args, "branch", None) or "main").strip() or "main"
+    requested = (getattr(args, "branch", None) or "").strip()
+    if not requested or requested in ("main", "origin/main"):
+        # No explicit branch given, or user tried main — force multi-agent
+        pass  # fall through to multi-agent
+    elif requested != "multi-agent":
+        # User requested a different branch — warn but still force multi-agent
+        print(f"  ⚠ --branch={requested} игнорируется. Обновление только из multi-agent.")
+    return "multi-agent"
+
+
+# Hard block: refuse to proceed if somehow main was resolved
+_MULTI_AGENT_BRANCH = "multi-agent"
+
+
+def _enforce_multiagent_branch(current_branch: str) -> None:
+    """Refuse update if current branch is main."""
+    if current_branch == "main":
+        print("━" * 56)
+        print("⛔ ОБНОВЛЕНИЕ ЗАПРЕЩЕНО")
+        print(f"   Текущая ветка: main")
+        print(f"   Разрешённая ветка: {_MULTI_AGENT_BRANCH}")
+        print()
+        print("   Hermes Multi-Agent обновляется ТОЛЬКО из ветки multi-agent.")
+        print("   Чтобы переключиться:")
+        print(f"     git checkout {_MULTI_AGENT_BRANCH}")
+        print(f"     hermes update")
+        print("━" * 56)
+        sys.exit(1)
 
 
 def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
@@ -8230,6 +8259,56 @@ def _cmd_update_pip(args):
     print("✓ Update complete! Restart hermes to use the new version.")
 
 
+def _run_multiagent_post_update(git_cmd, project_root, args):
+    """Auto-detect multi-agent branch and run config/project migrations.
+
+    Called after a successful ``git pull``.  Checks if the current
+    branch or the updated branch is the multi-agent fork and, if so,
+    runs the multi-agent updater (config migration, project init,
+    DuckDB migration, etc.).
+
+    Also runs when ``--multiagent`` flag is explicitly passed.
+    """
+    force = getattr(args, "multiagent", False) or getattr(args, "migrate", False)
+    try:
+        current_branch_result = subprocess.run(
+            git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=project_root, capture_output=True, text=True,
+        )
+        current_branch = current_branch_result.stdout.strip()
+    except Exception:
+        current_branch = ""
+
+    is_multiagent_branch = "multi-agent" in current_branch.lower()
+
+    if not force and not is_multiagent_branch:
+        return
+
+    print()
+    print("─" * 50)
+    if is_multiagent_branch:
+        print("🔄 Detected multi-agent branch — running config migration...")
+    else:
+        print("🔄 Running multi-agent update (--multiagent flag)...")
+
+    try:
+        from multiagent_updater import run_update, setup_workflow_agents
+        report = run_update(full=True, dry_run=False)
+
+        # Also set up workflow agents
+        wf_report = setup_workflow_agents(dry_run=False)
+        if wf_report.get("created"):
+            print(f"  🔧 Workflow agents created: {', '.join(wf_report['created'])}")
+
+        print(report)
+    except ImportError:
+        print("  ⚠ multiagent_updater not found — skipping multi-agent migration")
+        print("  Run /hermes-update from the CLI after restart.")
+    except Exception as e:
+        print(f"  ⚠ Multi-agent update failed: {e}")
+        print("  Run /hermes-update --full from the CLI after restart.")
+
+
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
@@ -8353,11 +8432,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
     try:
 
         # Resolve the target branch up front so the fetch can be scoped to it.
-        # A bare `git fetch origin` pulls every ref, and this repo carries
-        # thousands of auto-generated branches — an unscoped fetch can stall for
-        # minutes on a non-single-branch checkout. Fetch only what we update
-        # against.
+        # **MULTI-AGENT**: always forces multi-agent branch.
         branch = _resolve_update_branch(args)
+
+        # ── Multi-agent enforcement message ────────────────────
+        print("━" * 56)
+        print("🔄 Hermes Multi-Agent Updater")
+        print(f"   Обновление производится из ветки multi-agent")
+        print(f"   Целевая ветка: origin/{branch}")
+        print("━" * 56)
+        print()
 
         print("→ Fetching updates...")
         fetch_result = subprocess.run(
@@ -8392,6 +8476,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
             check=True,
         )
         current_branch = result.stdout.strip()
+
+        # ── Hard block: refuse update from main ────────────────
+        _enforce_multiagent_branch(current_branch)
 
         # If user is on a different branch than the update target, switch
         # to the target. When the target is "main" this is the historical
@@ -8966,6 +9053,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         print()
         print("✓ Update complete!")
+
+        # ── Multi-Agent post-update hook ────────────────────────
+        # After a successful git pull, auto-detect if we're on the
+        # multi-agent branch and run config migrations + project setup.
+        _run_multiagent_post_update(git_cmd, PROJECT_ROOT, args)
 
         # Curator first-run heads-up. Only prints when curator is enabled AND
         # has never run — i.e. the window where the ticker would otherwise

@@ -1352,22 +1352,46 @@ class AgentRegistry:
         # isolated memory namespace.  Descendants of a sub-agent
         # inherit the parent's subtree_session_id so they share
         # memory with their branch.
+        #
+        # PROJECT ISOLATION: when a project is active, the subtree is
+        # prefixed with "project-{project_id}/" so ALL agents in a
+        # project share one memory namespace and cannot cross project
+        # boundaries.  The orchestrator is NOT project-bound.
+        _project_prefix = ""
+        try:
+            from projects.project_context import get_current_project_id
+            _pid = get_current_project_id()
+            if _pid and parent_id == "orchestrator":
+                _project_prefix = f"project-{_pid}/"
+        except Exception:
+            pass
+
         if "subtree_session_id" in config:
             subtree_session_id = config["subtree_session_id"]
         elif parent_id != "orchestrator" and parent_id in self._agents:
-            # Inherit parent's session — same memory branch
+            # Inherit parent's session — same memory branch (includes project prefix)
             subtree_session_id = self._agents[parent_id].get(
                 "subtree_session_id",
                 f"subtree-{parent_id}-{uuid.uuid4().hex[:8]}",
             )
         else:
-            # Fresh branch under orchestrator
-            subtree_session_id = f"subtree-{agent_id}-{uuid.uuid4().hex[:8]}"
+            # Fresh branch under orchestrator — prefix with project if active
+            subtree_session_id = f"{_project_prefix}subtree-{agent_id}-{uuid.uuid4().hex[:8]}"
 
         # ── Identity ──────────────────────────────────────────────
         config["agent_id"] = agent_id
         config["parent_id"] = parent_id
         config["subtree_session_id"] = subtree_session_id
+
+        # ── Project binding ────────────────────────────────────────
+        # Inject project_id into the agent config so all memory
+        # operations can tag records with the project.
+        if _project_prefix:
+            config["project_id"] = _project_prefix[len("project-"):].rstrip("/")
+            logger.info(
+                f"Agent '{agent_id}' bound to project '{config['project_id']}' "
+                f"(subtree={subtree_session_id})"
+            )
 
         # ── Tools: full-stack clone by default ─────────────────────
         # When full_clone=True (default) and the caller didn't supply
@@ -2327,6 +2351,20 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
             for i, rule in enumerate(rules, 1):
                 prompt += f"{i}. {rule}\n"
             prompt += "\nThese rules persist across sessions. Follow them ALWAYS."
+
+        # ── Project context for sub-agents ─────────────────────
+        # Sub-agents inherit the orchestrator's active project so
+        # they know which subtree_session_id and ChromaDB collection
+        # to use.  Injected as a compact one-liner to keep the
+        # sub-agent prompt lean.
+        try:
+            from projects.project_context import get_project_block_compact
+            _proj_compact = get_project_block_compact()
+            if _proj_compact:
+                prompt += f"\n\n{_proj_compact}"
+        except Exception:
+            pass
+
         return prompt
 
     def _get_agent(self, agent_id: str, cfg: dict, session_id: str = ""):

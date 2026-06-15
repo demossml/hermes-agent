@@ -34,6 +34,7 @@ from agent.prompt_builder import (
     MEMORY_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PLATFORM_HINTS,
+    PROJECT_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     SKILLS_GUIDANCE,
     STEER_CHANNEL_NOTE,
@@ -200,6 +201,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if skills_prompt:
         stable_parts.append(skills_prompt)
 
+    # Project-aware behaviour — tells the agent how to handle
+    # project-creation intent natively (via /project command).
+    # Always present; the guidance is short and behavioural.
+    # ── Context identity banner ──────────────────────────
+    prefix = get_response_prefix()
+    stable_parts.append(f"CONTEXT: {prefix}")
+
     # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
     # of the requested model. Inject explicit model identity into the system prompt
     # so the agent can correctly report which model it is (workaround for API bug).
@@ -226,6 +234,19 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     _subagent_hints = _r.build_subagent_hints()
     if _subagent_hints:
         stable_parts.append(_subagent_hints)
+
+    # Project context — when the user has an active project, inject its
+    # metadata (ID, subtree session, ChromaDB collection, directory) so
+    # the agent knows which project it's operating in.  Stable for the
+    # lifetime of the process (project switches trigger a /reset).
+    try:
+        from projects.project_context import get_project_block, get_response_prefix
+        _proj_block = get_project_block()
+        if _proj_block:
+            stable_parts.append(_proj_block)
+    except Exception:
+        # Projects module may not be loaded — graceful degradation.
+        pass
 
     # Local Python toolchain probe — names python/pip/uv/PEP-668 state when
     # something is non-default so the model can pick the right install
