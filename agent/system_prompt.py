@@ -205,6 +205,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # project-creation intent natively (via /project command).
     # Always present; the guidance is short and behavioural.
     # ── Context identity banner ──────────────────────────
+    try:
+        from projects.project_context import get_response_prefix
+    except Exception:
+        get_response_prefix = lambda: "⚕ Orchestrator"  # type: ignore[no-redef]
     prefix = get_response_prefix()
     stable_parts.append(f"CONTEXT: {prefix}")
 
@@ -240,7 +244,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # the agent knows which project it's operating in.  Stable for the
     # lifetime of the process (project switches trigger a /reset).
     try:
-        from projects.project_context import get_project_block, get_response_prefix
+        from projects.project_context import get_project_block
         _proj_block = get_project_block()
         if _proj_block:
             stable_parts.append(_proj_block)
