@@ -244,6 +244,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         _proj_block = get_project_block()
         if _proj_block:
             stable_parts.append(_proj_block)
+
+        # ── Shared Insights Layer injection ─────────────────
+        try:
+            from projects.project_insights import get_insights_context
+            _ictx = get_insights_context("")
+            if _ictx:
+                stable_parts.append(_ictx)
+        except Exception:
+            pass
     except Exception:
         # Projects module may not be loaded — graceful degradation.
         pass

@@ -7724,6 +7724,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_memory(cmd_original)
         elif canonical == "workflow" or canonical == "workflows":
             self._handle_workflow(cmd_original)
+        elif canonical in ("orchestrate", "code-gen", "codegen"):
+            self._handle_orchestrate_cmd(cmd_original)
+        elif canonical == "approve":
+            self._handle_workflow_action(cmd_original, "approve")
+        elif canonical == "regenerate":
+            self._handle_workflow_action(cmd_original, "regenerate")
+        elif canonical == "edit":
+            self._handle_workflow_action(cmd_original, "edit")
+        elif canonical in ("insight", "insights"):
+            self._handle_insights(cmd_original)
+        elif canonical == "improve":
+            self._handle_improve(cmd_original)
         elif canonical == "agent-off":
             self._handle_agent_off()
         elif canonical in ("project", "proj"):
@@ -9112,6 +9124,253 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _cprint("    /subagents tools translator")
             _cprint("    /subagents tools translator set file,search")
             _cprint("    /subagents delete translator")
+
+    def _handle_orchestrate_cmd(self, cmd: str):
+        """Start a code generation workflow: /orchestrate <task> [--prompt]"""
+        parts = cmd.split(None, 1)
+        rest = parts[1] if len(parts) > 1 else ""
+        if not rest.strip():
+            _cprint("  [bold]Usage:[/] /orchestrate <task description> [--prompt]")
+            _cprint("  Example: /orchestrate \"Write a REST API in Python\"")
+            _cprint("           /orchestrate --prompt \"Design a database schema\"")
+            return
+
+        use_pe = None  # auto-detect
+        task = rest
+        team = "full"
+
+        # Parse flags
+        if rest.startswith("--prompt "):
+            use_pe = True
+            rest = rest[len("--prompt "):]
+        elif rest.startswith("--no-prompt "):
+            use_pe = False
+            rest = rest[len("--no-prompt "):]
+
+        for tflag in ("--team basic ", "--team full ", "--team advanced "):
+            if rest.startswith(tflag):
+                team = tflag.split()[1]
+                rest = rest[len(tflag):]
+                break
+
+        task = rest
+        if not task.strip():
+            _cprint("  [bold]Usage:[/] /orchestrate <task> [--prompt] [--team basic|full|advanced]")
+            _cprint("  Teams: basic (coder+tester), full (+prompt), advanced (+optimizer)")
+            return
+
+        _cprint(f"\n  [bold]⚡ Starting Code Workflow [{team.upper()}]</bold>")
+        _cprint(f"  Task: {task[:80]}{'...' if len(task) > 80 else ''}")
+        _cprint(f"  Prompt Engineer: {'[green]ON[/]' if use_pe else '[dim]AUTO[/]' if use_pe is None else '[dim]OFF[/]'}")
+
+        try:
+            from code_workflow import CodeGenerationWorkflow, orchestrate
+            from code_workflow.tracker import render_live_status
+
+            wf = orchestrate(task, team=team, use_prompt_engineer=use_pe)
+
+            def _on_stage(result):
+                from code_workflow.tracker import render_live_status
+                _cprint(render_live_status(wf))
+                _cprint("")
+
+            wf.on_stage(_on_stage)
+
+            # Run in background
+            import threading
+            def _run():
+                try:
+                    final = wf.run()
+                    _cprint(render_live_status(wf))
+                    if final.status == "completed":
+                        _cprint(f"\n  [bold green]✅ Complete![/] Best score: {final.best_score:.1f}/10")
+                        if final.best_code:
+                            _cprint(f"  Output: {wf.save_dir}/latest.py")
+                            _cprint(f"         {wf.save_dir}/final.py")
+                        # Auto-trigger improvement analysis
+                        try:
+                            from projects.self_improve import analyze_and_propose
+                            _report = analyze_and_propose(final)
+                            if _report and _report.proposals:
+                                _cprint(f"\n  [bold]💡 {len(_report.proposals)} improvement proposal(s) ready[/]")
+                                _cprint(f"  Run [bold]/improve[/] to review and apply.")
+                        except Exception:
+                            pass
+                except Exception as e:
+                    _cprint(f"\n  [red]✗ Workflow failed: {e}[/]")
+
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            _cprint(f"\n  [dim]Workflow {wf.state.task_id} started.[/]")
+            _cprint(f"  [dim]/workflow status — check progress[/]")
+            _cprint(f"  [dim]/approve | /edit | /regenerate | /stop[/]")
+
+        except ImportError:
+            _cprint("  [red]Code workflow module not available.[/]")
+
+    def _handle_workflow_action(self, cmd: str, action: str):
+        """Handle /approve, /edit, /regenerate, /stop commands."""
+        from code_workflow import get_active_workflow
+
+        wf = get_active_workflow()
+        if not wf:
+            _cprint("  [dim]No active workflow.[/]")
+            _cprint("  Use /orchestrate <task> to start one.")
+            return
+
+        if action == "approve":
+            wf.approve()
+            _cprint("\n  [bold green]✓ Approved![/] Workflow finishing current iteration...")
+
+        elif action == "regenerate":
+            wf.regenerate()
+            _cprint("\n  [bold yellow]↻ Regenerating[/] current stage...")
+
+        elif action == "edit":
+            parts = cmd.split(None, 1)
+            instruction = parts[1] if len(parts) > 1 else ""
+            if not instruction.strip():
+                _cprint("  [bold]Usage:[/] /edit <new instruction>")
+                return
+            wf.edit_prompt(instruction.strip())
+            _cprint(f"\n  [bold yellow]✎ Edit applied:[/] {instruction[:80]}")
+
+        elif action == "stop":
+            wf.stop()
+            _cprint("\n  [bold red]⏹ Workflow stopped.[/]")
+            _cprint(f"  Best code saved: {wf.save_dir}/latest.py" if wf.state.best_code else "  No code generated yet.")
+
+    def _handle_insights(self, cmd: str):
+        """/insight add "text"  — add insight to project memory
+           /insights [query]   — list or search insights
+        """
+        from projects.project_insights import (
+            get_project_insights, add_insight, search_insights,
+        )
+
+        parts = cmd.split(None, 2)
+        action = parts[1] if len(parts) > 1 else "list"
+
+        if action == "add":
+            text = parts[2] if len(parts) > 2 else ""
+            if not text.strip():
+                _cprint("  [bold]Usage:[/] /insight add \"key insight or lesson learned\"")
+                return
+            iid = add_insight(text.strip('"').strip("'"), importance=7)
+            if iid:
+                _cprint(f"\n  [bold green]✓ Insight added:[/] {text[:80]}")
+                _cprint(f"  ID: {iid}")
+            else:
+                _cprint("  [red]Failed to add insight.[/] No active project?")
+        else:
+            query = parts[1] if len(parts) > 1 else ""
+            pi = get_project_insights()
+            if not pi:
+                _cprint("  [red]No active project.[/] Switch to a project first.")
+                return
+
+            if query and query != "list":
+                results = search_insights(query, limit=8)
+            else:
+                results = pi.list_all(limit=20)
+
+            stats = pi.stats()
+            _cprint(f"\n  [bold]🧠 Project Insights ({stats['total']} total)[/]")
+            _cprint(f"  Avg importance: {stats.get('avg_importance', 0):.1f}/10")
+            if stats.get("top_tags"):
+                tags = ", ".join(f"[dim]{t}[/]" for t, _ in stats["top_tags"])
+                _cprint(f"  Tags: {tags}")
+
+            if results:
+                _cprint(f"\n  {'─' * 50}")
+                for ins in results[:10]:
+                    stars = "★" * min(ins.importance, 5) + "☆" * max(5 - ins.importance, 0)
+                    src = f"[dim]({ins.source})[/]" if ins.source else ""
+                    _cprint(f"  [{stars}] {ins.text[:100]} {src}")
+                _cprint(f"  {'─' * 50}")
+            else:
+                _cprint(f"\n  [dim]No insights yet.[/]")
+                _cprint(f"  Use [bold]/insight add \"...\"[/] to save knowledge.")
+
+            _cprint(f"\n  /insight add \"text\"  — добавить знание")
+            _cprint(f"  /insights <query>    — поиск по инсайтам")
+
+    def _handle_improve(self, cmd: str):
+        """/improve [apply <id>|history] — self-improvement analysis."""
+        from projects.self_improve import (
+            SelfImprover, force_improve_analysis, analyze_and_propose,
+        )
+        from projects.project_context import get_current_project_id
+        from code_workflow import get_active_workflow
+
+        pid = get_current_project_id()
+        if not pid:
+            _cprint("  [red]No active project.[/]")
+            return
+
+        parts = cmd.split(None, 2)
+        action = parts[1] if len(parts) > 1 else "analyze"
+        si = SelfImprover(pid)
+
+        if action == "history":
+            items = si.list_improvements(limit=10)
+            if items:
+                _cprint(f"\n  [bold]📈 Improvement History[/]")
+                for item in items:
+                    src = item.get("source_file", "?")
+                    when = item.get("updated_at", "?")[:19]
+                    val = str(item.get("value", ""))[:80]
+                    _cprint(f"  [dim]{when}[/] {src}: {val}")
+            else:
+                _cprint("  [dim]No improvements applied yet.[/]")
+            return
+
+        if action == "apply":
+            prop_id = parts[2] if len(parts) > 2 else ""
+            pending = si.list_pending_proposals()
+            for p in pending:
+                if p.id == prop_id:
+                    si.apply(p)
+                    _cprint(f"\n  [bold green]✓ Applied:[/] {p.title}")
+                    return
+            _cprint(f"  [red]Proposal '{prop_id}' not found.[/]")
+            _cprint(f"  Use /improve to see pending proposals.")
+            return
+
+        # ── Run analysis ──────────────────────────────────
+        _cprint(f"\n  [bold]🔍 Self-Improvement Analysis[/]")
+        _cprint(f"  Project: {pid}")
+
+        # Try live workflow first
+        wf = get_active_workflow()
+        report = None
+        if wf and wf.state.status == "completed":
+            _cprint(f"  Source: completed workflow ({wf.state.best_score:.0f}/10)")
+            report = analyze_and_propose(wf.state)
+        else:
+            _cprint(f"  Source: historical data")
+            report = force_improve_analysis()
+
+        if not report or not report.proposals:
+            _cprint(f"\n  [dim]No improvement proposals found.[/]")
+            _cprint(f"  Complete a workflow first: /orchestrate \"task\"")
+            return
+
+        # Show proposals
+        _cprint(f"\n  [bold]💡 {len(report.proposals)} Proposal(s)[/]")
+        _cprint(f"  {'─' * 50}")
+        for i, p in enumerate(report.proposals):
+            _cprint(f"  {p.summary()}")
+            _cprint(f"    {p.description[:100]}")
+            if p.after:
+                _cprint(f"    → [bold]{p.after[:100]}[/]")
+            _cprint(f"    /improve apply {p.id}  — применить")
+            _cprint("")
+
+        if report.lessons_learned:
+            _cprint(f"  [bold]📝 Lessons learned ({len(report.lessons_learned)}):[/]")
+            for ll in report.lessons_learned[:5]:
+                _cprint(f"    • {ll[:100]}")
 
     def _handle_agent_off(self):
         """Return to main agent from sub-agent mode."""
