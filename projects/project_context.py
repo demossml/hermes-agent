@@ -47,6 +47,56 @@ _current_project_loaded_at: float = 0.0
 # Re-read from disk at most once per 2 seconds (cross-process sync)
 _CURRENT_PROJECT_CACHE_TTL = 2.0
 
+# Hot-switch flag — set when project changes mid-session.
+# Checked by the conversation loop to rebuild the system prompt CONTEXT line.
+_project_just_switched: bool = False
+_switch_new_prefix: str = ""
+
+
+def notify_project_switched(new_prefix: str) -> None:
+    """Signal that the project changed — conversation loop must rebuild CONTEXT."""
+    global _project_just_switched, _switch_new_prefix
+    _project_just_switched = True
+    _switch_new_prefix = new_prefix
+
+
+def check_and_apply_project_switch(agent) -> bool:
+    """If a project switch happened, patch agent's system prompt CONTEXT line.
+
+    Called by ``_restore_or_build_system_prompt`` at the start of every turn.
+    Returns True if the prompt was modified.
+    """
+    global _project_just_switched, _switch_new_prefix
+    if not _project_just_switched:
+        return False
+
+    _project_just_switched = False
+    new_prefix = _switch_new_prefix
+    _switch_new_prefix = ""
+
+    # Patch CONTEXT line in cached system prompt
+    cached = getattr(agent, '_cached_system_prompt', '') or ''
+    import re
+    new_context = f"CONTEXT: {new_prefix}"
+
+    if 'CONTEXT:' in cached:
+        cached = re.sub(r'CONTEXT:.*', new_context, cached)
+    else:
+        cached = cached + '\n' + new_context if cached else new_context
+
+    agent._cached_system_prompt = cached
+
+    # Persist to SessionDB so future turns see the new CONTEXT
+    try:
+        db = getattr(agent, '_session_db', None)
+        sid = getattr(agent, 'session_id', None)
+        if db and sid:
+            db.update_system_prompt(sid, cached)
+    except Exception:
+        pass
+
+    return True
+
 
 def _lazy_load_current_project() -> None:
     """Load current project from disk, with short TTL for cross-process sync.
@@ -249,6 +299,9 @@ class ProjectContextMiddleware:
         _current_project_id = proj["project_id"]
         _current_project_name = proj["name"]
 
+        # ── Hot-switch: notify conversation loop ─────────────
+        notify_project_switched(get_response_prefix())
+
         # ── Phase 3: Restore new project's state ─────────────
         try:
             from projects.project_state import restore_project_and_notify
@@ -282,6 +335,10 @@ class ProjectContextMiddleware:
         proj = self._pm.create_project(name)
         _current_project_id = proj["project_id"]
         _current_project_name = proj["name"]
+
+        # ── Hot-switch: notify conversation loop ─────────────
+        notify_project_switched(get_response_prefix())
+
         return dict(proj)
 
     def list_projects(self) -> list[dict[str, Any]]:

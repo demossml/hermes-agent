@@ -304,6 +304,13 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         # Continuing session — reuse the exact system prompt from the
         # previous turn so the Anthropic cache prefix matches.
         agent._cached_system_prompt = stored_prompt
+
+        # ── Hot project switch: patch CONTEXT if project changed ──
+        try:
+            from projects.project_context import check_and_apply_project_switch
+            check_and_apply_project_switch(agent)
+        except Exception:
+            pass
         return
 
     if conversation_history and stored_state in ("null", "empty"):
