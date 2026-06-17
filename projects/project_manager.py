@@ -85,8 +85,80 @@ class ProjectManager:
 
     def _ensure_subdirs(self, project_id: str) -> None:
         root = self._project_dir(project_id)
-        for sub in ["data", "memory/chroma", "state/workflows", "agents"]:
+        for sub in ["data", "memory/chroma", "state/workflows", "agents", "code"]:
             (root / sub).mkdir(parents=True, exist_ok=True)
+
+    def ensure_project_structure(self, project_id: str, name: str | None = None) -> dict[str, Any]:
+        """Ensure a project has complete structure — idempotent, safe to re-run.
+
+        Creates or repairs:
+        - ``metadata.json`` — project identity (id, name, subtree, chroma, timestamps)
+        - ``project.yaml`` — project configuration (prefix, emoji, auto_save, etc.)
+        - All subdirectories (data/, memory/chroma/, state/workflows/, agents/, code/)
+
+        Returns the complete metadata dict.  Never overwrites existing
+        user-configured values in project.yaml.
+        """
+        import yaml
+
+        root = self._project_dir(project_id)
+        self._ensure_subdirs(project_id)
+
+        # ── metadata.json ──────────────────────────────────
+        meta_path = root / "metadata.json"
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                meta = {}
+        else:
+            meta = {}
+
+        # Fill in missing metadata fields
+        display_name = name or meta.get("name") or project_id
+        now = datetime.now(timezone.utc).isoformat()
+        meta.setdefault("project_id", project_id)
+        meta.setdefault("name", display_name)
+        meta.setdefault("subtree_session_id", f"project-{project_id}")
+        meta.setdefault("chroma_collection", f"project_{project_id}")
+        if "created_at" not in meta:
+            meta["created_at"] = now
+        meta["updated_at"] = now
+
+        meta_path.write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        # ── project.yaml ───────────────────────────────────
+        yaml_path = root / "project.yaml"
+        if yaml_path.exists():
+            try:
+                with open(yaml_path) as f:
+                    config = yaml.safe_load(f) or {}
+            except Exception:
+                config = {}
+        else:
+            config = {}
+
+        # Defaults — never overwrite existing values
+        config.setdefault("show_project_prefix", True)
+        config.setdefault("prefix_emoji", True)
+        config.setdefault("auto_save_code", True)
+        config.setdefault("auto_save_state", True)
+        config.setdefault("default_language", "python")
+        config.setdefault("description", f"Project: {display_name}")
+
+        with open(yaml_path, "w") as f:
+            yaml.dump(config, f, allow_unicode=True, default_flow_style=False)
+
+        logger.info(
+            f"Project '{project_id}' structure ensured "
+            f"(metadata={'repaired' if not meta_path.exists() else 'ok'}, "
+            f"yaml={'created' if not yaml_path.exists() else 'ok'})"
+        )
+
+        return meta
 
     def subdir_data(self, project_id: str) -> Path:
         return self._project_dir(project_id) / "data"
@@ -159,9 +231,7 @@ class ProjectManager:
             raise ValueError("Project name must not be empty")
         existing = set(self._list_ids())
         project_id = _ensure_unique_id(_slugify(name), existing)
-        self._ensure_subdirs(project_id)
-        meta = _new_metadata(project_id, name)
-        self._write_metadata(project_id, meta)
+        meta = self.ensure_project_structure(project_id, name=name)
         self._ensure_chroma_collection(project_id)
         self._write_current(project_id)
         meta["project_dir"] = str(self._project_dir(project_id))

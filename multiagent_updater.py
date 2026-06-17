@@ -205,29 +205,18 @@ def init_projects_system(dry_run: bool = False) -> dict[str, Any]:
         report["_dry_run"] = True
         return report
 
-    # ── Step 1: old projects.json → metadata.json per project ─
+    # ── Step 1: old projects.json → full project structure ──
     old_json = projects_dir / "projects.json"
     if old_json.exists():
         try:
+            from projects.project_manager import ProjectManager
+            pm = ProjectManager()
             old_data = json.loads(old_json.read_text())
             for pid, meta in old_data.items():
                 if pid in existing:
                     continue
-                proj_dir = projects_dir / pid
-                proj_dir.mkdir(parents=True, exist_ok=True)
-                for sub in ["data", "memory/chroma", "state/workflows", "agents"]:
-                    (proj_dir / sub).mkdir(parents=True, exist_ok=True)
-                new_meta = {
-                    "project_id": pid,
-                    "name": meta.get("name", pid),
-                    "subtree_session_id": meta.get("subtree_session_id", f"project-{pid}"),
-                    "chroma_collection": meta.get("chroma_collection", f"project_{pid}"),
-                    "created_at": meta.get("created_at", datetime.now().isoformat()),
-                    "updated_at": meta.get("updated_at", datetime.now().isoformat()),
-                }
-                (proj_dir / "metadata.json").write_text(
-                    json.dumps(new_meta, indent=2, ensure_ascii=False), encoding="utf-8",
-                )
+                name = meta.get("name", pid)
+                pm.ensure_project_structure(pid, name=name)
                 report["migrated_from_json"] += 1
                 existing.add(pid)
             old_json.rename(old_json.with_name("projects.json.migrated"))
@@ -244,20 +233,9 @@ def init_projects_system(dry_run: bool = False) -> dict[str, Any]:
             if clone_name in existing or clone_name.startswith("."):
                 continue
             try:
-                proj_dir = projects_dir / clone_name
-                proj_dir.mkdir(parents=True, exist_ok=True)
-                for sub in ["data", "memory/chroma", "state/workflows", "agents"]:
-                    (proj_dir / sub).mkdir(parents=True, exist_ok=True)
-                meta = {
-                    "project_id": clone_name, "name": clone_name,
-                    "subtree_session_id": f"project-{clone_name}",
-                    "chroma_collection": f"project_{clone_name}",
-                    "created_at": datetime.now().isoformat(),
-                    "updated_at": datetime.now().isoformat(),
-                }
-                (proj_dir / "metadata.json").write_text(
-                    json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8",
-                )
+                pm_local = ProjectManager()
+                pm_local.ensure_project_structure(clone_name, name=clone_name)
+                proj_dir = pm_local._project_dir(clone_name)
                 # DuckDB
                 src_db = profile_dir / "data" / "evotor.duckdb"
                 if src_db.exists():
@@ -309,27 +287,52 @@ def init_projects_system(dry_run: bool = False) -> dict[str, Any]:
 
 
 def migrate_existing_projects(dry_run: bool = False) -> dict[str, Any]:
-    """Обеспечить что все проекты имеют полную структуру директорий."""
-    home = Path.home() / ".hermes"
-    projects_dir = home / "projects"
-    report: dict[str, Any] = {"fixed": 0, "ok": 0}
-    if dry_run or not projects_dir.exists():
-        return report
-    for d in projects_dir.iterdir():
-        if not d.is_dir() or d.name.startswith("."):
-            continue
-        if not (d / "metadata.json").exists():
-            continue
-        fixed = False
-        for sub in ["data", "memory/chroma", "state/workflows", "agents"]:
-            sp = d / sub
-            if not sp.exists():
-                sp.mkdir(parents=True, exist_ok=True)
-                fixed = True
-        if fixed:
-            report["fixed"] += 1
-        else:
-            report["ok"] += 1
+    """Ensure ALL existing projects have complete structure.
+
+    Calls ``ProjectManager.ensure_project_structure()`` which
+    idempotently creates metadata.json + project.yaml + all subdirs.
+    Safe to run on already-structured projects — never overwrites
+    existing user config.
+    """
+    from projects.project_manager import ProjectManager
+
+    pm = ProjectManager()
+    report: dict[str, Any] = {
+        "scanned": 0, "repaired": 0, "ok": 0, "details": [],
+    }
+
+    for pid in pm._list_ids():
+        report["scanned"] += 1
+        try:
+            before_meta = (pm._project_dir(pid) / "metadata.json").exists()
+            before_yaml = (pm._project_dir(pid) / "project.yaml").exists()
+
+            if dry_run:
+                report["details"].append(
+                    f"[DRY-RUN] {pid}: metadata={'✓' if before_meta else '✗'}, "
+                    f"yaml={'✓' if before_yaml else '✗'}"
+                )
+                if not before_meta or not before_yaml:
+                    report["repaired"] += 1
+                else:
+                    report["ok"] += 1
+                continue
+
+            pm.ensure_project_structure(pid)
+            after_meta = (pm._project_dir(pid) / "metadata.json").exists()
+            after_yaml = (pm._project_dir(pid) / "project.yaml").exists()
+
+            if (not before_meta and after_meta) or (not before_yaml and after_yaml):
+                report["repaired"] += 1
+                report["details"].append(
+                    f"Repaired {pid}: metadata={'created' if not before_meta else 'ok'}, "
+                    f"yaml={'created' if not before_yaml else 'ok'}"
+                )
+            else:
+                report["ok"] += 1
+        except Exception as e:
+            report["details"].append(f"ERROR {pid}: {e}")
+
     return report
 
 

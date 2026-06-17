@@ -352,14 +352,49 @@ cd ~/.hermes/hermes-agent
 git pull origin multi-agent
 pip install -e .
 
-# Enable multi-agent toolsets (auto-propagates to all agents)
-hermes tools enable delegation messaging
-
-# Apply migrations to existing configs
-hermes update
+# Apply all migrations (agents, projects, configs, SOUL.md)
+hermes update --full
 ```
 
-After the update, all existing agents automatically receive the new toolsets. New agents are created as full clones by default.
+After the update, all existing agents and projects are automatically upgraded:
+- Agents get activity prefix, project binding, code workflow, shared insights
+- Projects get `metadata.json` + `project.yaml` + all subdirectories (auto-created if missing)
+- SOUL.md updated to v2 with multi-agent rules
+
+**What `hermes update --full` does:**
+1. Backs up current installation
+2. Updates core files
+3. Migrates old `projects.json` → per-project `metadata.json`
+4. Ensures all projects have complete structure (`metadata.json` + `project.yaml`)
+5. Upgrades agent configs with latest migration (v20260617)
+6. Updates SOUL.md globally and per-project
+
+### Creating Projects
+
+Projects are fully self-contained directories under `~/.hermes/projects/<slug>/`.
+**You never need to manually create any files** — the system handles everything:
+
+```bash
+/project new my-app        # creates full structure automatically
+/project switch my-app     # instant switch, no /reset needed
+/project list              # show all projects
+```
+
+Each project automatically gets:
+
+```
+~/.hermes/projects/my-app/
+├── metadata.json          ← identity (id, name, subtree, chroma, timestamps)
+├── project.yaml           ← config (prefix, emoji, auto_save, language)
+├── SOUL.md                ← project rules and personality
+├── code/                  ← all generated code
+├── state/                 ← workflow results, reports, snapshots
+├── agents/                ← project-bound sub-agent configs
+├── data/                  ← DuckDB + observer_groups
+└── memory/chroma/         ← vector memory
+```
+
+All files are created automatically — no manual setup required.
 
 ### Install @mention Hook (optional)
 
