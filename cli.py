@@ -9630,6 +9630,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._project_unarchive(ctx, rest)
         elif action == "config":
             self._project_config(ctx, rest)
+        elif action == "show":
+            self._project_show_artifacts(ctx, rest)
+        elif action == "open":
+            self._project_open_last(ctx, rest)
         else:
             # Ambiguous: treat as switch if it looks like a project_id
             all_projects = ctx.list_projects()
@@ -9773,6 +9777,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         _cprint(f"    Directory:   {proj['project_dir']}")
         _cprint(f"    ⚡ Prefix updated instantly — all future messages will use it.")
 
+        # ── Show recent project artifacts ────────────────────
+        try:
+            from projects.project_artifacts import format_recent_files_report
+            recent = format_recent_files_report(proj["project_id"], limit=3)
+            if "No files" not in recent:
+                _cprint(f"\n{recent}")
+        except Exception:
+            pass
+
         # ── Show state notifications ────────────────────────
         notifications = proj.get("_notifications", [])
         if notifications:
@@ -9910,6 +9923,51 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         """Handle /projects — list all projects (convenience alias)."""
         from projects.project_context import get_project_context
         self._project_list(get_project_context())
+
+    def _project_show_artifacts(self, ctx, rest: str):
+        """/project show [recent_code] — show project artifacts."""
+        from projects.project_context import get_current_project_id
+        pid = get_current_project_id()
+        if not pid:
+            _cprint("  [red]No active project.[/] Use /project switch first.")
+            return
+
+        from projects.project_artifacts import format_recent_files_report
+        report = format_recent_files_report(pid)
+        _cprint(report)
+
+    def _project_open_last(self, ctx, rest: str):
+        """/project open [last_file] — open the most recent project file."""
+        from projects.project_context import get_current_project_id
+        pid = get_current_project_id()
+        if not pid:
+            _cprint("  [red]No active project.[/] Use /project switch first.")
+            return
+
+        from projects.project_artifacts import get_last_file, get_recent_files
+        target = rest.strip().lower()
+
+        # Determine file type
+        ftype = "code"
+        if target in ("state", "report", "workflow"):
+            ftype = "state"
+
+        path = get_last_file(pid, file_type=ftype)
+        if not path:
+            _cprint(f"  [dim]No {ftype} files in project yet.[/]")
+            return
+
+        _cprint(f"  📂 Opening: {path}")
+        try:
+            content = path.read_text(encoding="utf-8")
+            # Show first 40 lines
+            lines = content.split("\n")[:40]
+            for line in lines:
+                _cprint(f"  {line[:120]}")
+            if len(content.split("\n")) > 40:
+                _cprint(f"  [dim]... ({len(content.splitlines())} lines total)[/]")
+        except Exception as e:
+            _cprint(f"  [red]Failed to read: {e}[/]")
 
     def _handle_search(self, cmd: str):
         """Handle /search <query> [--all] — search across projects."""

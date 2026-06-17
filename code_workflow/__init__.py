@@ -336,7 +336,9 @@ class CodeGenerationWorkflow:
             from projects.project_context import get_current_project_id
             pid = get_current_project_id()
             if pid:
-                return Path.home() / ".hermes" / "projects" / pid / "code"
+                from projects.project_artifacts import get_project_artifact_dirs
+                code_dir, _ = get_project_artifact_dirs(pid)
+                return code_dir
         except Exception:
             pass
         return Path.home() / ".hermes" / "code_output"
