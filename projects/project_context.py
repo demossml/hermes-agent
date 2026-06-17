@@ -42,15 +42,67 @@ logger = logging.getLogger(__name__)
 
 _current_project_id: str | None = None
 _current_project_name: str | None = None
+_current_project_loaded_at: float = 0.0
+
+# Re-read from disk at most once per 2 seconds (cross-process sync)
+_CURRENT_PROJECT_CACHE_TTL = 2.0
+
+
+def _lazy_load_current_project() -> None:
+    """Load current project from disk, with short TTL for cross-process sync.
+
+    The gateway process never calls switch_project() — it relies on
+    the ``.current_project`` file written by the CLI process.
+
+    Cache TTL of 2s prevents excessive disk reads while still picking
+    up project switches within a single conversation turn.
+    """
+    global _current_project_id, _current_project_name, _current_project_loaded_at
+
+    import time
+    now = time.time()
+
+    # Short TTL: re-read even if already loaded (cross-process sync)
+    if _current_project_id is not None and (now - _current_project_loaded_at) < _CURRENT_PROJECT_CACHE_TTL:
+        return
+
+    _current_project_loaded_at = now
+
+    try:
+        from pathlib import Path
+        from projects.project_manager import ProjectManager
+        pm = ProjectManager()
+        pid = pm._read_current()
+        if pid and pid.strip():
+            meta = pm._read_metadata(pid)
+            if meta:
+                _current_project_id = meta.get("project_id", pid)
+                _current_project_name = meta.get("name", pid)
+                return
+        # No current project
+        _current_project_id = None
+        _current_project_name = None
+    except Exception:
+        pass
 
 
 def get_current_project_id() -> str | None:
-    """Return the active project_id, or None if no project is set."""
+    """Return the active project_id, or None if no project is set.
+
+    Falls back to reading ``.current_project`` from disk when the
+    in-memory global hasn't been set (cross-process: CLI → gateway).
+    """
+    _lazy_load_current_project()
     return _current_project_id
 
 
 def get_current_project_name() -> str | None:
-    """Return the active project name, or None if no project is set."""
+    """Return the active project name, or None if no project is set.
+
+    Falls back to reading ``.current_project`` from disk when the
+    in-memory global hasn't been set (cross-process: CLI → gateway).
+    """
+    _lazy_load_current_project()
     return _current_project_name
 
 

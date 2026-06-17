@@ -443,78 +443,79 @@ _PLATFORM_BOLD: dict[str, tuple[str, str]] = {
     "whatsapp": ("*", "*"),
 }
 
-# Emoji glyphs — set by per-project config key "prefix_emoji"
-_PREFIX_EMOJI_PROJECT = "📁"
-_PREFIX_EMOJI_ORCHESTRATOR = "⚕"
-
 
 def format_gateway_response_prefix(
     platform: str,
     agent_result: dict | None = None,
 ) -> str:
-    """Return a compact context prefix for gateway response delivery.
+    """Return a bold activity prefix for gateway response delivery.
 
     Centralised — every platform goes through this function.
+    Delegates to ``core.response_formatter.get_activity_prefix()``.
 
-    Format (per-platform bold applied):
-        ``**📁 Project: Name**\\n\\n``
-        ``**📁 Project: Name · agent**\\n\\n``
-        ``**⚕ Orchestrator**\\n\\n``
-        ``**⚕ Orchestrator · agent**\\n\\n``
+    Format (per-platform bold, trailing arrow):
+        ``**[⚕ Orchestrator] →**\\n\\n``
+        ``**[Project: WorkApp] • [Agent: coder] →**\\n\\n``
 
-    Prefix is ALWAYS followed by a blank line (``\\n\\n``) to prevent
-    markdown interference with code blocks, tables, and headers.
+    Returns ``""`` when ``HERMES_NO_ACTIVITY_PREFIX=1``.
     """
-    try:
-        from projects.project_context import (
-            get_current_project_name, get_current_project_id,
-        )
-        pid = get_current_project_id()
-        pname = get_current_project_name()
-    except Exception:
-        pid, pname = None, None
+    from core.response_formatter import get_activity_prefix
 
-    # ── Global override ────────────────────────────────────
-    import os
-    if os.environ.get("HERMES_NO_PROJECT_PREFIX", "").strip() in ("1", "true", "yes"):
+    # ── Extract agent_id from result ────────────────────────
+    agent_id = "orchestrator"
+    if agent_result:
+        _aid = str(agent_result.get("caller_agent_id", "") or "").strip()
+        if _aid:
+            agent_id = _aid
+
+    # ── Build prefix via centralised function ───────────────
+    prefix = get_activity_prefix(agent_id)
+    if not prefix:
         return ""
 
-    # ── Per-project config ──────────────────────────────────
-    use_emoji = True  # default: emoji on
-    if pid:
-        try:
-            from projects.project_manager import ProjectManager
-            pm = ProjectManager()
-            if not pm.get_show_project_prefix(pid):
-                return ""
-            use_emoji = pm.get_config(pid, "prefix_emoji", True)
-        except Exception:
-            pass
-
-    agent_id = ""
-    if agent_result:
-        agent_id = str(agent_result.get("caller_agent_id", "") or "").strip()
-
-    # ── Build compact prefix (emoji · short label · optional agent) ──
-    sep = " · "  # middle-dot separator, compact
-    if pid and pname:
-        emoji = _PREFIX_EMOJI_PROJECT if use_emoji else ""
-        label = pname
-        prefix = f"{emoji}{' ' if emoji else ''}{label}"
-        if agent_id and agent_id != "orchestrator":
-            prefix = f"{prefix}{sep}{agent_id}"
-    else:
-        emoji = _PREFIX_EMOJI_ORCHESTRATOR if use_emoji else ""
-        prefix = f"{emoji}{' ' if emoji else ''}Orchestrator"
-        if agent_id and agent_id != "orchestrator":
-            prefix = f"{prefix}{sep}{agent_id}"
-
-    # ── Platform bold + safety blank line ───────────────────
+    # ── Platform bold + trailing arrow + safety blank line ──
+    # Format: **prefix →**\n\n
+    # The arrow connects the prefix to the message that follows.
+    # Double newline prevents markdown interference with code blocks.
     platform_lower = str(platform).lower()
     b_open, b_close = _PLATFORM_BOLD.get(platform_lower, ("", ""))
+
     if b_open:
-        return f"{b_open}{prefix}{b_close}\n\n"
-    return f"{prefix}\n\n"
+        return f"{b_open}{prefix} →{b_close}\n\n"
+    return f"{prefix} →\n\n"
+
+
+def wrap_gateway_message(
+    text: str,
+    platform: str,
+    agent_id: str = "orchestrator",
+) -> str:
+    """Wrap *any* gateway message with the mandatory activity prefix.
+
+    Use this for ALL gateway send paths — notices, voice reply captions,
+    media captions, footer messages, goal status, and any other
+    ``adapter.send()`` call site.
+
+    Args:
+        text:     The message body.
+        platform: Platform name (``"telegram"``, ``"discord"``, etc.).
+        agent_id: Sub-agent ID, defaults to ``"orchestrator"``.
+
+    Returns:
+        ``{bold_prefix}{text}`` or just ``text`` when prefix is disabled.
+    """
+    from core.response_formatter import get_activity_prefix
+
+    prefix = get_activity_prefix(agent_id)
+    if not prefix:
+        return text
+
+    platform_lower = str(platform).lower()
+    b_open, b_close = _PLATFORM_BOLD.get(platform_lower, ("", ""))
+
+    if b_open:
+        return f"{b_open}{prefix} →{b_close}\n\n{text}"
+    return f"{prefix} →\n\n{text}"
 
 
 

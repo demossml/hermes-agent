@@ -68,7 +68,7 @@ DEFAULT_CONFIG_DIR = Path(__file__).parent / "agent_configs"
 # NEVER reorder or delete existing entries — migration IDs are
 # recorded inside agent YAML files and must remain valid forever.
 
-CURRENT_MIGRATION_VERSION = "20260613"
+CURRENT_MIGRATION_VERSION = "20260617"
 
 MIGRATIONS: list[dict] = [
     {
@@ -98,6 +98,14 @@ MIGRATIONS: list[dict] = [
             "L1/L2→добавить delegation/messaging/terminal/file/web_search"
         ),
         "apply": lambda cfg: _migrate_upgrade_agent_toolsets(cfg),
+    },
+    {
+        "id": "20260617_auto_upgrade",
+        "description": (
+            "Авто-апгрейд: activity prefix, project binding, "
+            "code workflow, shared insights"
+        ),
+        "apply": lambda cfg: _migrate_auto_upgrade_20260617(cfg),
     },
 ]
 
@@ -225,6 +233,57 @@ def _migrate_upgrade_agent_toolsets(cfg: dict) -> bool:
     # Defensive: non-list, non-None (malformed YAML) → curated set
     cfg["enabled_toolsets"] = list(CURATED)
     return True
+
+
+# ── Migration: 20260617 — auto-upgrade all features ──────────
+
+def _migrate_auto_upgrade_20260617(cfg: dict) -> bool:
+    """Auto-upgrade agent config with all latest features.
+
+    Adds (if missing, preserves existing values):
+    - ``activity_prefix_enabled: true``
+    - ``project_id`` (auto-detected from subtree)
+    - ``code_workflow_enabled: true``
+    - ``shared_insights: true``
+    - ``soul_version: 2``
+    """
+    changed = False
+
+    # ── Activity prefix ─────────────────────────────────
+    if "activity_prefix_enabled" not in cfg:
+        cfg["activity_prefix_enabled"] = True
+        changed = True
+
+    # ── Project binding ─────────────────────────────────
+    if "project_id" not in cfg:
+        # Try to auto-detect from subtree_session_id
+        subtree = cfg.get("subtree_session_id", "")
+        if subtree.startswith("project-"):
+            # Extract: "project-xxx/subtree-..." → "xxx"
+            rest = subtree[len("project-"):]
+            pid = rest.split("/")[0]
+            if pid:
+                cfg["project_id"] = pid
+                changed = True
+        # No auto-detection possible — leave unset
+
+    # ── Code workflow ───────────────────────────────────
+    if "code_workflow_enabled" not in cfg:
+        cfg["code_workflow_enabled"] = True
+        changed = True
+
+    # ── Shared insights ─────────────────────────────────
+    if "shared_insights" not in cfg:
+        cfg["shared_insights"] = True
+        changed = True
+
+    # ── SOUL version ────────────────────────────────────
+    if "soul_version" not in cfg:
+        cfg["soul_version"] = 2
+        changed = True
+
+    return changed
+
 
 # ── RuleChecker (lightweight, no LLM) ─────────────────────────
 
@@ -1542,6 +1601,13 @@ class AgentRegistry:
         t0 = asyncio.get_event_loop().time() * 1000
         last_error = None
 
+        # ── Monitor: notify start ─────────────────────────────
+        try:
+            from core.agent_monitor import get_monitor
+            get_monitor().start_task(agent_id, message[:80])
+        except Exception:
+            pass
+
         # Build fallback model list
         fallbacks = [cfg.get("model", "")]
         fallbacks += cfg.get("fallback_models", [])
@@ -1575,6 +1641,18 @@ class AgentRegistry:
                     )
                     if ltm_context:
                         msg = ltm_context + "\n\n" + msg
+
+                    # ── Shared insights (cross-agent knowledge) ────
+                    if cfg.get("shared_insights", True):
+                        try:
+                            from core.shared_insights import get_insights
+                            insights_ctx = get_insights().get_context_for(
+                                agent_id, message, k=3,
+                            )
+                            if insights_ctx:
+                                msg = insights_ctx + "\n\n" + msg
+                        except Exception:
+                            pass
 
                 # ── Rule reminder ──────────────────────────────────────
                 reminder_every = cfg.get("rule_reminder_every", 0)
@@ -1630,6 +1708,19 @@ class AgentRegistry:
 
                 self._save_turn(agent_id, session_id, msg, reply)
                 self._track_call(agent_id, t0, len(reply) // 4)
+
+                # ── Monitor: notify success ────────────────────
+                try:
+                    from core.agent_monitor import get_monitor
+                    elapsed_ms = int(asyncio.get_event_loop().time() * 1000 - t0)
+                    get_monitor().end_task(agent_id, success=True, elapsed_ms=elapsed_ms)
+                except Exception:
+                    pass
+
+                # ── Shared insights: auto-share discoveries ────
+                if cfg.get("shared_insights", True) and reply:
+                    self._auto_share_insight(agent_id, message, reply)
+
                 return reply
 
             except Exception as e:
@@ -1640,6 +1731,18 @@ class AgentRegistry:
                     await asyncio.sleep(0.5)
                 else:
                     logger.error(f"Agent {agent_id} call failed after {retries+1} attempts: {e}", exc_info=True)
+
+        # ── Monitor: notify error ──────────────────────────────
+        try:
+            from core.agent_monitor import get_monitor
+            elapsed_ms = int(asyncio.get_event_loop().time() * 1000 - t0)
+            get_monitor().end_task(
+                agent_id, success=False,
+                error=str(last_error)[:120],
+                elapsed_ms=elapsed_ms,
+            )
+        except Exception:
+            pass
 
         return f"Error from agent '{agent_id}': {last_error}"
 
@@ -1692,6 +1795,61 @@ class AgentRegistry:
         )
         logger.error(error_msg)
         return f"Error: {error_msg}"
+
+    def _auto_share_insight(self, agent_id: str, task: str, reply: str) -> None:
+        """Auto-detect and share useful discoveries to SharedInsights.
+
+        Triggers when the reply contains patterns indicating the agent
+        found a solution, fix, or important pattern worth sharing.
+        """
+        # Only share substantial discoveries (skip trivial replies)
+        if len(reply) < 200:
+            return
+
+        reply_lower = reply.lower()
+
+        # Heuristic triggers — the agent discovered something useful
+        triggers = [
+            "the fix is", "the solution is", "the problem was",
+            "root cause", "the issue was", "to fix this",
+            "here's the pattern", "best practice", "pitfall",
+            "watch out for", "common mistake", "key insight",
+            "important:", "note:", "tldr:",
+        ]
+        if not any(t in reply_lower for t in triggers):
+            return
+
+        # Extract the key sentence (first trigger match context)
+        for t in triggers:
+            idx = reply_lower.find(t)
+            if idx >= 0:
+                # Take ~200 chars around the trigger
+                start = max(0, idx - 40)
+                end = min(len(reply), idx + 200)
+                snippet = reply[start:end].strip()
+                # Clean up: remove code blocks and excessive whitespace
+                snippet = snippet.replace("```", "").replace("\n\n", " ")
+                snippet = " ".join(snippet.split())[:200]
+
+                try:
+                    from core.shared_insights import get_insights
+                    # Determine category
+                    category = "general"
+                    if any(w in reply_lower for w in ("fix", "solution", "resolve", "bug")):
+                        category = "fix"
+                    elif any(w in reply_lower for w in ("pattern", "template", "boilerplate")):
+                        category = "pattern"
+                    elif any(w in reply_lower for w in ("pitfall", "mistake", "watch out", "careful")):
+                        category = "pitfall"
+
+                    get_insights().share(
+                        agent_id, snippet,
+                        category=category,
+                        importance="medium",
+                    )
+                except Exception:
+                    pass
+                break  # one insight per call is enough
 
     def _track_call(self, agent_id: str, start_ms: float, tokens: int):
         """Update per-agent performance stats."""

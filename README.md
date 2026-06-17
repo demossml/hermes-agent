@@ -47,6 +47,11 @@ This branch extends Hermes Agent with **multi-agent orchestration**, DAG pipelin
 - **DuckDB chat rules** — per-group rules stored in DuckDB, injected into prompts with zero LLM overhead
 - **DuckDB chat history** — all Telegram messages auto-saved with semantic search capability
 - **Telegram API 10.1** — native rich markup: tables, slideshows, LaTeX rendering
+- **Activity Prefix** — `[Project: Name] • [Agent: coder] →` on every message (CLI + all gateways)
+- **Agent Monitoring** — `/watch <agent>` and `/status` — real-time activity tracking
+- **Shared Insights** — cross-agent knowledge exchange (auto-share discoveries)
+- **Instant Project Switching** — prefix updates immediately on `/project switch` (no /reset needed)
+- **Auto-Upgrade** — `hermes update` automatically upgrades ALL agents with latest features
 
 ---
 
@@ -271,7 +276,8 @@ User → Main Hermes Agent [level: 0, main-session]
                 │    ├── 20260610: enabled_toolsets=None
                 │    ├── 20260611: critical_rules
                 │    ├── 20260612: fallback_models, LLM params
-                │    └── 20260613: upgrade agent toolsets
+                │    ├── 20260613: upgrade agent toolsets
+                │    └── 20260617: activity prefix, project binding, code workflow, shared insights
                 │
                 ├── propagate_toolset_to_agents()
                 │    └── hermes tools enable → auto-propagation
@@ -778,11 +784,110 @@ Each migration:
 
 ---
 
+## Activity Prefix
+
+Every agent message in CLI, Telegram, Discord, Slack, and all gateways includes a compact activity prefix:
+
+```
+[⚕ Orchestrator]                    ← no project
+[Project: WorkApp] • [Agent: coder]  ← with project
+[Project: App] • [Agent: coder] → writing auth  ← with action
+```
+
+**Prefix modes (env vars):**
+
+| Variable | Effect |
+|----------|--------|
+| `HERMES_NO_ACTIVITY_PREFIX=1` | Disable all prefixes |
+| `HERMES_ACTIVITY_PREFIX_COMPACT=1` | Compact mode: `[App] · [coder]` |
+| `HERMES_ACTIVITY_PREFIX_EMOJI=1` | Emoji mode: `📁 [Project: App] • 🔧 [Agent: coder]` |
+
+**Instant project switching:**
+
+```bash
+/project switch WorkApp
+# ✦ Switched: [Project: WorkApp] • [⚕ Orchestrator]
+# ⚡ Prefix updated instantly — all future messages will use it.
+```
+
+The prefix updates immediately on `/project switch` — no `/reset` needed. Gateway picks up the change within 2 seconds via cross-process `.current_project` file sync.
+
+**Code block & table safety:** Gateway delivery always adds `\n\n` after the prefix to prevent markdown interference.
+
+---
+
+## Agent Monitoring
+
+Real-time activity tracking for all sub-agents:
+
+```bash
+/watch coder          # monitor only coder
+/watch all            # monitor all agents
+/watch off            # disable monitoring
+/watch                # show current watch state
+/status               # session info + agent activity report
+```
+
+**Status output:**
+```
+🔴 Active (1):
+  [Agent: coder] 🧠 thinking · 2.3s · write auth middleware
+
+✅ Recent (2):
+  [Agent: coder] ✅ done · write sort function
+  [Agent: tester] ❌ error · syntax error on line 5
+
+👁 Watching: coder, researcher
+```
+
+Monitored per-agent: `status`, `task`, `elapsed`, `calls`, `successes`, `errors`, `avg_latency_ms`. Zero token overhead — pure in-memory tracking.
+
+---
+
+## Shared Insights
+
+Cross-agent knowledge exchange — when one agent discovers a fix or pattern, others can access it automatically:
+
+```python
+from core.shared_insights import get_insights
+ins = get_insights()
+
+# Agent discovers something
+ins.share("coder", "SQLite FTS5 requires content= for external content tables")
+
+# Other agents search
+results = ins.search("researcher", "FTS5", k=3)
+```
+
+**Auto-enabled** on all agents (`shared_insights: true`). Before each call, relevant insights from other agents are injected into context. After successful calls, discoveries are auto-shared via heuristic trigger detection.
+
+Backend: ChromaDB (when installed) with in-memory fallback.
+
+---
+
+## Auto-Upgrade on `hermes update`
+
+Running `hermes update --full` automatically upgrades ALL agents — main, profiles, and projects:
+
+```
+🔄  Auto-upgrade agents  3 upgraded; 5 already v2; 2 SOUL.md updated
+```
+
+**What gets upgraded:** `activity_prefix_enabled`, `project_id`, `code_workflow_enabled`, `shared_insights`, `soul_version: 2`.
+
+Migration `20260617_auto_upgrade` is idempotent — safe to run repeatedly. Never overwrites user-set values.
+
+---
+
 ## Project Structure
 
 ```
 multi-agent/                           ← branch
 ├── agent_registry.py                  ← registry + orchestrator + RuleEngine
+├── core/                              ← new shared utilities
+│   ├── response_formatter.py          ← activity prefix (CLI + gateway)
+│   ├── agent_monitor.py               ← /watch + /status monitoring
+│   └── shared_insights.py             ← cross-agent knowledge exchange
 ├── memory/
 │   └── __init__.py                    ← LongTermMemory (ChromaDB)
 ├── agent_configs/
@@ -791,20 +896,20 @@ multi-agent/                           ← branch
 │   ├── researcher.yaml                ← L1, subtree-researcher
 │   ├── reviewer.yaml                  ← L1, subtree-reviewer
 │   └── summarizer.yaml                ← L1, subtree-summarizer
-├── cli.py                             ← /subagents, /agent-off, status indicator
-├── multiagent_updater.py              ← migrations (versioned system)
+├── cli.py                             ← /subagents, /watch, /project, /status
+├── multiagent_updater.py              ← migrations + upgrade_all_agents
 ├── hermes_cli/
-│   └── commands.py                    ← CommandDef for new commands
+│   └── commands.py                    ← CommandDef for all commands
 ├── tests/
 │   ├── test_multiagent_updater.py     ← migration tests
 │   └── test_agent_registry.py         ← registry smoke tests
 ├── gateway/
 │   ├── agent_mention.py               ← @mention routing
-│   └── run.py                         ← dispatch
+│   ├── delivery.py                    ← format_gateway_response_prefix
+│   └── run.py                         ← dispatch (mandatory prefix)
 ├── hooks/agent-mention/               ← hook integration
 └── install_hooks.py
 ```
-
 ---
 
 ## Profile & Clone Isolation

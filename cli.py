@@ -5498,6 +5498,53 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         except Exception as e:
             _cprint(f"  [sub-agents: {e}]")
 
+    def _handle_watch(self, cmd: str):
+        """/watch <agent|all|off> — control agent activity monitoring."""
+        parts = cmd.strip().split(None, 1)
+        arg = parts[1].strip().lower() if len(parts) > 1 else ""
+
+        from core.agent_monitor import get_monitor
+        mon = get_monitor()
+
+        if arg in ("", "status"):
+            # Show current watch state
+            watched = mon.watched_agents
+            if not mon._enabled:
+                _cprint("  👁 Monitoring: [red]OFF[/]")
+                _cprint("  Use /watch <agent> or /watch all to enable.")
+            elif watched:
+                _cprint(f"  👁 Watching: [bold]{', '.join(watched)}[/]")
+                _cprint(f"    /watch off — disable")
+                _cprint(f"    /watch <name> — add/switch agent")
+            else:
+                _cprint("  👁 Watching: [bold]ALL[/] (no activity yet)")
+                _cprint(f"    /watch off — disable")
+            return
+
+        if arg == "off":
+            msg = mon.watch(None)
+            _cprint(f"  👁 [red]{msg}[/]")
+            return
+
+        if arg == "all":
+            msg = mon.watch("all")
+            _cprint(f"  👁 [green]{msg}[/]")
+            return
+
+        # Watch specific agent
+        from agent_registry import get_registry
+        registry = get_registry()
+        agent = registry.get(arg)
+        if not agent:
+            available = [a["agent_id"] for a in registry.list()]
+            _cprint(f"  [red]Unknown agent: {arg}[/]")
+            if available:
+                _cprint(f"  Available: {', '.join(available)}")
+            return
+
+        msg = mon.watch(arg)
+        _cprint(f"  👁 [green]{msg}[/]")
+
     def _handle_paste_command(self):
         """Handle /paste — explicitly check clipboard for an image.
 
@@ -5757,6 +5804,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             f"Agent Running: {'Yes' if is_running else 'No'}",
         ])
         self._console_print("\n".join(lines), highlight=False, markup=False)
+
+        # ── Agent activity monitor ──────────────────────────
+        try:
+            from core.agent_monitor import get_monitor
+            mon = get_monitor()
+            report = mon.format_status_report()
+            if report:
+                _cprint(report)
+        except Exception:
+            pass
     
     def _fast_command_available(self) -> bool:
         try:
@@ -7668,6 +7725,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._show_gateway_status()
         elif canonical == "status":
             self._show_session_status()
+        elif canonical in ("watch", "monitor"):
+            self._handle_watch(cmd_original)
         elif canonical == "statusbar":
             self._status_bar_visible = not self._status_bar_visible
             state = "visible" if self._status_bar_visible else "hidden"
@@ -8463,18 +8522,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         }
 
         if not message:
-            _cprint(f"  ✅ Switched to [{agent_id}] (level {_active_subagent['level']})")
+            from core.response_formatter import get_activity_prefix_rich
+            _pfx = get_activity_prefix_rich(agent_id)
+            _cprint(f"  ✅ Switched to {_pfx} (level {_active_subagent['level']})")
             _cprint(f"  Type /agent-off to return to main agent")
             return
 
         session_id = getattr(self, "session_id", "cli-agent")
-        _cprint(f"  [{agent_id}] thinking...")
+
+        from core.response_formatter import get_activity_prefix_rich
+        _pfx = get_activity_prefix_rich(agent_id, action="thinking…")
+        _cprint(f"  {_pfx}")
 
         try:
             reply = self._run_async(
                 registry.call(agent_id, session_id, message)
             )
-            _cprint(f"  [{agent_id}] {reply}")
+            _pfx_done = get_activity_prefix_rich(agent_id)
+            _cprint(f"  {_pfx_done} {reply}")
         except Exception as e:
             _cprint(f"  [bold red]Agent call failed: {e}[/]")
 
@@ -8568,14 +8633,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             return
 
         # ── Normal orchestration (non-code task) ─────────────
-        _cprint(f"  [orchestrator] analysing...")
+        from core.response_formatter import get_activity_prefix_rich
+        _pfx = get_activity_prefix_rich("orchestrator", action="analysing…")
+        _cprint(f"  {_pfx}")
 
         try:
             reply = self._run_async(
                 registry.orchestrate(session_id, message),
                 timeout=300,
             )
-            _cprint(f"  [orchestrator] {reply}")
+            _pfx_done = get_activity_prefix_rich("orchestrator")
+            _cprint(f"  {_pfx_done} {reply}")
         except Exception as e:
             _cprint(f"  [bold red]Orchestrate failed: {e}[/]")
 
@@ -9589,15 +9657,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _cprint(f"    Created:     {current.get('created_at', '?')[:19]}")
             # Prefix
             try:
-                from projects.project_context import get_response_prefix
-                _pfx = get_response_prefix()
-                _cprint(f"    Prefix:      [bold green]{_pfx}[/]" if _pfx else f"    Prefix:      [dim]отключён[/]")
+                from core.response_formatter import get_activity_prefix_rich
+                _pfx = get_activity_prefix_rich("orchestrator")
+                _cprint(f"    Prefix:      {_pfx}")
             except Exception:
                 pass
         else:
             _cprint("\n  [dim]No active project.[/]")
             _cprint("  Use [bold]/project new <name>[/] to create one.")
-            _cprint(f"  Prefix: [bold blue]⚕ Orchestrator[/]")
+            try:
+                from core.response_formatter import get_activity_prefix_rich
+                _pfx = get_activity_prefix_rich("orchestrator")
+                _cprint(f"  Prefix: {_pfx}")
+            except Exception:
+                _cprint(f"  Prefix: [bold blue][⚕ Orchestrator][/bold blue]")
 
     def _project_new(self, ctx, name: str):
         """Create a new project."""
@@ -9607,13 +9680,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             return
         try:
             proj = ctx.create_project(name)
-            _cprint(f"\n  [bold green]✦ Project created[/]")
-            _cprint(f"    Name:        [bold]{proj['name']}[/]")
+
+            from core.response_formatter import get_activity_prefix_rich
+            _pfx = get_activity_prefix_rich("orchestrator")
+
+            _cprint(f"\n  [bold green]✦ Project created:[/] {_pfx}")
             _cprint(f"    ID:          {proj['project_id']}")
             _cprint(f"    Subtree:     {proj['subtree_session_id']}")
             _cprint(f"    ChromaDB:    {proj['chroma_collection']}")
             _cprint(f"    Directory:   {proj['project_dir']}")
-            _cprint(f"\n  [yellow]⟳ Run /reset to apply project context.[/]")
+            _cprint(f"    ⚡ Prefix active immediately.")
         except ValueError as e:
             _cprint(f"  [red]Error:[/] {e}")
 
@@ -9685,21 +9761,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 _cprint(f"  [red]Project not found:[/] {target}")
                 _cprint("  Use [bold]/project list[/] to see all projects.")
                 return
-        _cprint(f"\n  [bold green]✦ Switched to:[/] [bold]{proj['name']}[/]")
+
+        # ── Show confirmation WITH instant prefix ────────────
+        from core.response_formatter import get_activity_prefix_rich
+        _pfx = get_activity_prefix_rich("orchestrator")
+
+        _cprint(f"\n  [bold green]✦ Switched:[/] {_pfx}")
         _cprint(f"    ID:          {proj['project_id']}")
         _cprint(f"    Subtree:     {proj['subtree_session_id']}")
         _cprint(f"    ChromaDB:    {proj['chroma_collection']}")
         _cprint(f"    Directory:   {proj['project_dir']}")
-        # ── Show new prefix preview ───────────────────────────
-        try:
-            from projects.project_context import get_response_prefix
-            _pfx = get_response_prefix()
-            if _pfx:
-                _cprint(f"    Prefix:      [bold green]{_pfx}[/]  ← все ответы теперь с этим")
-            else:
-                _cprint(f"    Prefix:      [dim]отключён[/]")
-        except Exception:
-            pass
+        _cprint(f"    ⚡ Prefix updated instantly — all future messages will use it.")
 
         # ── Show state notifications ────────────────────────
         notifications = proj.get("_notifications", [])
@@ -9707,8 +9779,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _cprint("")
             for note in notifications:
                 _cprint(f"  [bold cyan]ℹ {note}[/]")
-
-        _cprint(f"\n  [yellow]⟳ Run /reset to apply project context.[/]")
 
     def _project_rename(self, ctx, args: str):
         """Rename a project: /project rename <old_name_or_id> <new_name>."""
@@ -12372,20 +12442,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     _resp_color = _maybe_remap_for_light_mode("#CD7F32")
                     _resp_text = _maybe_remap_for_light_mode("#FFF8DC")
 
-                # ── Project context prefix ──────────────────────────
-                try:
-                    from projects.project_context import (
-                        get_current_project_name,
-                        get_current_project_id,
-                    )
-                    pid = get_current_project_id()
-                    pname = get_current_project_name()
-                    if pid and pname:
-                        label = f"[bold green]📁 {pname}[/]  {label}"
-                    else:
-                        label = f"[bold blue]⚕ Orchestrator[/]  {label}"
-                except Exception:
-                    pass
+                # ── Activity prefix (project + agent) ────────────────
+                from core.response_formatter import get_activity_prefix_rich
+                _ctx_pfx = get_activity_prefix_rich("orchestrator")
+                label = f"{_ctx_pfx}  {label}"
 
                 is_error_response = result and (result.get("failed") or result.get("partial"))
                 already_streamed = self._stream_started and self._stream_box_opened and not is_error_response

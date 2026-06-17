@@ -1068,6 +1068,7 @@ def format_full_report(
     profile_count: int = 0,
     workflow_report: dict[str, Any] | None = None,
     migration_report: dict[str, Any] | None = None,
+    upgrade_report: dict[str, Any] | None = None,
     dry_run: bool = False,
 ) -> str:
     """Сформировать красивый итоговый отчёт об обновлении."""
@@ -1158,6 +1159,22 @@ def format_full_report(
             parts.append(f"{s} SOUL.md сгенерировано")
         if parts:
             section_items.append(("📦", "Миграция данных", "; ".join(parts)))
+
+    # Auto-upgrade agents
+    if upgrade_report:
+        scanned = upgrade_report.get("scanned", 0)
+        upgraded = upgrade_report.get("upgraded", 0)
+        current = upgrade_report.get("already_current", 0)
+        souls = upgrade_report.get("soul_updated", 0)
+        errors = upgrade_report.get("errors", 0)
+        parts = [f"{upgraded} upgraded"]
+        if current:
+            parts.append(f"{current} already v2")
+        if souls:
+            parts.append(f"{souls} SOUL.md updated")
+        if errors:
+            parts.append(f"{errors} errors")
+        section_items.append(("🔄", "Auto-upgrade агентов", "; ".join(parts)))
 
     for icon, name, detail in section_items:
         lines.append(f"  {icon}  {name:<20} {detail}")
@@ -1273,6 +1290,186 @@ def format_full_report(
 
 
 # ═══════════════════════════════════════════════════════════════
+# Phase 10: Auto-upgrade ALL agents
+# ═══════════════════════════════════════════════════════════════
+
+def upgrade_all_agents(
+    root: Path | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Auto-upgrade ALL agents across the entire installation.
+
+    Scans and upgrades:
+    1. ``~/.hermes/agent_configs/*.yaml`` (main agents)
+    2. ``~/.hermes/profiles/*/agent_configs/*.yaml`` (profile agents)
+    3. ``~/.hermes/projects/*/agents/*.yaml`` (project agents)
+
+    Each agent receives:
+    - Activity prefix enabled
+    - Project binding (auto-detected)
+    - Code workflow enabled
+    - Shared insights enabled
+    - SOUL.md updated to v2
+
+    Returns a detailed report.
+    """
+    import os
+    from agent_registry import MIGRATIONS
+
+    home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    report: dict[str, Any] = {
+        "scanned": 0,
+        "upgraded": 0,
+        "already_current": 0,
+        "errors": 0,
+        "soul_updated": 0,
+        "details": [],
+    }
+
+    # Collect all agent YAML files
+    search_dirs = [
+        home / "agent_configs",                # main agents
+    ]
+
+    # Profile agents
+    profiles_dir = home / "profiles"
+    if profiles_dir.exists():
+        for pdir in profiles_dir.iterdir():
+            if pdir.is_dir():
+                ac = pdir / "agent_configs"
+                if ac.exists():
+                    search_dirs.append(ac)
+
+    # Project agents
+    projects_dir = home / "projects"
+    if projects_dir.exists():
+        for pdir in projects_dir.iterdir():
+            if pdir.is_dir():
+                ac = pdir / "agents"
+                if ac.exists():
+                    search_dirs.append(ac)
+
+    migration = next((m for m in MIGRATIONS if m["id"] == "20260617_auto_upgrade"), None)
+    if not migration:
+        report["details"].append("Migration 20260617_auto_upgrade not found in MIGRATIONS")
+        return report
+
+    for agent_dir in search_dirs:
+        for yaml_file in sorted(agent_dir.glob("*.yaml")):
+            report["scanned"] += 1
+            detail = {"file": str(yaml_file), "status": "unchanged"}
+
+            try:
+                with open(yaml_file) as f:
+                    cfg = yaml.safe_load(f) or {}
+
+                agent_id = cfg.get("agent_id", yaml_file.stem)
+                detail["agent_id"] = agent_id
+
+                # Check if already upgraded
+                if cfg.get("soul_version") == 2 and cfg.get("activity_prefix_enabled"):
+                    report["already_current"] += 1
+                    detail["status"] = "already v2"
+                    report["details"].append(detail)
+                    continue
+
+                # Apply migration
+                changed = migration["apply"](cfg)
+                if not changed and not dry_run:
+                    report["already_current"] += 1
+                    detail["status"] = "no changes needed"
+                    report["details"].append(detail)
+                    continue
+
+                if not dry_run:
+                    with open(yaml_file, "w") as f:
+                        yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
+                    report["upgraded"] += 1
+                    detail["status"] = "upgraded to v2"
+                else:
+                    detail["status"] = "[DRY-RUN] would upgrade"
+
+                report["details"].append(detail)
+
+            except Exception as e:
+                report["errors"] += 1
+                detail["status"] = f"ERROR: {e}"
+                report["details"].append(detail)
+                logger.error(f"upgrade_all_agents failed for {yaml_file}: {e}")
+
+    # ── Update global SOUL.md ──────────────────────────────
+    global_soul = home / "SOUL.md"
+    if global_soul.exists() and not dry_run:
+        try:
+            if _update_soul_v2(global_soul):
+                report["soul_updated"] += 1
+                report["details"].append({
+                    "file": str(global_soul),
+                    "status": "Global SOUL.md updated to v2",
+                })
+        except Exception as e:
+            logger.error(f"Global SOUL update failed: {e}")
+
+    # ── Update SOUL.md in all projects ─────────────────────
+    if projects_dir.exists() and not dry_run:
+        for pdir in projects_dir.iterdir():
+            if not pdir.is_dir():
+                continue
+            soul_path = pdir / "SOUL.md"
+            if soul_path.exists():
+                try:
+                    updated = _update_soul_v2(soul_path)
+                    if updated:
+                        report["soul_updated"] += 1
+                        report["details"].append({
+                            "file": str(soul_path),
+                            "status": "SOUL.md updated to v2",
+                        })
+                except Exception as e:
+                    logger.error(f"SOUL update failed for {soul_path}: {e}")
+
+    return report
+
+
+def _update_soul_v2(soul_path: Path) -> bool:
+    """Update SOUL.md to version 2 with new multi-agent rules."""
+    current = soul_path.read_text(encoding="utf-8")
+
+    if "## Multi-Agent Rules (v2)" in current:
+        return False  # Already v2
+
+    # Append v2 rules block
+    v2_block = """
+
+## Multi-Agent Rules (v2)
+
+### Activity Prefix
+- Every agent message MUST include an activity prefix: `[Agent: name]` or `[Project: Name] • [Agent: name]`
+- The prefix is automatically added by the gateway and CLI — no manual action needed
+- Disable globally with `HERMES_NO_ACTIVITY_PREFIX=1`
+
+### Project Binding
+- All sub-agents in this project share the `project-{project_id}/` subtree prefix
+- DuckDB records are tagged with the project_id
+- Long-term vector memory uses the project's ChromaDB collection
+
+### Code Workflow
+- Code tasks auto-detect and route through coder → tester pipeline
+- Coder and Tester agents have fully isolated memory
+- Use `/orchestrate <task>` to trigger the code workflow
+
+### Shared Insights
+- Agents automatically share discoveries (fixes, patterns, pitfalls)
+- Cross-agent knowledge is retrieved before each call
+- Use `/status` to see what agents are doing
+- Use `/watch <agent>` to monitor specific agents
+"""
+
+    soul_path.write_text(current + v2_block, encoding="utf-8")
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════
 # Entry Point
 # ═══════════════════════════════════════════════════════════════
 
@@ -1339,6 +1536,11 @@ def run_update(
     if full:
         workflow_report = setup_workflow_agents(root, dry_run=dry_run)
 
+    # ── Phase 10: Auto-upgrade ALL agents ────────────────────
+    upgrade_report: dict[str, Any] = {}
+    if full:
+        upgrade_report = upgrade_all_agents(root, dry_run=dry_run)
+
     # ── Format report ───────────────────────────────────────
     report = format_full_report(
         backup_path=backup_path,
@@ -1352,6 +1554,7 @@ def run_update(
         profile_count=profile_count,
         workflow_report=workflow_report,
         migration_report=migration_report,
+        upgrade_report=upgrade_report,
         dry_run=dry_run,
     )
 
