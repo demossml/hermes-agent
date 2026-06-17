@@ -597,3 +597,207 @@ def get_meta_preamble() -> list[dict]:
         messages.append(project_meta)
 
     return messages
+
+
+# ═══════════════════════════════════════════════════════════════
+# ProjectContextManager — central orchestrator for all projects
+# ═══════════════════════════════════════════════════════════════
+
+class ProjectContextManager:
+    """Central orchestrator for all project-related operations.
+
+    Single entry point for:
+    - Hot project switching (instant, no /reset)
+    - Sub-agent project binding (YAML + system prompt)
+    - Compression-safe meta messages ([PROJECT STATE])
+    - Artifact storage (code/ + state/)
+    - Activity prefix integration
+
+    Usage::
+
+        mgr = ProjectContextManager.get_instance()
+        mgr.switch_hot("my-project")        # instant switch
+        mgr.bind_agent_config(cfg)           # add project_id/name
+        mgr.get_meta_preamble()              # compression-safe messages
+    """
+
+    _instance: "ProjectContextManager | None" = None
+
+    @classmethod
+    def get_instance(cls) -> "ProjectContextManager":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    # ── Identity ──────────────────────────────────────────
+
+    @property
+    def has_project(self) -> bool:
+        """True when a project is currently active."""
+        return bool(_current_project_id)
+
+    @property
+    def project_id(self) -> str | None:
+        return _current_project_id
+
+    @property
+    def project_name(self) -> str | None:
+        return _current_project_name
+
+    def get_context(self) -> dict[str, str | None]:
+        """Return current project context as a flat dict."""
+        return {
+            "project_id": _current_project_id,
+            "project_name": _current_project_name,
+        }
+
+    # ── Hot switch ────────────────────────────────────────
+
+    def switch_hot(self, project_id: str) -> dict:
+        """Switch project instantly — updates globals + notifies loop.
+
+        Returns the new project's metadata dict.
+        """
+        mw = ProjectContextMiddleware.get_instance()
+        result = mw.switch_project(project_id)
+
+        # notify_project_switched is already called inside switch_project
+        # and get_response_prefix() reads the now-updated globals.
+        return result
+
+    def create_and_switch(self, name: str) -> dict:
+        """Create a new project and switch to it instantly."""
+        mw = ProjectContextMiddleware.get_instance()
+        return mw.create_project(name)
+
+    # ── Agent binding ─────────────────────────────────────
+
+    def bind_agent_config(self, config: dict) -> dict:
+        """Add project_id and project_name to an agent config dict.
+
+        Called during sub-agent creation.  Returns the modified config.
+        Does nothing when no project is active (orchestrator mode).
+        """
+        if not _current_project_id:
+            return config
+
+        config["project_id"] = _current_project_id
+        config["project_name"] = _current_project_name or _current_project_id
+        return config
+
+    def build_project_system_block(self, config: dict) -> str:
+        """Build [ACTIVE PROJECT] block for a project-bound agent's system prompt.
+
+        Returns empty string for non-project-bound agents (orchestrator).
+        """
+        pid = config.get("project_id", "")
+        pname = config.get("project_name", "")
+        if not pid or not pname:
+            return ""
+
+        subtree = config.get("subtree_session_id", "")
+        return (
+            f"\n\n[ACTIVE PROJECT]\n"
+            f"You work STRICTLY within project '{pname}' "
+            f"(ID: {pid}).\n"
+            f"You do NOT have access to other projects.\n"
+            f"Your subtree: {subtree}\n"
+            f"All your memory, files, and sub-agents are scoped "
+            f"to this project.\n"
+            f"Do not switch projects on your own — only the "
+            f"Orchestrator can manage project boundaries."
+        )
+
+    def get_delegation_context(self, agent_config: dict) -> str:
+        """Return project context string for injection during delegation.
+
+        Used when orchestrator calls a project-bound sub-agent.
+        """
+        pid = agent_config.get("project_id", "")
+        pname = agent_config.get("project_name", "")
+        if not pid or not pname:
+            return ""
+        return (
+            f"[Project context]\n"
+            f"You are working on project '{pname}' (ID: {pid}).\n"
+            f"All actions must be scoped to this project."
+        )
+
+    # ── Meta protection ───────────────────────────────────
+
+    def get_meta_preamble(self) -> list[dict]:
+        """Return compression-safe meta messages (delegates to module function)."""
+        return get_meta_preamble()
+
+    def build_project_state_message(self) -> dict | None:
+        """Build [PROJECT STATE] meta message (delegates to module function)."""
+        return build_project_state_meta()
+
+    # ── Artifacts ─────────────────────────────────────────
+
+    def get_artifact_dirs(self) -> tuple["Path", "Path"] | tuple[None, None]:
+        """Return (code_dir, state_dir) for the active project.
+
+        Returns (None, None) when no project is active.
+        """
+        if not _current_project_id:
+            return None, None
+        from projects.project_artifacts import get_project_artifact_dirs
+        return get_project_artifact_dirs(_current_project_id)
+
+    def save_code(self, filename: str, code: str) -> "Path | None":
+        """Save generated code to the active project."""
+        if not _current_project_id:
+            return None
+        from projects.project_artifacts import save_code as _save
+        return _save(_current_project_id, filename, code)
+
+    def save_state(self, filename: str, data: str | dict) -> "Path | None":
+        """Save state/report to the active project."""
+        if not _current_project_id:
+            return None
+        from projects.project_artifacts import save_state as _save
+        return _save(_current_project_id, filename, data)
+
+    def get_recent_files(self, limit: int = 10) -> list[dict]:
+        """Return recently modified files in the active project."""
+        if not _current_project_id:
+            return []
+        from projects.project_artifacts import get_recent_files
+        return get_recent_files(_current_project_id, limit=limit)
+
+    # ── Activity prefix ───────────────────────────────────
+
+    def get_activity_prefix(self, agent_id: str, action: str = None) -> str:
+        """Return activity prefix for the current project context."""
+        from core.response_formatter import get_activity_prefix
+        return get_activity_prefix(agent_id, action=action)
+
+    def get_activity_prefix_rich(self, agent_id: str, action: str = None) -> str:
+        """Return coloured activity prefix for CLI."""
+        from core.response_formatter import get_activity_prefix_rich
+        return get_activity_prefix_rich(agent_id, action=action)
+
+    # ── Diagnostics ───────────────────────────────────────
+
+    def status_report(self) -> str:
+        """Return a one-line status summary."""
+        if not _current_project_id:
+            return "⚕ Orchestrator mode (no active project)"
+
+        from projects.project_artifacts import get_recent_files
+        files = get_recent_files(_current_project_id, limit=5)
+        code_count = sum(1 for f in files if f["type"] == "code")
+        state_count = sum(1 for f in files if f["type"] == "state")
+
+        return (
+            f"📁 {_current_project_name} ({_current_project_id}) | "
+            f"{code_count} code files, {state_count} state files"
+        )
+
+
+# ── Module-level convenience ──────────────────────────────
+
+def get_manager() -> ProjectContextManager:
+    """Return the global ProjectContextManager singleton."""
+    return ProjectContextManager.get_instance()
