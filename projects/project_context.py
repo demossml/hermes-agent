@@ -536,3 +536,64 @@ def get_response_prefix() -> str:
         emoji = "📁 "
 
     return f"{emoji}{_current_project_name}"
+
+
+# ── Compression-safe project state (META message) ────────────
+
+def build_project_state_meta() -> dict | None:
+    """Build a ``[PROJECT STATE]`` meta message that survives compression.
+
+    This message is injected after the system prompt but BEFORE conversation
+    history.  It is NEVER part of ``conversation_history``, so it cannot be
+    summarised or dropped by the context compressor.
+
+    Returns ``None`` when no project is active (keeps the prompt byte-stable
+    for non-project users).
+    """
+    if not _current_project_id or not _current_project_name:
+        return None
+
+    try:
+        from projects.project_manager import ProjectManager
+        pm = ProjectManager()
+        proj = pm.get_project(_current_project_id)
+    except Exception:
+        proj = None
+
+    subtree = (proj or {}).get("subtree_session_id", f"project-{_current_project_id}")
+    created = (proj or {}).get("created_at", "?")[:19] if proj else "?"
+
+    content = (
+        f"[PROJECT STATE]\n"
+        f"Active project: {_current_project_name}\n"
+        f"Project ID:     {_current_project_id}\n"
+        f"Subtree:        {subtree}\n"
+        f"Created:        {created}\n"
+        f"\n"
+        f"All agents in this session are bound to this project.\n"
+        f"Never switch projects in the middle of a session — use /project.\n"
+        f"Do NOT remove or summarise this block during compression."
+    )
+
+    return {
+        "role": "user",
+        "content": content,
+        "_meta": True,
+        "_compression_protected": True,
+    }
+
+
+def get_meta_preamble() -> list[dict]:
+    """Return meta messages to inject after the system prompt.
+
+    These messages are NEVER compressed — they live outside conversation
+    history and are rebuilt fresh on every turn.
+    """
+    messages: list[dict] = []
+
+    # Project state (when active)
+    project_meta = build_project_state_meta()
+    if project_meta:
+        messages.append(project_meta)
+
+    return messages

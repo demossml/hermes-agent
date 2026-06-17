@@ -788,6 +788,23 @@ def run_conversation(
             for idx, pfm in enumerate(agent.prefill_messages):
                 api_messages.insert(sys_offset + idx, pfm.copy())
 
+        # ── Meta preamble: compression-safe project state ───────
+        # Injected AFTER system prompt, BEFORE conversation history.
+        # These messages are NEVER part of conversation_history —
+        # they survive compression because they're rebuilt fresh
+        # every turn from live project state.
+        try:
+            from projects.project_context import get_meta_preamble
+            meta_msgs = get_meta_preamble()
+            if meta_msgs:
+                sys_offset = 1 if (api_messages and api_messages[0].get("role") == "system") else 0
+                # Insert after system + any prefill messages
+                insert_at = sys_offset + len(agent.prefill_messages or [])
+                for idx, mm in enumerate(meta_msgs):
+                    api_messages.insert(insert_at + idx, mm.copy())
+        except Exception:
+            pass
+
         # Apply Anthropic prompt caching for Claude models on native
         # Anthropic, OpenRouter, and third-party Anthropic-compatible
         # gateways. Auto-detected: if ``_use_prompt_caching`` is set,
