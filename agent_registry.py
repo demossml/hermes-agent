@@ -963,6 +963,7 @@ class AgentRegistry:
         for key in (
             "agent_id", "parent_id", "level", "subtree_session_id",
             "description", "system_prompt",
+            "project_id", "project_name",
         ):
             if key in cfg:
                 persist_cfg[key] = cfg[key]
@@ -1443,13 +1444,23 @@ class AgentRegistry:
         config["subtree_session_id"] = subtree_session_id
 
         # ── Project binding ────────────────────────────────────────
-        # Inject project_id into the agent config so all memory
-        # operations can tag records with the project.
+        # Inject project_id and project_name into the agent config so
+        # all memory operations can tag records with the project.
+        # Sub-agents are project-bound by default — they work strictly
+        # within their project and cannot cross boundaries.
+        # The orchestrator is the ONLY agent exempt from project binding.
         if _project_prefix:
-            config["project_id"] = _project_prefix[len("project-"):].rstrip("/")
+            _pid = _project_prefix[len("project-"):].rstrip("/")
+            config["project_id"] = _pid
+            try:
+                from projects.project_context import get_current_project_name
+                _pname = get_current_project_name() or _pid
+            except Exception:
+                _pname = _pid
+            config["project_name"] = _pname
             logger.info(
-                f"Agent '{agent_id}' bound to project '{config['project_id']}' "
-                f"(subtree={subtree_session_id})"
+                f"Agent '{agent_id}' bound to project '{_pid}' "
+                f"({_pname}, subtree={subtree_session_id})"
             )
 
         # ── Tools: full-stack clone by default ─────────────────────
@@ -1631,6 +1642,26 @@ class AgentRegistry:
                     system = cfg.get("system_prompt", "You are a helpful assistant.")
                     system += f"\n\n[Context from orchestrator]:\n{injected_context}"
                     agent.ephemeral_system_prompt = system
+
+                # ── Project context injection ────────────────────────
+                # When the orchestrator delegates to a project-bound agent,
+                # auto-inject the project context so the agent always knows
+                # which project it's working under.
+                if caller_id == "orchestrator":
+                    proj_id = cfg.get("project_id", "")
+                    proj_name = cfg.get("project_name", "")
+                    if proj_id and proj_name:
+                        proj_ctx = (
+                            f"[Project context]\n"
+                            f"You are working on project '{proj_name}' "
+                            f"(ID: {proj_id}).\n"
+                            f"All actions must be scoped to this project."
+                        )
+                        existing = agent.ephemeral_system_prompt or ""
+                        if proj_ctx not in existing:
+                            agent.ephemeral_system_prompt = (
+                                existing + "\n\n" + proj_ctx
+                            ).strip()
 
                 msg = message if attempt == 0 else f"Please respond concisely: {message}"
 
@@ -2511,15 +2542,32 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
             prompt += "\nThese rules persist across sessions. Follow them ALWAYS."
 
         # ── Project context for sub-agents ─────────────────────
-        # Sub-agents inherit the orchestrator's active project so
-        # they know which subtree_session_id and ChromaDB collection
-        # to use.  Injected as a compact one-liner to keep the
-        # sub-agent prompt lean.
+        # Sub-agents inherit the orchestrator's active project.
+        # When project-bound, inject an explicit [ACTIVE PROJECT]
+        # block that enforces the boundary.  The compact block is
+        # still used for non-project-bound agents.
         try:
-            from projects.project_context import get_project_block_compact
-            _proj_compact = get_project_block_compact()
-            if _proj_compact:
-                prompt += f"\n\n{_proj_compact}"
+            project_id = cfg.get("project_id", "")
+            project_name = cfg.get("project_name", "")
+            if project_id and project_name:
+                # Project-bound agent — explicit block
+                subtree = cfg.get("subtree_session_id", "")
+                prompt += (
+                    f"\n\n[ACTIVE PROJECT]\n"
+                    f"You work STRICTLY within project '{project_name}' "
+                    f"(ID: {project_id}).\n"
+                    f"You do NOT have access to other projects.\n"
+                    f"Your subtree: {subtree}\n"
+                    f"All your memory, files, and sub-agents are scoped "
+                    f"to this project.\n"
+                    f"Do not switch projects on your own — only the "
+                    f"Orchestrator can manage project boundaries."
+                )
+            else:
+                from projects.project_context import get_project_block_compact
+                _proj_compact = get_project_block_compact()
+                if _proj_compact:
+                    prompt += f"\n\n{_proj_compact}"
         except Exception:
             pass
 
