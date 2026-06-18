@@ -2724,8 +2724,21 @@ class AgentRegistry:
         violation_texts = [v["rule"] for v in violations]
 
         # ── Semantic check: second LLM pass for semantic/critical rules ──
-        semantic_rules = cfg.get("semantic_rules", [])
-        if semantic_rules and cfg.get("semantic_check_enabled", False):
+        # Collect rules that need semantic verification:
+        #   1. Explicit semantic_rules (always, if semantic_check_enabled)
+        #   2. Critical rules with enforcement=strict/semantic (auto)
+        semantic_rules = list(cfg.get("semantic_rules", []))
+        semantic_enabled = cfg.get("semantic_check_enabled", False)
+        # Auto-enable for critical strict rules
+        for r_spec in rules:
+            if isinstance(r_spec, dict):
+                pri = r_spec.get("priority", "")
+                enf = r_spec.get("enforcement", "")
+                if pri in ("critical", "crit") and enf in ("strict", "semantic"):
+                    rt = r_spec.get("rule", r_spec.get("text", ""))
+                    if rt and rt not in semantic_rules:
+                        semantic_rules.append(rt)
+        if semantic_rules and semantic_enabled:
             try:
                 semantic_violations = await self._semantic_check_violations(
                     agent_id, reply, semantic_rules,
@@ -2827,24 +2840,33 @@ class AgentRegistry:
             "You are a strict rule-compliance checker.\n\n"
             f"RULES TO CHECK:\n{rules_block}\n\n"
             f"AGENT RESPONSE:\n{reply[:2000]}\n\n"
-            "Return ONLY valid JSON (no markdown, no explanation outside JSON):\n"
+            "Return EXACTLY this JSON structure (NOTHING else — no markdown, no explanation outside JSON):\n"
             "{\n"
-            '  "violations": ["Rule 1", "Rule 3"],\n'
-            '  "explanation": "Brief explanation of each violation",\n'
-            '  "confidence": 0.92\n'
+            '  "violations": [],\n'
+            '  "explanation": "",\n'
+            '  "confidence": 0.0\n'
             "}\n\n"
-            "- \"violations\": list of rule numbers (e.g. \"Rule 1\") that "
-            "the response VIOLATES. Empty list [] if none.\n"
-            "- \"explanation\": one-line summary.\n"
-            "- \"confidence\": 0.0–1.0 how sure you are.\n\n"
-            "Only flag CLEAR violations. Be strict but fair."
+            "FIELDS:\n"
+            '- "violations": list of rule NUMBERS (e.g. ["Rule 1", "Rule 3"]) ' "that the response VIOLATES. Empty [] if none.\n"
+            '- "explanation": brief one-line summary.\n'
+            '- "confidence": float 0.0–1.0 — how certain you are.\n'
+            "  * 0.95+ = obvious, 0.70-0.94 = likely, <0.50 = do not report\n\n"
+            "RULES:\n"
+            "- Only flag violations with confidence >= 0.50.\n"
+            "- If no violations, return violations:[] and confidence:0.0.\n"
+            "- NO markdown, NO code fences, ONLY raw JSON.\n"
+            "- Be strict but fair."
         )
 
     @staticmethod
     def _parse_semantic_result(
         result_text: str, rules: list[str], agent_id: str,
     ) -> list[str]:
-        """Parse JSON result from semantic checker into violated rule texts."""
+        """Parse JSON result from semantic checker into violated rule texts.
+
+        Fail-open: any parse failure → empty list (no violations assumed).
+        Confidence < 0.5 violations are filtered out.
+        """
         import json as _json
 
         if not result_text:
@@ -2871,18 +2893,27 @@ class AgentRegistry:
                 except _json.JSONDecodeError:
                     logger.warning(
                         f"Semantic check: failed to parse JSON from "
-                        f"agent '{agent_id}': {text[:100]}..."
+                        f"agent '{agent_id}' (fail-open, no violations)"
                     )
                     return []
             else:
                 logger.warning(
                     f"Semantic check: no JSON found in response "
-                    f"for '{agent_id}': {text[:100]}..."
+                    f"for '{agent_id}' (fail-open, no violations)"
                 )
                 return []
 
         violations_list = data.get("violations", [])
         if not isinstance(violations_list, list):
+            return []  # fail-open
+
+        # Confidence threshold: only act on high-confidence violations
+        confidence = float(data.get("confidence", 0) or 0)
+        if confidence < 0.5 and violations_list:
+            logger.debug(
+                f"Semantic check for '{agent_id}': "
+                f"low confidence ({confidence:.2f}), ignoring"
+            )
             return []
 
         # Map "Rule N" → rule text
