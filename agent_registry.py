@@ -1002,6 +1002,8 @@ class AgentRegistry:
         self._stats: dict[str, dict] = {}          # agent_id -> {calls, tokens, total_ms}
         self._longterm_memory: LongTermMemory | None = None  # set via init_longterm_memory()
         self._chat_history = None  # ChatHistoryDB singleton — lazy init
+        self._semantic_cache: dict[str, list[str]] = {}  # hash → violated rules
+        self._semantic_cache_max: int = 200
 
     @property
     def chat_history(self):
@@ -2289,7 +2291,7 @@ class AgentRegistry:
                             result.get("tool_calls") or result.get("tool_results")
                             if isinstance(result, dict) else None
                         )
-                        violations = self._check_violations(
+                        violations = await self._check_violations(
                             agent_id, reply, tool_calls=result_tc,
                         )
                         if not violations:
@@ -2360,7 +2362,7 @@ class AgentRegistry:
 
         return f"Error from agent '{agent_id}': {last_error}"
 
-    def _check_violations(
+    async def _check_violations(
         self, agent_id: str, reply: str,
         tool_calls: list[dict] | None = None,
     ) -> "list[str]":
@@ -2398,7 +2400,7 @@ class AgentRegistry:
         semantic_rules = cfg.get("semantic_rules", [])
         if semantic_rules and cfg.get("semantic_check_enabled", False):
             try:
-                semantic_violations = self._semantic_check_violations(
+                semantic_violations = await self._semantic_check_violations(
                     agent_id, reply, semantic_rules,
                 )
                 violation_texts.extend(semantic_violations)
@@ -2409,78 +2411,182 @@ class AgentRegistry:
 
         return violation_texts
 
-    def _semantic_check_violations(
+    async def _semantic_check_violations(
         self, agent_id: str, reply: str, semantic_rules: list[str],
     ) -> list[str]:
         """Run a second LLM pass to check semantic/critical rules.
 
-        Uses a cheap model (configurable via semantic_check_provider / model)
-        to detect violations that keyword-based checks miss:
-        - косвенные нарушения (псевдокод, намёки, синонимы)
-        - нарушения стиля / тона
-        - обход запретов через иносказания
-
-        Batch mode: all rules are checked in a single LLM call.
+        Features:
+        - **Async + timeout** — max 4s, doesn't block the main response
+        - **Caching** — hash(rule_texts + reply) → cached result
+        - **Batch** — all rules in ONE LLM call
+        - **Structured JSON** — model returns parsable JSON, not free text
 
         Returns list of violated rule texts.
         """
         if not semantic_rules or not reply:
             return []
 
+        # ── Cache check ──────────────────────────────────────
+        cache_key = self._semantic_cache_key(semantic_rules, reply)
+        if cache_key in self._semantic_cache:
+            logger.debug(
+                f"Semantic check cache HIT for agent '{agent_id}' "
+                f"(key={cache_key[:12]}...)"
+            )
+            return list(self._semantic_cache[cache_key])
+
         cfg = self._agents.get(agent_id, {})
         provider_name = cfg.get("semantic_check_provider", "deepseek")
         model_name = cfg.get("semantic_check_model", "deepseek-chat")
+        timeout_s = cfg.get("semantic_check_timeout", 4)
 
-        # Build batch prompt
-        rules_block = "\n".join(
-            f"{i+1}. {rule}" for i, rule in enumerate(semantic_rules)
-        )
-        prompt = (
-            f"You are a strict rule-compliance checker. "
-            f"Your ONLY job: detect rule violations.\n\n"
-            f"RULES TO CHECK:\n{rules_block}\n\n"
-            f"AGENT RESPONSE:\n{reply[:2000]}\n\n"
-            f"For EACH rule, answer exactly:\n"
-            f"  Rule N: VIOLATION — <brief reason>\n"
-            f"  Rule N: OK\n\n"
-            f"Only flag a violation if the response CLEARLY breaks the rule. "
-            f"Be strict but fair."
-        )
+        # Build prompt with JSON output requirement
+        prompt = self._build_semantic_check_prompt(semantic_rules, reply)
 
         try:
-            result_text = self._call_cheap_llm(
-                provider_name, model_name, prompt,
+            result_text = await asyncio.wait_for(
+                self._call_cheap_llm_async(
+                    provider_name, model_name, prompt,
+                ),
+                timeout=timeout_s,
             )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Semantic check TIMEOUT for '{agent_id}' "
+                f"({timeout_s}s limit)"
+            )
+            return []
         except Exception as e:
             logger.warning(
                 f"Semantic check LLM call failed for '{agent_id}': {e}"
             )
             return []
 
-        # Parse result: look for "VIOLATION" in each rule's line
-        violated = []
-        result_lower = result_text.lower() if result_text else ""
-        for i, rule in enumerate(semantic_rules):
-            rule_key = f"rule {i+1}:"
-            # Find the line containing this rule number
-            for line in result_lower.splitlines():
-                if rule_key in line and "violation" in line:
-                    violated.append(rule)
-                    logger.info(
-                        f"Semantic check: agent '{agent_id}' violated "
-                        f"rule: {rule[:60]}..."
-                    )
-                    break
+        # Parse structured JSON
+        violated = self._parse_semantic_result(
+            result_text, semantic_rules, agent_id,
+        )
+
+        # ── Cache the result ─────────────────────────────────
+        self._semantic_cache[cache_key] = list(violated)
+        # Limit cache size
+        if len(self._semantic_cache) > self._semantic_cache_max:
+            # Evict oldest (first key in dict)
+            oldest = next(iter(self._semantic_cache))
+            del self._semantic_cache[oldest]
 
         return violated
 
-    def _call_cheap_llm(
+    @staticmethod
+    def _semantic_cache_key(rules: list[str], reply: str) -> str:
+        """Deterministic cache key from rule texts + response."""
+        import hashlib
+        data = "|".join(rules) + "||" + reply[:500]
+        return hashlib.sha256(data.encode()).hexdigest()
+
+    @staticmethod
+    def _build_semantic_check_prompt(
+        rules: list[str], reply: str,
+    ) -> str:
+        """Build prompt requesting structured JSON output."""
+        rules_block = "\n".join(
+            f"Rule {i+1}: \"{rule}\"" for i, rule in enumerate(rules)
+        )
+        return (
+            "You are a strict rule-compliance checker.\n\n"
+            f"RULES TO CHECK:\n{rules_block}\n\n"
+            f"AGENT RESPONSE:\n{reply[:2000]}\n\n"
+            "Return ONLY valid JSON (no markdown, no explanation outside JSON):\n"
+            "{\n"
+            '  "violations": ["Rule 1", "Rule 3"],\n'
+            '  "explanation": "Brief explanation of each violation",\n'
+            '  "confidence": 0.92\n'
+            "}\n\n"
+            "- \"violations\": list of rule numbers (e.g. \"Rule 1\") that "
+            "the response VIOLATES. Empty list [] if none.\n"
+            "- \"explanation\": one-line summary.\n"
+            "- \"confidence\": 0.0–1.0 how sure you are.\n\n"
+            "Only flag CLEAR violations. Be strict but fair."
+        )
+
+    @staticmethod
+    def _parse_semantic_result(
+        result_text: str, rules: list[str], agent_id: str,
+    ) -> list[str]:
+        """Parse JSON result from semantic checker into violated rule texts."""
+        import json as _json
+
+        if not result_text:
+            return []
+
+        # Try to extract JSON from response (may have markdown fences)
+        text = result_text.strip()
+        if "```" in text:
+            # Extract JSON from markdown code block
+            import re as _re
+            m = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, _re.DOTALL)
+            if m:
+                text = m.group(1)
+
+        try:
+            data = _json.loads(text)
+        except _json.JSONDecodeError:
+            # Fallback: try to find JSON object bounds
+            import re as _re
+            m = _re.search(r"\{.*\}", text, _re.DOTALL)
+            if m:
+                try:
+                    data = _json.loads(m.group(0))
+                except _json.JSONDecodeError:
+                    logger.warning(
+                        f"Semantic check: failed to parse JSON from "
+                        f"agent '{agent_id}': {text[:100]}..."
+                    )
+                    return []
+            else:
+                logger.warning(
+                    f"Semantic check: no JSON found in response "
+                    f"for '{agent_id}': {text[:100]}..."
+                )
+                return []
+
+        violations_list = data.get("violations", [])
+        if not isinstance(violations_list, list):
+            return []
+
+        # Map "Rule N" → rule text
+        violated = []
+        for v in violations_list:
+            v_str = str(v).strip()
+            # Extract number: "Rule 3" → 3, "rule 2" → 2, or just "3"
+            import re as _re
+            num_match = _re.search(r"(\d+)", v_str)
+            if num_match:
+                idx = int(num_match.group(1)) - 1  # 0-based
+                if 0 <= idx < len(rules):
+                    violated.append(rules[idx])
+                    logger.info(
+                        f"Semantic check: agent '{agent_id}' violated "
+                        f"rule: {rules[idx][:60]}..."
+                    )
+
+        confidence = data.get("confidence", 0)
+        explanation = data.get("explanation", "")
+        if explanation:
+            logger.debug(
+                f"Semantic check for '{agent_id}': "
+                f"confidence={confidence:.2f}, {explanation[:100]}"
+            )
+
+        return violated
+
+    async def _call_cheap_llm_async(
         self, provider_name: str, model_name: str, prompt: str,
     ) -> str:
-        """Make a single-turn call to a cheap LLM for rule checking.
+        """Make an async single-turn call to a cheap LLM for rule checking.
 
-        Uses OpenAI-compatible API via the openai library (DeepSeek, etc).
-        Requires the provider's API key in environment.
+        Uses OpenAI-compatible API. Runs in a thread to avoid blocking.
         """
         import os
         from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -2495,15 +2601,6 @@ class AgentRegistry:
                 f"for semantic check"
             )
 
-        # Use OpenAI-compatible chat completion
-        try:
-            from openai import OpenAI
-        except ImportError:
-            raise RuntimeError(
-                "openai package required for semantic check. "
-                "Install: pip install openai"
-            )
-
         base_url = runtime.get("base_url") or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
         api_key = runtime.get("api_key") or os.getenv("DEEPSEEK_API_KEY", "")
 
@@ -2513,12 +2610,52 @@ class AgentRegistry:
                 f"Set DEEPSEEK_API_KEY or configure semantic_check_provider."
             )
 
+        # Run the blocking OpenAI call in a thread
+        def _call():
+            from openai import OpenAI
+            client = OpenAI(api_key=api_key, base_url=base_url, timeout=10)
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=256,
+                temperature=0.0,
+                response_format={"type": "json_object"},
+            )
+            return response.choices[0].message.content or ""
+
+        return await asyncio.to_thread(_call)
+
+    # Legacy sync wrapper (kept for backward compat)
+    def _call_cheap_llm(
+        self, provider_name: str, model_name: str, prompt: str,
+    ) -> str:
+        """Synchronous wrapper — prefer _call_cheap_llm_async."""
+        import os
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider(
+            requested=provider_name,
+            target_model=model_name,
+        )
+        if not runtime:
+            raise RuntimeError(
+                f"Cannot resolve provider '{provider_name}'"
+            )
+
+        base_url = runtime.get("base_url") or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+        api_key = runtime.get("api_key") or os.getenv("DEEPSEEK_API_KEY", "")
+
+        if not api_key:
+            raise RuntimeError(f"No API key for '{provider_name}'")
+
+        from openai import OpenAI
         client = OpenAI(api_key=api_key, base_url=base_url, timeout=15)
         response = client.chat.completions.create(
             model=model_name,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=256,
             temperature=0.0,
+            response_format={"type": "json_object"},
         )
         return response.choices[0].message.content or ""
 
