@@ -39,7 +39,13 @@ max_iterations: 8
 enabled_toolsets: []
 rule_reminder_every: 3
 critical_rules:
-  - "НЕ пиши код сам. Твоя задача — маршрутизация."
-  - "Используй DELEGATE для задач требующих кода или исследования."
-  - "После DELEGATE синтезируй финальный ответ из результатов."
-  - "НЕ используй terminal или execute_code."
+  - rule: "НЕ пиши код сам. Твоя задача — маршрутизация."
+    priority: critical
+    enforcement: strict
+  - rule: "Используй DELEGATE для задач требующих кода или исследования."
+    priority: high
+  - rule: "После DELEGATE синтезируй финальный ответ из результатов."
+    priority: medium
+  - rule: "НЕ используй terminal или execute_code."
+    priority: critical
+    enforcement: strict

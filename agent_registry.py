@@ -484,6 +484,115 @@ class RuleCategory:
     CUSTOM = "custom"                         # всё остальное
 
 
+class PriorityLevel:
+    """Уровни важности правил (чем выше, тем строже проверка)."""
+    CRITICAL = 0   # keyword + semantic + tool_calls, макс попыток коррекции
+    HIGH = 1       # keyword + semantic
+    MEDIUM = 5     # semantic (если включён), иначе keyword
+    LOW = 10       # только keyword
+
+    _MAP = {
+        "critical": 0, "crit": 0, "highest": 0,
+        "high": 1, "hi": 1,
+        "medium": 5, "med": 5, "normal": 5,
+        "low": 10, "lo": 10,
+    }
+
+    @classmethod
+    def parse(cls, value) -> int:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            return cls._MAP.get(value.lower(), 5)
+        return 5
+
+
+class Enforcement:
+    """Стратегия проверки правила."""
+    STRICT = "strict"      # keyword + semantic + tool_calls
+    KEYWORD = "keyword"    # только keyword/regex/tool
+    SEMANTIC = "semantic"  # только LLM-пас
+
+    _DEFAULTS = {
+        PriorityLevel.CRITICAL: "strict",
+        PriorityLevel.HIGH: "strict",
+        PriorityLevel.MEDIUM: "keyword",
+        PriorityLevel.LOW: "keyword",
+    }
+
+    @classmethod
+    def default_for(cls, priority: int) -> str:
+        return cls._DEFAULTS.get(priority, "keyword")
+
+
+class Rule:
+    """Одно правило с автораспознаванием типа и приоритетом."""
+
+    __slots__ = (
+        "text", "priority", "priority_level", "enforcement", "category",
+        "forbidden_keywords", "regex", "target_language",
+        "forbidden_tools", "check_fn",
+    )
+
+    def __init__(
+        self,
+        text: str,
+        priority: int | None = None,
+        priority_level: int | None = None,
+        enforcement: str | None = None,
+        category: str | None = None,
+        forbidden_keywords: set[str] | None = None,
+        regex: "re.Pattern | None" = None,
+        target_language: str | None = None,
+        forbidden_tools: set[str] | None = None,
+        check_fn: "callable | None" = None,
+    ):
+        self.text = text
+        self.category = category or RuleCategory.CUSTOM
+        self.priority = (
+            priority if priority is not None
+            else CATEGORY_DEFAULT_PRIORITY.get(self.category, 10)
+        )
+        # Priority level (critical/high/medium/low)
+        self.priority_level = (
+            priority_level if priority_level is not None
+            else self.priority
+        )
+        # Enforcement strategy
+        self.enforcement = (
+            enforcement
+            if enforcement is not None
+            else Enforcement.default_for(self.priority_level)
+        )
+        self.forbidden_keywords = forbidden_keywords or set()
+        self.regex = regex
+        self.target_language = target_language
+        self.forbidden_tools = forbidden_tools or set()
+        self.check_fn = check_fn
+
+    def __repr__(self) -> str:
+        return (
+            f"Rule(pri={self.priority_level}, enf={self.enforcement}, "
+            f"cat={self.category}, text={self.text[:50]!r})"
+        )
+
+    @property
+    def is_critical(self) -> bool:
+        return self.priority_level <= PriorityLevel.CRITICAL
+
+    @property
+    def is_high(self) -> bool:
+        return self.priority_level <= PriorityLevel.HIGH
+
+    @property
+    def needs_semantic(self) -> bool:
+        return self.enforcement in (Enforcement.STRICT, Enforcement.SEMANTIC)
+
+    @property
+    def needs_keyword(self) -> bool:
+        return self.enforcement in (Enforcement.STRICT, Enforcement.KEYWORD)
+
+
 # Порядок проверки: критические категории — первыми
 CATEGORY_CHECK_ORDER = [
     RuleCategory.TOOL_RESTRICTION,
@@ -507,45 +616,6 @@ CATEGORY_DEFAULT_PRIORITY = {
     RuleCategory.GATING: 8,
     RuleCategory.CUSTOM: 10,
 }
-
-
-class Rule:
-    """Одно правило с автораспознаванием типа."""
-
-    __slots__ = (
-        "text", "priority", "category",
-        "forbidden_keywords", "regex", "target_language",
-        "forbidden_tools", "check_fn",
-    )
-
-    def __init__(
-        self,
-        text: str,
-        priority: int | None = None,
-        category: str | None = None,
-        forbidden_keywords: set[str] | None = None,
-        regex: "re.Pattern | None" = None,
-        target_language: str | None = None,
-        forbidden_tools: set[str] | None = None,
-        check_fn: "callable | None" = None,
-    ):
-        self.text = text
-        self.category = category or RuleCategory.CUSTOM
-        self.priority = (
-            priority if priority is not None
-            else CATEGORY_DEFAULT_PRIORITY.get(self.category, 10)
-        )
-        self.forbidden_keywords = forbidden_keywords or set()
-        self.regex = regex
-        self.target_language = target_language
-        self.forbidden_tools = forbidden_tools or set()
-        self.check_fn = check_fn
-
-    def __repr__(self) -> str:
-        return (
-            f"Rule(pri={self.priority}, cat={self.category}, "
-            f"text={self.text[:50]!r})"
-        )
 
 
 class AdvancedRuleChecker:
@@ -715,7 +785,12 @@ class AdvancedRuleChecker:
         ]
 
     @classmethod
-    def parse_rule(cls, text: str, priority: int | None = None) -> Rule:
+    def parse_rule(
+        cls, text: str,
+        priority: int | None = None,
+        priority_level: int | None = None,
+        enforcement: str | None = None,
+    ) -> Rule:
         """Распарсить текст правила в Rule с автоопределением категории."""
         cls._init_parsers()
         for _cat_name, parser in cls._PARSERS:
@@ -723,6 +798,10 @@ class AdvancedRuleChecker:
             if rule is not None:
                 if priority is not None:
                     rule.priority = priority
+                if priority_level is not None:
+                    rule.priority_level = priority_level
+                if enforcement is not None:
+                    rule.enforcement = enforcement
                 return rule
         # Fallback: custom rule — keyword match
         keywords = {
@@ -735,15 +814,17 @@ class AdvancedRuleChecker:
             category=RuleCategory.CUSTOM,
             forbidden_keywords=keywords,
             priority=priority if priority is not None else 10,
+            priority_level=priority_level,
+            enforcement=enforcement,
         )
 
     # ── Инициализация ─────────────────────────────────────────
 
-    def __init__(self, rules: list[str] | None = None):
+    def __init__(self, rules: list | None = None):
         self._rules: list[Rule] = []
         if rules:
-            for r_text in rules:
-                self.add_rule(r_text)
+            for r_spec in rules:
+                self.add_rule(r_spec)
 
     @property
     def has_rules(self) -> bool:
@@ -755,21 +836,63 @@ class AdvancedRuleChecker:
 
     def add_rule(
         self,
-        text: str,
+        rule_spec: "str | dict",
         priority: int | None = None,
         *,
+        priority_level: int | None = None,
+        enforcement: str | None = None,
         category: str | None = None,
         forbidden_keywords: set[str] | None = None,
         regex: "re.Pattern | None" = None,
         target_language: str | None = None,
         forbidden_tools: set[str] | None = None,
     ) -> Rule:
-        """Добавить правило (автопарсинг или ручное)."""
-        if category is not None:
+        """Добавить правило (строка или dict с priority/enforcement).
+
+        String mode (backward compatible):
+            checker.add_rule("НЕ пиши код")
+
+        Dict mode (new):
+            checker.add_rule({
+                "rule": "НЕ пиши код",
+                "priority": "critical",
+                "enforcement": "strict",
+            })
+        """
+        # Handle dict-based rule spec
+        if isinstance(rule_spec, dict):
+            text = rule_spec.get("rule", rule_spec.get("text", ""))
+            if not text:
+                raise ValueError(f"Dict rule missing 'rule' key: {rule_spec}")
+            priority_level = rule_spec.get("priority_level") or PriorityLevel.parse(
+                rule_spec.get("priority", "medium")
+            )
+            enforcement = rule_spec.get(
+                "enforcement",
+                Enforcement.default_for(priority_level),
+            )
+            if category is not None:
+                rule = Rule(
+                    text=text, priority=priority, priority_level=priority_level,
+                    enforcement=enforcement, category=category,
+                    forbidden_keywords=forbidden_keywords, regex=regex,
+                    target_language=target_language,
+                    forbidden_tools=forbidden_tools,
+                )
+            else:
+                rule = self.parse_rule(
+                    text,
+                    priority=priority_level,
+                    priority_level=priority_level,
+                    enforcement=enforcement,
+                )
+        elif category is not None:
             # Ручное добавление — не парсим
             rule = Rule(
-                text=text,
+                text=str(rule_spec),
                 priority=priority,
+                priority_level=priority_level,
+                enforcement=enforcement,
                 category=category,
                 forbidden_keywords=forbidden_keywords,
                 regex=regex,
@@ -777,9 +900,14 @@ class AdvancedRuleChecker:
                 forbidden_tools=forbidden_tools,
             )
         else:
-            rule = self.parse_rule(text, priority=priority)
+            rule = self.parse_rule(
+                str(rule_spec),
+                priority=priority,
+                priority_level=priority_level,
+                enforcement=enforcement,
+            )
         self._rules.append(rule)
-        self._rules.sort(key=lambda r: r.priority)
+        self._rules.sort(key=lambda r: (r.priority_level, r.priority))
         return rule
 
     def remove_rule(self, text_substring: str) -> int:
@@ -953,11 +1081,11 @@ class AdvancedRuleChecker:
     # ── Batch ──────────────────────────────────────────────────
 
     @classmethod
-    def from_yaml_rules(cls, rules: list[str]) -> "AdvancedRuleChecker":
-        """Создать чекер из списка правил (как в YAML critical_rules)."""
+    def from_yaml_rules(cls, rules: list) -> "AdvancedRuleChecker":
+        """Создать чекер из списка правил (строки или dict с priority/enforcement)."""
         checker = cls()
-        for rule_text in rules:
-            checker.add_rule(rule_text)
+        for rule_spec in rules:
+            checker.add_rule(rule_spec)
         return checker
 
     def parse_from_system_prompt(self, system_prompt: str) -> int:
@@ -2285,7 +2413,9 @@ class AgentRegistry:
                 rules = cfg_for_check.get("critical_rules", [])
                 if rules:
                     corrected = False
-                    for correction_attempt in range(2):
+                    # Max retries depends on highest priority rule
+                    max_retries = self._correction_retries(agent_id)
+                    for correction_attempt in range(max_retries):
                         # Extract tool_calls from result (if available)
                         result_tc = (
                             result.get("tool_calls") or result.get("tool_results")
@@ -2410,6 +2540,28 @@ class AgentRegistry:
         if "global" in r:
             return "global"
         return "custom"
+
+    def _correction_retries(self, agent_id: str) -> int:
+        """Return max correction attempts based on rule priorities.
+
+        critical rules → 3 retries
+        high → 2 retries
+        medium/low → 1 retry
+        """
+        cfg = self._agents.get(agent_id, {})
+        rules = cfg.get("critical_rules", [])
+        if not rules:
+            return 1
+        # Check if any critical-priority rule exists
+        for r_spec in rules:
+            if isinstance(r_spec, dict):
+                pri = r_spec.get("priority", "")
+                if pri in ("critical", "crit", "highest"):
+                    return 3
+                if pri in ("high", "hi"):
+                    return 2
+        # Default: 2 retries (unchanged from before)
+        return 2
 
     async def _check_violations(
         self, agent_id: str, reply: str,
