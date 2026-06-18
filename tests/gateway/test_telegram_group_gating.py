@@ -11,6 +11,7 @@ from gateway.session import SessionSource
 def _make_adapter(
     require_mention=None,
     free_response_chats=None,
+    free_response_chats_strict=None,
     mention_patterns=None,
     exclusive_bot_mentions=None,
     ignored_threads=None,
@@ -30,6 +31,8 @@ def _make_adapter(
         extra["require_mention"] = require_mention
     if free_response_chats is not None:
         extra["free_response_chats"] = free_response_chats
+    if free_response_chats_strict is not None:
+        extra["free_response_chats_strict"] = free_response_chats_strict
     if mention_patterns is not None:
         extra["mention_patterns"] = mention_patterns
     if exclusive_bot_mentions is not None:
@@ -541,6 +544,144 @@ def test_free_response_chats_bypass_mention_requirement():
 
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is True
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is False
+
+
+# ── free_response_chats_strict ─────────────────────────────────────────
+
+
+def test_strict_free_response_chats_requires_explicit_addressing():
+    """Strict mode: only mention, reply-to-bot, or bot-name prefix pass."""
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-200"],
+        free_response_chats_strict=True,
+    )
+
+    # Mention passes
+    assert adapter._should_process_message(
+        _group_message("hi @hermes_bot", chat_id=-200, entities=[_mention_entity("hi @hermes_bot")])
+    ) is True
+
+    # Reply to bot passes
+    assert adapter._should_process_message(
+        _group_message("thanks", chat_id=-200, reply_to_bot=True)
+    ) is True
+
+    # Starts with bot name passes (username)
+    assert adapter._should_process_message(
+        _group_message("hermes_bot что делаешь", chat_id=-200)
+    ) is True
+
+    # Starts with @botname passes
+    assert adapter._should_process_message(
+        _group_message("@hermes_bot привет", chat_id=-200)
+    ) is True
+
+    # Starts with bot first_name passes
+    adapter_first = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-200"],
+        free_response_chats_strict=True,
+        bot_username="grisha_bot",
+    )
+    assert adapter_first._should_process_message(
+        _group_message("grisha_bot привет", chat_id=-200)
+    ) is True
+
+
+def test_strict_free_response_chats_blocks_ordinary_messages():
+    """Strict mode: messages not addressed to bot are discarded."""
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-200"],
+        free_response_chats_strict=True,
+    )
+
+    # Plain text — blocked
+    assert adapter._should_process_message(
+        _group_message("hello everyone", chat_id=-200)
+    ) is False
+
+    # Bot name in the middle — blocked (not at start)
+    assert adapter._should_process_message(
+        _group_message("эй hermes_bot ты тут", chat_id=-200)
+    ) is False
+
+    # Another chat not in free_response_chats — blocked by require_mention
+    assert adapter._should_process_message(
+        _group_message("hello", chat_id=-201)
+    ) is False
+
+
+def test_strict_free_response_chats_without_strict_is_backward_compatible():
+    """Without strict mode, free_response_chats pass everything (existing behavior)."""
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-200"],
+        free_response_chats_strict=False,
+    )
+
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is True
+    assert adapter._should_process_message(_group_message("random text", chat_id=-200)) is True
+
+
+def test_strict_free_response_chats_strict_defaults_to_false():
+    """When free_response_chats_strict is not configured, it defaults to False."""
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-200"],
+        # free_response_chats_strict not set → defaults to False
+    )
+
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is True
+
+
+def test_message_starts_with_bot_name_edge_cases():
+    """_message_starts_with_bot_name handles punctuation and empty text."""
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-200"],
+        free_response_chats_strict=True,
+    )
+
+    # Name followed by comma
+    assert adapter._should_process_message(
+        _group_message("hermes_bot, привет", chat_id=-200)
+    ) is True
+
+    # Name followed by colon
+    assert adapter._should_process_message(
+        _group_message("hermes_bot: привет", chat_id=-200)
+    ) is True
+
+    # Name followed by exclamation
+    assert adapter._should_process_message(
+        _group_message("hermes_bot! давай", chat_id=-200)
+    ) is True
+
+    # Just the name (no following text)
+    assert adapter._should_process_message(
+        _group_message("hermes_bot", chat_id=-200)
+    ) is True
+
+    # @username alone
+    assert adapter._should_process_message(
+        _group_message("@hermes_bot", chat_id=-200)
+    ) is True
+
+    # Empty message — should not crash
+    assert adapter._should_process_message(
+        _group_message("", chat_id=-200)
+    ) is False
+
+    # Case insensitive
+    assert adapter._should_process_message(
+        _group_message("HERMES_BOT привет", chat_id=-200)
+    ) is True
+
+    assert adapter._should_process_message(
+        _group_message("@Hermes_Bot привет", chat_id=-200)
+    ) is True
 
 
 def test_guest_mode_allows_only_direct_mentions_outside_allowed_chats():

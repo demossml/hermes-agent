@@ -5148,6 +5148,54 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_free_response_chats_strict(self) -> bool:
+        """Return whether free_response_chats require explicit addressing.
+
+        When enabled, messages in free_response_chats are only passed to the
+        agent when they explicitly address the bot (mention, reply, or start
+        with the bot's name).  Other messages are discarded at the gateway
+        level before reaching the LLM.
+        """
+        configured = self.config.extra.get("free_response_chats_strict")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return os.getenv("TELEGRAM_FREE_RESPONSE_CHATS_STRICT", "false").lower() in {"true", "1", "yes", "on"}
+
+    def _message_starts_with_bot_name(self, message: Message) -> bool:
+        """Return True when the message text starts with the bot's name.
+
+        Checks both the bot's username (with or without @ prefix) and
+        first name, case-insensitive.  Trailing punctuation after the
+        name is stripped before the check.
+        """
+        if not self._bot:
+            return False
+        text = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
+        if not text:
+            return False
+        text_lower = text.lower()
+        bot_username = (getattr(self._bot, "username", None) or "").lower()
+        bot_first_name = (getattr(self._bot, "first_name", None) or "").lower()
+        candidates = []
+        if bot_username:
+            candidates.extend([bot_username, f"@{bot_username}"])
+        if bot_first_name:
+            candidates.append(bot_first_name)
+        for candidate in candidates:
+            if not candidate:
+                continue
+            # Match at start of text, optionally followed by punctuation/whitespace
+            if text_lower == candidate:
+                return True
+            prefix = text_lower[:len(candidate)]
+            if prefix == candidate:
+                after = text_lower[len(candidate):]
+                if not after or after[0] in (",", ".", "!", "?", ":", ";", " ", "\n"):
+                    return True
+        return False
+
     def _telegram_allowed_chats(self) -> set[str]:
         """Return the whitelist of group/supergroup chat IDs the bot will respond in.
 
@@ -5769,6 +5817,18 @@ class TelegramAdapter(BasePlatformAdapter):
         if guest_mention:
             return True
         if chat_id_str in self._telegram_free_response_chats():
+            if self._telegram_free_response_chats_strict():
+                # Strict mode: only pass explicitly addressed messages.
+                # The agent will NOT see messages that fail this gate —
+                # the decision is made at the gateway level, before any
+                # prompt context or LLM invocation.
+                if self._is_reply_to_bot(message):
+                    return True
+                if self._message_mentions_bot(message):
+                    return True
+                if self._message_starts_with_bot_name(message):
+                    return True
+                return False
             return True
         if not self._telegram_require_mention():
             return True
