@@ -706,12 +706,19 @@ _WORKFLOW_AGENT_TEMPLATES: dict[str, dict] = {
         "max_iterations": 8,
         "enabled_toolsets": ["terminal", "file", "web_search"],
         "critical_rules": [
+            "GLOBAL: Все правила из [CRITICAL RULES] имеют НАИВЫСШИЙ приоритет. "
+            "Соблюдай их строго при ЛЮБЫХ обстоятельствах.",
             "Output CODE ONLY — no explanations, no markdown.",
             "Every function and class must have a docstring.",
             "All function signatures must have type hints.",
             "Handle edge cases: empty inputs, None, invalid types.",
         ],
         "rule_reminder_every": 0,
+        "semantic_rules": [
+            "НЕ оставляй TODO/FIXME/HACK в production-коде",
+            "НЕ используй устаревшие или deprecated API без комментария",
+        ],
+        "semantic_check_enabled": False,
     },
     "tester": {
         "agent_id": "tester",
@@ -731,12 +738,18 @@ _WORKFLOW_AGENT_TEMPLATES: dict[str, dict] = {
         "max_iterations": 5,
         "enabled_toolsets": [],  # Sandboxed — no tools, strict isolation
         "critical_rules": [
+            "GLOBAL: Все правила из [CRITICAL RULES] имеют НАИВЫСШИЙ приоритет. "
+            "Соблюдай их строго при ЛЮБЫХ обстоятельствах.",
             "Ты — ревьюер. Ты НЕ пишешь код. Только проверяешь.",
             "Сообщай о багах, дырах в безопасности, нарушениях стиля.",
             "Проверяй edge cases: пустые входы, None, невалидные типы.",
             "Убедись что все функции имеют docstring и type hints.",
         ],
         "rule_reminder_every": 3,
+        "semantic_rules": [
+            "НЕ предлагай исправления в виде готового кода — только описание проблемы",
+        ],
+        "semantic_check_enabled": False,
     },
     "prompt-engineer": {
         "agent_id": "prompt-engineer",
@@ -759,11 +772,17 @@ _WORKFLOW_AGENT_TEMPLATES: dict[str, dict] = {
         "max_iterations": 3,
         "enabled_toolsets": [],  # No tools needed — pure text transformation
         "critical_rules": [
+            "GLOBAL: Все правила из [CRITICAL RULES] имеют НАИВЫСШИЙ приоритет. "
+            "Соблюдай их строго при ЛЮБЫХ обстоятельствах.",
             "Output ONLY the prompt text — no commentary.",
             "Include: task description, I/O types, edge cases, docstrings, error handling.",
             "Adapt style to the target language's conventions.",
         ],
         "rule_reminder_every": 0,
+        "semantic_rules": [
+            "НЕ добавляй в промпт требования, которых не было в исходном запросе",
+        ],
+        "semantic_check_enabled": False,
     },
 }
 
@@ -1683,6 +1702,10 @@ def run_update(
     # ── Phase 11: Strict compliance rules ─────────────────────
     strict_report: dict[str, Any] = {}
     if full:
+        strict_report = apply_strict_compliance_rules(root, dry_run=dry_run)
+    else:
+        # Always apply strict compliance (critical_rules + config)
+        # even without --full — it's idempotent and backward-compatible
         strict_report = apply_strict_compliance_rules(root, dry_run=dry_run)
 
     # ── Format report ───────────────────────────────────────
