@@ -1237,6 +1237,8 @@ class AgentRegistry:
         self._semantic_cache: dict[str, list[str]] = {}  # hash → violated rules
         self._semantic_cache_max: int = 200
         self._rule_cache_obj = None  # lazy-init from core.violation_learner
+        self._semantic_last_call: dict[str, float] = {}  # agent_id → timestamp
+        self._semantic_rate_limit: float = 10.0  # seconds between LLM calls per agent
 
     @property
     def _rule_cache(self):
@@ -2779,6 +2781,21 @@ class AgentRegistry:
             )
             return list(self._semantic_cache[cache_key])
 
+        # ── Rate limit: max 1 LLM call per agent per 10s ─────
+        import time
+        now = time.time()
+        last = self._semantic_last_call.get(agent_id, 0)
+        elapsed = now - last
+        rate_limit = self._semantic_rate_limit
+        if elapsed < rate_limit:
+            logger.debug(
+                f"Semantic check RATE LIMITED for '{agent_id}' "
+                f"({elapsed:.1f}s since last call, limit={rate_limit}s)"
+            )
+            return []
+
+        self._semantic_last_call[agent_id] = now
+
         cfg = self._agents.get(agent_id, {})
         provider_name = cfg.get("semantic_check_provider", "deepseek")
         model_name = cfg.get("semantic_check_model", "deepseek-chat")
@@ -2815,9 +2832,17 @@ class AgentRegistry:
         self._semantic_cache[cache_key] = list(violated)
         # Limit cache size
         if len(self._semantic_cache) > self._semantic_cache_max:
-            # Evict oldest (first key in dict)
             oldest = next(iter(self._semantic_cache))
             del self._semantic_cache[oldest]
+
+        # ── Periodic rate limiter cleanup ───────────────────
+        if len(self._semantic_last_call) > 50:
+            import time
+            cutoff = time.time() - self._semantic_rate_limit * 10
+            self._semantic_last_call = {
+                k: v for k, v in self._semantic_last_call.items()
+                if v > cutoff
+            }
 
         return violated
 
