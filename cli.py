@@ -7930,6 +7930,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_improve(cmd_original)
         elif canonical == "agent-off":
             self._handle_agent_off()
+        elif canonical == "rules":
+            self._handle_rules(cmd_original)
         elif canonical in ("project", "proj"):
             self._handle_project(cmd_original)
         elif canonical in ("projects", "projs"):
@@ -9581,6 +9583,44 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _active_subagent = None
         else:
             _cprint("  Already in main agent mode")
+
+    def _handle_rules(self, cmd: str):
+        """/rules <learn|list|history> — self-learning rule management."""
+        from core.violation_learner import (
+            get_violation_history, learn_from_violations, format_learn_report,
+        )
+
+        parts = cmd.strip().split()
+        action = parts[1].lower() if len(parts) > 1 else "learn"
+
+        if action == "list" or action == "ls":
+            history = get_violation_history()
+            recent = history.recent(limit=20)
+            if not recent:
+                _cprint("  No violations recorded.")
+                return
+            _cprint(f"  Violation history (last {len(recent)}):")
+            for r in recent:
+                icon = "OK" if r.was_caught else "MISS"
+                _cprint(f"    [{icon}] {r.agent_id}: {r.rule_text[:60]}...")
+
+        elif action == "history":
+            history = get_violation_history()
+            agent = parts[2] if len(parts) > 2 else None
+            missed = history.missed(agent)
+            _cprint(f"  Missed violations: {len(missed)}/{history.count}")
+            if missed:
+                from collections import Counter
+                rule_counts = Counter(r.rule_text[:60] for r in missed)
+                for rule_key, count in rule_counts.most_common(5):
+                    _cprint(f"    {count}x: {rule_key}...")
+
+        else:  # learn
+            agent = parts[2] if len(parts) > 2 else None
+            _cprint("  Analyzing violation history...")
+            suggestions = learn_from_violations(agent_id=agent)
+            report = format_learn_report(suggestions)
+            _cprint(report)
 
     def _handle_project(self, cmd: str):
         """Handle /project — manage Hermes projects.

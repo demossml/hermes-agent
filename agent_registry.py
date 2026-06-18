@@ -2307,6 +2307,13 @@ class AgentRegistry:
                             f"Agent '{agent_id}' violated rules "
                             f"(attempt {correction_attempt+1}/2): {violations}"
                         )
+                        # ── Record violation for self-learning ──────
+                        self._record_violations(
+                            agent_id=agent_id,
+                            violations=violations,
+                            reply=reply,
+                            was_caught=True,
+                        )
                         # Send correction
                         correction_msg = (
                             f"[VIOLATION] You violated critical rules: {', '.join(violations)}. "
@@ -2361,6 +2368,48 @@ class AgentRegistry:
             pass
 
         return f"Error from agent '{agent_id}': {last_error}"
+
+    def _record_violations(
+        self, agent_id: str, violations: list[str],
+        reply: str, was_caught: bool,
+    ) -> None:
+        """Record violations in persistent history for self-learning."""
+        try:
+            from core.violation_learner import get_violation_history
+
+            history = get_violation_history()
+            cfg = self._agents.get(agent_id, {})
+            model = cfg.get("model", "")
+
+            for rule_text in violations:
+                history.record(
+                    agent_id=agent_id,
+                    rule_text=rule_text,
+                    response_snippet=reply[:300] if reply else "",
+                    was_caught=was_caught,
+                    category=self._guess_violation_category(rule_text),
+                    model=model,
+                )
+        except Exception:
+            pass  # Non-critical — don't break agent loop
+
+    @staticmethod
+    def _guess_violation_category(rule_text: str) -> str:
+        """Guess violation category from rule text."""
+        r = rule_text.lower()
+        if any(kw in r for kw in ("не пиши код", "don't write code", "no code")):
+            return "code_restriction"
+        if any(kw in r for kw in ("не используй", "don't use", "never use")):
+            return "tool_restriction"
+        if any(kw in r for kw in ("отвечай только на", "respond only in", "speak only")):
+            return "language"
+        if any(kw in r for kw in ("delegate", "делегируй")):
+            return "delegate"
+        if any(kw in r for kw in ("не упоминай", "не говори", "don't mention")):
+            return "forbidden_word"
+        if "global" in r:
+            return "global"
+        return "custom"
 
     async def _check_violations(
         self, agent_id: str, reply: str,

@@ -308,6 +308,13 @@ COMMAND_REGISTRY: list[CommandDef] = [
         cli_only=True,
     ),
     CommandDef(
+        "rules",
+        "Rule management: learn, list, history. /rules <learn|list|history>",
+        "Agents",
+        args_hint="<learn|list|history>",
+        cli_only=True,
+    ),
+    CommandDef(
         "project",
         "Manage projects: /project [new|list|switch|current|rename|delete]",
         "Agents",
