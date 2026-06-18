@@ -540,7 +540,7 @@ def test_exclusive_bot_mentions_can_be_disabled_for_legacy_groups():
 
 
 def test_free_response_chats_bypass_mention_requirement():
-    adapter = _make_adapter(require_mention=True, free_response_chats=["-200"])
+    adapter = _make_adapter(require_mention=True, free_response_chats=["-200"], free_response_chats_strict=False)
 
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is True
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is False
@@ -625,15 +625,20 @@ def test_strict_free_response_chats_without_strict_is_backward_compatible():
     assert adapter._should_process_message(_group_message("random text", chat_id=-200)) is True
 
 
-def test_strict_free_response_chats_strict_defaults_to_false():
-    """When free_response_chats_strict is not configured, it defaults to False."""
+def test_strict_free_response_chats_strict_defaults_to_true():
+    """When free_response_chats_strict is not configured, it defaults to True."""
     adapter = _make_adapter(
         require_mention=True,
         free_response_chats=["-200"],
-        # free_response_chats_strict not set → defaults to False
+        # free_response_chats_strict not set → defaults to True
     )
 
-    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is True
+    # Ordinary message blocked (strict mode on by default)
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is False
+    # Mention still passes
+    assert adapter._should_process_message(
+        _group_message("@hermes_bot привет", chat_id=-200, entities=[_mention_entity("@hermes_bot привет")])
+    ) is True
 
 
 def test_message_starts_with_bot_name_edge_cases():
@@ -732,7 +737,10 @@ def test_guest_mode_mention_dropped_in_ignored_thread():
 
 
 def test_ignored_threads_drop_group_messages_before_other_gates():
-    adapter = _make_adapter(require_mention=False, free_response_chats=["-200"], ignored_threads=[31, "42"])
+    adapter = _make_adapter(
+        require_mention=False, free_response_chats=["-200"],
+        free_response_chats_strict=False, ignored_threads=[31, "42"],
+    )
 
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200, thread_id=31)) is False
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200, thread_id=42)) is False

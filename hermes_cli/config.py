@@ -1990,6 +1990,7 @@ DEFAULT_CONFIG = {
         "reactions": False,            # Add 👀/✅/❌ reactions to messages during processing
         "channel_prompts": {},         # Per-chat/topic ephemeral system prompts (topics inherit from parent group)
         "allowed_chats": "",           # If set, bot ONLY responds in these group/supergroup chat IDs (whitelist)
+        "free_response_chats_strict": True,  # When True, free_response_chats require explicit @mention / reply / bot-name prefix
         "extra": {
             "rich_messages": False,     # Opt in to Bot API 10.1 rich messages; default uses legacy MarkdownV2
         },

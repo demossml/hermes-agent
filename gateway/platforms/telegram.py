@@ -5161,7 +5161,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("TELEGRAM_FREE_RESPONSE_CHATS_STRICT", "false").lower() in {"true", "1", "yes", "on"}
+        return os.getenv("TELEGRAM_FREE_RESPONSE_CHATS_STRICT", "true").lower() in {"true", "1", "yes", "on"}
 
     def _message_starts_with_bot_name(self, message: Message) -> bool:
         """Return True when the message text starts with the bot's name.
