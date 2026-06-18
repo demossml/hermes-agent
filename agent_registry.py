@@ -689,9 +689,18 @@ class AdvancedRuleChecker:
                 return None
             tools_str = m.group(1)
             tools = {t.strip().lower() for t in tools_str.split(",") if t.strip()}
+            # Expand: add common synonyms
+            synonym_map = {
+                "terminal": {"terminal", "shell", "bash", "command"},
+                "execute_code": {"execute_code", "exec", "subprocess"},
+            }
+            expanded = set(tools)
+            for t in tools:
+                if t in synonym_map:
+                    expanded.update(synonym_map[t])
             return Rule(
                 text=text, category=RuleCategory.TOOL_RESTRICTION,
-                forbidden_tools=tools,
+                forbidden_tools=expanded,
             )
 
         def _parse_language(text: str) -> Rule | None:
@@ -943,6 +952,18 @@ class AdvancedRuleChecker:
 
             if rule.category == RuleCategory.TOOL_RESTRICTION:
                 detail = self._check_tool_restriction(rule, tool_calls)
+                # Fallback: check response text for tool synonyms
+                # (e.g. "I'll use bash" when bash ∈ forbidden_tools)
+                if not detail and rule.forbidden_tools and reply_lower:
+                    text_hits = [
+                        t for t in rule.forbidden_tools
+                        if t in reply_lower
+                    ]
+                    if text_hits:
+                        detail = (
+                            f"Tool mention(s) in text: {', '.join(text_hits)} "
+                            f"(forbidden by rule: {rule.text})"
+                        )
             elif rule.category == RuleCategory.LANGUAGE:
                 detail = self._check_language(rule, response)
             elif rule.category == RuleCategory.CODE_RESTRICTION:
@@ -974,15 +995,23 @@ class AdvancedRuleChecker:
     def _check_tool_restriction(
         rule: Rule, tool_calls: list[dict] | None,
     ) -> str | None:
-        if not tool_calls or not rule.forbidden_tools:
-            return None
-        for tc in tool_calls:
-            name = (tc.get("name") or tc.get("function", {}).get("name", "")).lower()
-            if name in rule.forbidden_tools:
-                return (
-                    f"Tool '{name}' was called but is forbidden "
-                    f"by rule: {rule.text}"
-                )
+        violations = []
+        # Check actual tool calls
+        if tool_calls:
+            for tc in tool_calls:
+                name = (tc.get("name") or tc.get("function", {}).get("name", "")).lower()
+                if name in rule.forbidden_tools:
+                    violations.append(f"Tool '{name}' was called but is forbidden")
+
+        # Also check response text for tool mentions (synonyms)
+        # e.g. "I'll use bash" when bash is a forbidden_tool synonym
+        if not violations and rule.forbidden_tools:
+            # Only check response text if no tool_call was made
+            # (tool_calls take priority)
+            pass  # Text check is handled by _check_forbidden_words separately
+
+        if violations:
+            return f"{violations[0]} by rule: {rule.text}"
         return None
 
     @staticmethod
@@ -1012,15 +1041,90 @@ class AdvancedRuleChecker:
     def _check_code(rule: Rule, response: str) -> str | None:
         if not response:
             return None
+        # Precise code markers: avoid false positives on conversational text
         code_markers = [
-            "```", "def ", "class ", "import ",
-            "function ", "const ", "let ", "var ",
-            "return ", "async ", "await ",
-            "<?php", "#!/", "package ",
+            "```",                      # code fence (unambiguous)
+            "def ",                     # Python function
+            "class ",                   # Python class
+            "import ",                  # import statement
+            "from ",                    # from x import y
+            "function(",                # JS/TS function call (NOT "function " alone)
+            "const ",                   # JS const
+            "let ",                     # JS let
+            "var ",                     # JS var
+            "return ",                  # return statement
+            "async ",                   # async keyword
+            "await ",                   # await keyword
+            "<?php",                    # PHP
+            "#!/",                      # shebang
+            "package ",                 # Go/Java package
+            "=>",                       # arrow function
+            "def function",             # Python typed function
         ]
-        found = [m for m in code_markers if m in response]
+        # Whitelist: words containing marker substrings but NOT code
+        whitelist_contexts = [
+            "definition", "definitive", "definitely",   # contain "def "
+            "classification", "classical", "classroom",  # contain "class "
+            "functionality", "malfunction",              # contain "function"
+            "the function of", "a function of",          # conversational
+            "main function", "primary function",          # conversational
+            "important ", "importance",                   # contain "import "
+            "information", "constellation",               # contain "const "/"informat"
+            "lettuce", "letter", "letting",               # contain "let "
+            "variety", "various", "variable",             # contain "var " (only "var " detection)
+        ]
+
+        resp_lower = response.lower()
+
+        # Check for whitelist contexts — if found, mask them before checking markers
+        masked = response
+        for wc in whitelist_contexts:
+            if wc in resp_lower:
+                # Mask this specific occurrence
+                import re as _re
+                masked = _re.sub(
+                    _re.escape(wc), " " * len(wc), masked, count=0,
+                    flags=_re.IGNORECASE,
+                )
+
+        # Check code_markers with context awareness
+        found = []
+        for m in code_markers:
+            if m == "return " or m == "async " or m == "await ":
+                # These are only code if at line start or indented
+                import re as _re3
+                if _re3.search(rf"(^|\n)\s*{_re3.escape(m)}", masked, _re3.IGNORECASE):
+                    found.append(m)
+            elif m in masked:
+                found.append(m)
         if found:
             return f"Code detected (markers: {', '.join(found[:3])})"
+
+        # ── Pseudocode detection ──────────────────────────
+        # Lines that look like code: indented + contain code patterns
+        lines = response.split("\n")
+        code_like_lines = 0
+        code_patterns = [
+            r"^\s{2,}(if|for|while|try|with|return|yield|break|continue|raise|pass)\b",
+            r"^\s{2,}[a-zA-Z_]\w*\s*[=:]\s*",
+            r"^\s{2,}[a-zA-Z_]\w*\.\w+\(",
+            r"^\s{2,}(print|len|range|enumerate|sorted|list|dict|set)\(",
+            r"^\s{0,2}(import|from)\s+\w+",
+        ]
+        import re as _re2
+        for line in lines:
+            for pat in code_patterns:
+                if _re2.search(pat, line, _re2.IGNORECASE | _re2.MULTILINE):
+                    code_like_lines += 1
+                    break
+
+        # If 3+ lines look like code → pseudocode detected
+        if code_like_lines >= 3:
+            return (
+                f"Pseudocode detected "
+                f"({code_like_lines} code-like lines)"
+            )
+
         return None
 
     @staticmethod
