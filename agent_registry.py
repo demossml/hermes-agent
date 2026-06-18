@@ -2775,11 +2775,12 @@ class AgentRegistry:
         # ── Cache check ──────────────────────────────────────
         cache_key = self._semantic_cache_key(semantic_rules, reply)
         if cache_key in self._semantic_cache:
-            logger.debug(
-                f"Semantic check cache HIT for agent '{agent_id}' "
-                f"(key={cache_key[:12]}...)"
+            cached_violations = list(self._semantic_cache[cache_key])
+            self._log_semantic(
+                agent_id, semantic_rules, reply,
+                violations=cached_violations, cache_hit=True,
             )
-            return list(self._semantic_cache[cache_key])
+            return cached_violations
 
         # ── Rate limit: max 1 LLM call per agent per 10s ─────
         import time
@@ -2791,6 +2792,10 @@ class AgentRegistry:
             logger.debug(
                 f"Semantic check RATE LIMITED for '{agent_id}' "
                 f"({elapsed:.1f}s since last call, limit={rate_limit}s)"
+            )
+            self._log_semantic(
+                agent_id, semantic_rules, reply,
+                violations=[], rate_limited=True,
             )
             return []
 
@@ -2804,6 +2809,7 @@ class AgentRegistry:
         # Build prompt with JSON output requirement
         prompt = self._build_semantic_check_prompt(semantic_rules, reply)
 
+        t_start = time.time()
         try:
             result_text = await asyncio.wait_for(
                 self._call_cheap_llm_async(
@@ -2823,9 +2829,18 @@ class AgentRegistry:
             )
             return []
 
+        duration_ms = (time.time() - t_start) * 1000
+
         # Parse structured JSON
-        violated = self._parse_semantic_result(
+        violated, confidence, explanation = self._parse_semantic_result(
             result_text, semantic_rules, agent_id,
+        )
+
+        # ── Log to dedicated file ─────────────────────────────
+        self._log_semantic(
+            agent_id, semantic_rules, reply,
+            violations=violated, confidence=confidence,
+            explanation=explanation, duration_ms=duration_ms,
         )
 
         # ── Cache the result ─────────────────────────────────
@@ -2886,7 +2901,7 @@ class AgentRegistry:
     @staticmethod
     def _parse_semantic_result(
         result_text: str, rules: list[str], agent_id: str,
-    ) -> list[str]:
+    ) -> tuple[list[str], float, str]:
         """Parse JSON result from semantic checker into violated rule texts.
 
         Fail-open: any parse failure → empty list (no violations assumed).
@@ -2895,7 +2910,7 @@ class AgentRegistry:
         import json as _json
 
         if not result_text:
-            return []
+            return [], 0.0, ""
 
         # Try to extract JSON from response (may have markdown fences)
         text = result_text.strip()
@@ -2920,17 +2935,17 @@ class AgentRegistry:
                         f"Semantic check: failed to parse JSON from "
                         f"agent '{agent_id}' (fail-open, no violations)"
                     )
-                    return []
+                    return [], 0.0, ""
             else:
                 logger.warning(
                     f"Semantic check: no JSON found in response "
                     f"for '{agent_id}' (fail-open, no violations)"
                 )
-                return []
+                return [], 0.0, ""
 
         violations_list = data.get("violations", [])
         if not isinstance(violations_list, list):
-            return []  # fail-open
+            return [], 0.0, ""  # fail-open
 
         # Confidence threshold: only act on high-confidence violations
         confidence = float(data.get("confidence", 0) or 0)
@@ -2939,7 +2954,7 @@ class AgentRegistry:
                 f"Semantic check for '{agent_id}': "
                 f"low confidence ({confidence:.2f}), ignoring"
             )
-            return []
+            return [], confidence, data.get("explanation", "")
 
         # Map "Rule N" → rule text
         violated = []
@@ -2965,7 +2980,34 @@ class AgentRegistry:
                 f"confidence={confidence:.2f}, {explanation[:100]}"
             )
 
-        return violated
+        return violated, confidence, explanation
+
+    def _log_semantic(
+        self, agent_id: str, rules: list[str], reply: str,
+        violations: list[str], cache_hit: bool = False,
+        rate_limited: bool = False, confidence: float = 0.0,
+        explanation: str = "", duration_ms: float = 0.0,
+    ) -> None:
+        """Log semantic check result to dedicated log file."""
+        try:
+            from core.semantic_logger import log_semantic_check
+
+            cfg = self._agents.get(agent_id, {})
+            model = cfg.get("semantic_check_model", "")
+            log_semantic_check(
+                agent_id=agent_id,
+                rules=rules,
+                response=reply,
+                violations=violations,
+                confidence=confidence,
+                explanation=explanation,
+                model=model,
+                duration_ms=duration_ms,
+                cache_hit=cache_hit,
+                rate_limited=rate_limited,
+            )
+        except Exception:
+            pass  # Non-critical
 
     async def _call_cheap_llm_async(
         self, provider_name: str, model_name: str, prompt: str,

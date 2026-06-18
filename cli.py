@@ -7932,6 +7932,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_agent_off()
         elif canonical == "rules":
             self._handle_rules(cmd_original)
+        elif canonical == "semantic":
+            self._handle_semantic(cmd_original)
         elif canonical in ("project", "proj"):
             self._handle_project(cmd_original)
         elif canonical in ("projects", "projs"):
@@ -9635,6 +9637,30 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             suggestions = learn_from_violations(agent_id=agent)
             report = format_learn_report(suggestions)
             _cprint(report)
+
+    def _handle_semantic(self, cmd: str):
+        """/semantic log [last N] — show semantic check log."""
+        from core.semantic_logger import (
+            read_semantic_log, format_semantic_log_entries,
+        )
+
+        parts = cmd.strip().split()
+        limit = 10
+        agent = None
+
+        for i, p in enumerate(parts[1:], 1):
+            if p == "last" and i + 1 < len(parts):
+                try:
+                    limit = int(parts[i + 1])
+                except ValueError:
+                    pass
+            elif p == "agent" and i + 1 < len(parts):
+                agent = parts[i + 1]
+
+        entries = read_semantic_log(limit=limit, agent_id=agent)
+        _cprint(f"  Semantic check log (last {len(entries)} entries):")
+        report = format_semantic_log_entries(entries)
+        _cprint(report)
 
     def _handle_project(self, cmd: str):
         """Handle /project — manage Hermes projects.

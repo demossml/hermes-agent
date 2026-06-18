@@ -315,6 +315,13 @@ COMMAND_REGISTRY: list[CommandDef] = [
         cli_only=True,
     ),
     CommandDef(
+        "semantic",
+        "Semantic check log: /semantic log [last N] [agent id]",
+        "Agents",
+        args_hint="log [last N] [agent id]",
+        cli_only=True,
+    ),
+    CommandDef(
         "project",
         "Manage projects: /project [new|list|switch|current|rename|delete]",
         "Agents",
