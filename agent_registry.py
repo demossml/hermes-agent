@@ -1239,6 +1239,17 @@ class AgentRegistry:
         self._rule_cache_obj = None  # lazy-init from core.violation_learner
         self._semantic_last_call: dict[str, float] = {}  # agent_id → timestamp
         self._semantic_rate_limit: float = 10.0  # seconds between LLM calls per agent
+        # Dynamic confidence thresholds per priority level
+        self._confidence_thresholds: dict[int, float] = {
+            0: 0.65,   # critical
+            1: 0.70,   # high
+            5: 0.75,   # medium
+            10: 0.85,  # low
+        }
+        # Suppression tracker: rule_key → (consecutive_low, suppressed_until_ts)
+        self._suppress_tracker: dict[str, tuple[int, float]] = {}
+        self._suppress_consecutive_limit: int = 3
+        self._suppress_duration: float = 600.0  # 10 minutes
 
     @property
     def _rule_cache(self):
@@ -2741,11 +2752,29 @@ class AgentRegistry:
                     if rt and rt not in semantic_rules:
                         semantic_rules.append(rt)
         if semantic_rules and semantic_enabled:
+            # Build priority map for dynamic thresholds
+            rule_priorities: dict[str, int] = {}
+            for r_spec in rules:
+                if isinstance(r_spec, dict):
+                    rt = r_spec.get("rule", r_spec.get("text", ""))
+                    if rt:
+                        pri = PriorityLevel.parse(r_spec.get("priority", "medium"))
+                        rule_priorities[rt] = pri
+
             try:
-                semantic_violations = await self._semantic_check_violations(
+                results = await self._semantic_check_violations(
                     agent_id, reply, semantic_rules,
+                    rule_priorities=rule_priorities,
                 )
-                violation_texts.extend(semantic_violations)
+                for res in results:
+                    rule_text = res["rule"]
+                    violation_texts.append(rule_text)
+                    # Attach explanation if available
+                    expl = res.get("explanation", "")
+                    if expl and res.get("confidence", 0) > 0:
+                        violation_texts.append(
+                            f"  ↳ [{res['confidence']:.0%}] {expl}"
+                        )
             except Exception as e:
                 logger.warning(
                     f"Semantic check failed for '{agent_id}': {e}"
@@ -2758,19 +2787,37 @@ class AgentRegistry:
 
     async def _semantic_check_violations(
         self, agent_id: str, reply: str, semantic_rules: list[str],
-    ) -> list[str]:
+        rule_priorities: dict[str, int] | None = None,
+    ) -> "list[dict[str, Any]]":
         """Run a second LLM pass to check semantic/critical rules.
 
-        Features:
-        - **Async + timeout** — max 4s, doesn't block the main response
-        - **Caching** — hash(rule_texts + reply) → cached result
-        - **Batch** — all rules in ONE LLM call
-        - **Structured JSON** — model returns parsable JSON, not free text
-
-        Returns list of violated rule texts.
+        Returns list of dicts: {rule, explanation, confidence}
         """
         if not semantic_rules or not reply:
             return []
+
+        # ── Suppression check ──────────────────────────────
+        import time
+        now = time.time()
+        active_rules = []
+        for r in semantic_rules:
+            tracker = self._suppress_tracker.get(r)
+            if tracker:
+                consec, until = tracker
+                if now < until:
+                    logger.debug(
+                        f"Semantic check SUPPRESSED for rule '{r[:40]}...' "
+                        f"(low confidence {consec}x, until "
+                        f"{time.strftime('%H:%M', time.localtime(until))})"
+                    )
+                    continue  # skip suppressed rule
+            active_rules.append(r)
+
+        if not active_rules:
+            return []
+
+        semantic_rules = active_rules
+        rule_priorities = rule_priorities or {}
 
         # ── Cache check ──────────────────────────────────────
         cache_key = self._semantic_cache_key(semantic_rules, reply)
@@ -2780,7 +2827,9 @@ class AgentRegistry:
                 agent_id, semantic_rules, reply,
                 violations=cached_violations, cache_hit=True,
             )
-            return cached_violations
+            # Convert cached strings back to dict format
+            return [{"rule": r, "explanation": "", "confidence": 1.0}
+                    for r in cached_violations]
 
         # ── Rate limit: max 1 LLM call per agent per 10s ─────
         import time
@@ -2831,35 +2880,59 @@ class AgentRegistry:
 
         duration_ms = (time.time() - t_start) * 1000
 
-        # Parse structured JSON
-        violated, confidence, explanation = self._parse_semantic_result(
-            result_text, semantic_rules, agent_id,
+        # Parse structured JSON with dynamic thresholds
+        result = self._parse_semantic_result_with_thresholds(
+            result_text, semantic_rules, agent_id, rule_priorities,
         )
+        violated_rules = [r["rule"] for r in result]
+        explanation = result[0]["explanation"] if result else ""
+        confidence = result[0]["confidence"] if result else 0.0
 
-        # ── Log to dedicated file ─────────────────────────────
+        # ── Suppression tracking ───────────────────────────
+        for rule_text in semantic_rules:
+            rule_conf = next(
+                (r["confidence"] for r in result if r["rule"] == rule_text), 1.0
+            )
+            pri = rule_priorities.get(rule_text, 5)
+            threshold = self._confidence_thresholds.get(pri, 0.75)
+            tracker = self._suppress_tracker.get(rule_text)
+
+            if rule_conf < threshold:
+                consec = (tracker[0] + 1) if tracker else 1
+                if consec >= self._suppress_consecutive_limit:
+                    until = time.time() + self._suppress_duration
+                    self._suppress_tracker[rule_text] = (consec, until)
+                    logger.warning(
+                        f"Semantic check SUPPRESSING rule '{rule_text[:40]}...' "
+                        f"for {self._suppress_duration}s "
+                        f"(low confidence {rule_conf:.2f} x{consec})"
+                    )
+                else:
+                    self._suppress_tracker[rule_text] = (consec, 0)
+            elif tracker:
+                # Confidence back to normal → reset tracker
+                del self._suppress_tracker[rule_text]
+
+        # ── Log + cache ────────────────────────────────────
         self._log_semantic(
             agent_id, semantic_rules, reply,
-            violations=violated, confidence=confidence,
+            violations=violated_rules, confidence=confidence,
             explanation=explanation, duration_ms=duration_ms,
         )
-
-        # ── Cache the result ─────────────────────────────────
-        self._semantic_cache[cache_key] = list(violated)
-        # Limit cache size
+        self._semantic_cache[cache_key] = list(violated_rules)
         if len(self._semantic_cache) > self._semantic_cache_max:
             oldest = next(iter(self._semantic_cache))
             del self._semantic_cache[oldest]
 
-        # ── Periodic rate limiter cleanup ───────────────────
+        # ── Periodic cleanup ───────────────────────────────
         if len(self._semantic_last_call) > 50:
-            import time
             cutoff = time.time() - self._semantic_rate_limit * 10
             self._semantic_last_call = {
                 k: v for k, v in self._semantic_last_call.items()
                 if v > cutoff
             }
 
-        return violated
+        return result
 
     @staticmethod
     def _semantic_cache_key(rules: list[str], reply: str) -> str:
@@ -2981,6 +3054,95 @@ class AgentRegistry:
             )
 
         return violated, confidence, explanation
+
+    @staticmethod
+    def _parse_semantic_result_with_thresholds(
+        result_text: str, rules: list[str], agent_id: str,
+        rule_priorities: dict[str, int],
+    ) -> "list[dict[str, Any]]":
+        """Parse with priority-dependent confidence thresholds.
+
+        critical (0) → 0.65  |  high (1) → 0.70
+        medium (5)   → 0.75  |  low (10)  → 0.85
+
+        Returns list of dicts: {rule, explanation, confidence}
+        """
+        # Use existing parser but pass custom threshold logic
+        results = AgentRegistry._parse_semantic_result_inner(
+            result_text, rules, agent_id, rule_priorities,
+        )
+        return results
+
+    @staticmethod
+    def _parse_semantic_result_inner(
+        result_text: str, rules: list[str], agent_id: str,
+        rule_priorities: dict[str, int] | None = None,
+    ) -> "list[dict[str, Any]]":
+        """Parse JSON, apply per-rule dynamic confidence thresholds."""
+        import json as _json
+
+        if not result_text:
+            return []
+
+        rp = rule_priorities or {}
+
+        text = result_text.strip()
+        if "```" in text:
+            import re as _re
+            m = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, _re.DOTALL)
+            if m:
+                text = m.group(1)
+
+        try:
+            data = _json.loads(text)
+        except _json.JSONDecodeError:
+            import re as _re
+            m = _re.search(r"\{.*\}", text, _re.DOTALL)
+            if m:
+                try:
+                    data = _json.loads(m.group(0))
+                except _json.JSONDecodeError:
+                    return []
+            else:
+                return []
+
+        violations_list = data.get("violations", [])
+        if not isinstance(violations_list, list):
+            return []
+
+        raw_confidence = float(data.get("confidence", 0) or 0)
+        explanation = data.get("explanation", "") or ""
+
+        results = []
+        for v in violations_list:
+            v_str = str(v).strip()
+            import re as _re
+            num_match = _re.search(r"(\d+)", v_str)
+            if num_match:
+                idx = int(num_match.group(1)) - 1
+                if 0 <= idx < len(rules):
+                    rule_text = rules[idx]
+                    pri = rp.get(rule_text, 5)
+                    threshold = {0: 0.65, 1: 0.70, 5: 0.75, 10: 0.85}.get(pri, 0.75)
+                    if raw_confidence >= threshold:
+                        results.append({
+                            "rule": rule_text,
+                            "explanation": explanation,
+                            "confidence": raw_confidence,
+                        })
+                        logger.info(
+                            f"Semantic check: agent '{agent_id}' violated "
+                            f"rule: {rule_text[:60]}... "
+                            f"(conf={raw_confidence:.2f} >= {threshold})"
+                        )
+                    else:
+                        logger.debug(
+                            f"Semantic check: LOW confidence for "
+                            f"'{rule_text[:40]}...' "
+                            f"(conf={raw_confidence:.2f} < {threshold}), ignored"
+                        )
+
+        return results
 
     def _log_semantic(
         self, agent_id: str, rules: list[str], reply: str,
