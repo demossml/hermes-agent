@@ -691,8 +691,10 @@ class AdvancedRuleChecker:
             tools = {t.strip().lower() for t in tools_str.split(",") if t.strip()}
             # Expand: add common synonyms
             synonym_map = {
-                "terminal": {"terminal", "shell", "bash", "command"},
-                "execute_code": {"execute_code", "exec", "subprocess"},
+                "terminal": {"terminal", "shell", "bash", "command",
+                             "command line", "cmd", "shell command",
+                             "run in console", "execute in terminal"},
+                "execute_code": {"execute_code", "exec", "subprocess", "eval"},
             }
             expanded = set(tools)
             for t in tools:
@@ -1090,35 +1092,49 @@ class AdvancedRuleChecker:
         # Check code_markers with context awareness
         found = []
         for m in code_markers:
-            if m == "return " or m == "async " or m == "await ":
+            if m in ("return ", "async ", "await "):
                 # These are only code if at line start or indented
                 import re as _re3
                 if _re3.search(rf"(^|\n)\s*{_re3.escape(m)}", masked, _re3.IGNORECASE):
                     found.append(m)
+            elif m == "import ":
+                # "import " followed by identifier or at line end
+                if m in masked:
+                    found.append(m)
+                else:
+                    # Edge case: bare "import" at end of line
+                    import re as _re3
+                    if _re3.search(r"(^|\n|;)\s*import\s*$", masked, _re3.IGNORECASE | _re3.MULTILINE):
+                        found.append("import")
             elif m in masked:
                 found.append(m)
         if found:
             return f"Code detected (markers: {', '.join(found[:3])})"
 
         # ── Pseudocode detection ──────────────────────────
-        # Lines that look like code: indented + contain code patterns
+        # ── Pseudocode detection ──────────────────────────
         lines = response.split("\n")
         code_like_lines = 0
+        # Skip bullet-point lines (start with "  -", "  *", "  •", "  ·")
+        bullet_re = r"^\s{0,4}[-*•·#>]\s"
         code_patterns = [
             r"^\s{2,}(if|for|while|try|with|return|yield|break|continue|raise|pass)\b",
-            r"^\s{2,}[a-zA-Z_]\w*\s*[=:]\s*",
+            r"^\s{2,}[a-zA-Z_]\w*\s*[=:]\s*[^=:]",
             r"^\s{2,}[a-zA-Z_]\w*\.\w+\(",
             r"^\s{2,}(print|len|range|enumerate|sorted|list|dict|set)\(",
             r"^\s{0,2}(import|from)\s+\w+",
         ]
         import re as _re2
         for line in lines:
+            # Skip bullets
+            if _re2.search(bullet_re, line):
+                continue
             for pat in code_patterns:
-                if _re2.search(pat, line, _re2.IGNORECASE | _re2.MULTILINE):
+                if _re2.search(pat, line, _re2.IGNORECASE):
                     code_like_lines += 1
                     break
 
-        # If 3+ lines look like code → pseudocode detected
+        # Threshold: 3+ code-like lines (non-bullet)
         if code_like_lines >= 3:
             return (
                 f"Pseudocode detected "
@@ -2652,8 +2668,38 @@ class AgentRegistry:
                     category=self._guess_violation_category(rule_text),
                     model=model,
                 )
+            # ── Auto-trigger learning after 3+ identical violations ──
+            self._auto_learn_from_violations(agent_id)
         except Exception:
-            pass  # Non-critical — don't break agent loop
+            pass  # Non-critical
+
+    def _auto_learn_from_violations(self, agent_id: str) -> None:
+        """Check if any rule has 3+ violations and suggest new patterns."""
+        try:
+            from core.violation_learner import (
+                get_violation_history, learn_from_violations,
+            )
+            from collections import Counter
+
+            history = get_violation_history()
+            recent = [r for r in history.recent(limit=30)
+                      if r.agent_id == agent_id and r.was_caught]
+            rule_counts = Counter(r.rule_text[:60] for r in recent)
+
+            for rule_key, count in rule_counts.most_common(3):
+                if count >= 3:
+                    suggestions = learn_from_violations(
+                        agent_id=agent_id, min_occurrences=3,
+                    )
+                    if suggestions:
+                        logger.info(
+                            f"PatternLearner: {len(suggestions)} suggestions "
+                            f"for agent '{agent_id}' "
+                            f"(rule '{rule_key[:40]}...' violated {count}x). "
+                            f"Run /rules learn to review."
+                        )
+        except Exception:
+            pass  # Non-critical
 
     @staticmethod
     def _guess_violation_category(rule_text: str) -> str:
@@ -2738,10 +2784,12 @@ class AgentRegistry:
 
         # ── Semantic check: second LLM pass for semantic/critical rules ──
         # Collect rules that need semantic verification:
-        #   1. Explicit semantic_rules (always, if semantic_check_enabled)
-        #   2. Critical rules with enforcement=strict/semantic (auto)
+        #   1. Explicit semantic_rules (if semantic_check_enabled)
+        #   2. Critical rules with enforcement=strict/semantic (AUTO — no flag needed)
         semantic_rules = list(cfg.get("semantic_rules", []))
         semantic_enabled = cfg.get("semantic_check_enabled", False)
+        has_critical_strict = False
+
         # Auto-enable for critical strict rules
         for r_spec in rules:
             if isinstance(r_spec, dict):
@@ -2751,6 +2799,16 @@ class AgentRegistry:
                     rt = r_spec.get("rule", r_spec.get("text", ""))
                     if rt and rt not in semantic_rules:
                         semantic_rules.append(rt)
+                        has_critical_strict = True
+
+        # Critical rules force-enable semantic check
+        if has_critical_strict and not semantic_enabled:
+            semantic_enabled = True
+            logger.info(
+                f"Semantic check AUTO-ENABLED for agent '{agent_id}' "
+                f"(critical rules with enforcement=strict found)"
+            )
+
         if semantic_rules and semantic_enabled:
             # Build priority map for dynamic thresholds
             rule_priorities: dict[str, int] = {}
