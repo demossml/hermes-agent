@@ -1132,6 +1132,21 @@ class AgentRegistry:
         self._chat_history = None  # ChatHistoryDB singleton — lazy init
         self._semantic_cache: dict[str, list[str]] = {}  # hash → violated rules
         self._semantic_cache_max: int = 200
+        self._rule_cache_obj = None  # lazy-init from core.violation_learner
+
+    @property
+    def _rule_cache(self):
+        """Lazy-init rule cache singleton."""
+        if self._rule_cache_obj is None:
+            from core.violation_learner import get_rule_cache
+            self._rule_cache_obj = get_rule_cache()
+        return self._rule_cache_obj
+
+    @staticmethod
+    def _rule_cache_key(rules: list, reply: str) -> str:
+        """Build cache key from rules + response."""
+        from core.violation_learner import get_rule_cache
+        return get_rule_cache().make_key(rules, reply)
 
     @property
     def chat_history(self):
@@ -2584,6 +2599,13 @@ class AgentRegistry:
         if not rules:
             return []
 
+        # ── Cache check (keyword + semantic combined cache) ─────
+        all_rules = list(rules) + cfg.get("semantic_rules", [])
+        cache_key = self._rule_cache_key(all_rules, reply)
+        cached = self._rule_cache.get(cache_key) if self._rule_cache else None
+        if cached is not None:
+            return list(cached)
+
         # Build / reuse checker for this agent
         checker_key = f"__adv_checker__{agent_id}"
         checker = self._agents[agent_id].get(checker_key)
@@ -2609,6 +2631,9 @@ class AgentRegistry:
                 logger.warning(
                     f"Semantic check failed for '{agent_id}': {e}"
                 )
+
+        # ── Save to cache ──────────────────────────────────
+        self._rule_cache.set(cache_key, violation_texts)
 
         return violation_texts
 

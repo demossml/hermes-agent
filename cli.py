@@ -9593,7 +9593,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         parts = cmd.strip().split()
         action = parts[1].lower() if len(parts) > 1 else "learn"
 
-        if action == "list" or action == "ls":
+        if action == "cache":
+            from core.violation_learner import get_rule_cache
+            cache = get_rule_cache()
+            sub = parts[2].lower() if len(parts) > 2 else "status"
+            if sub == "clear" or sub == "flush":
+                count = cache.clear()
+                _cprint(f"  Cache cleared: {count} entries removed")
+            else:  # status
+                s = cache.stats
+                _cprint(f"  Rule cache: {s['active']} active / {s['total']} total")
+                _cprint(f"  TTL: {s['ttl_seconds']}s | Max: {s['max_entries']}")
+                if s['expired']:
+                    _cprint(f"  Expired (waiting GC): {s['expired']}")
+
+        elif action == "list" or action == "ls":
             history = get_violation_history()
             recent = history.recent(limit=20)
             if not recent:

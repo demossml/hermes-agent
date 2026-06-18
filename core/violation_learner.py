@@ -34,7 +34,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-_HISTORY: ViolationHistory | None = None
+_HISTORY: "ViolationHistory | None" = None
+_RULE_CACHE: "RuleCheckCache | None" = None
 MAX_HISTORY = 100
 
 
@@ -43,6 +44,140 @@ def get_violation_history() -> "ViolationHistory":
     if _HISTORY is None:
         _HISTORY = ViolationHistory()
     return _HISTORY
+
+
+def get_rule_cache() -> "RuleCheckCache":
+    global _RULE_CACHE
+    if _RULE_CACHE is None:
+        _RULE_CACHE = RuleCheckCache()
+    return _RULE_CACHE
+
+
+# ═══════════════════════════════════════════════════════════════
+# RuleCheckCache — TTL-based cache for rule violation results
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class CacheEntry:
+    violations: list[str]
+    timestamp: float  # time.time()
+
+
+class RuleCheckCache:
+    """TTL-based cache for rule check results.
+
+    Caches both keyword-based (AdvancedRuleChecker) and semantic
+    (LLM pass) violation results.  Entries expire after TTL seconds.
+
+    Usage::
+
+        cache = get_rule_cache()
+        key = cache.make_key(rules, response)
+        violations = cache.get(key)      # None if miss/expired
+        cache.set(key, violations)
+    """
+
+    def __init__(self, ttl_seconds: int = 1800, max_entries: int = 500):
+        self._ttl = ttl_seconds
+        self._max = max_entries
+        self._store: dict[str, CacheEntry] = {}
+        # Track which rules hash was used for the key (for invalidation)
+        self._rules_hash: str = ""
+
+    @staticmethod
+    def make_key(rules: list, response: str) -> str:
+        """Deterministic cache key: sha256(normalized_rules + response)."""
+        import hashlib
+        # Normalize rules list
+        rules_str = "|".join(
+            r if isinstance(r, str) else r.get("rule", json.dumps(r, sort_keys=True))
+            for r in rules
+        )
+        data = rules_str + "||" + response[:800]
+        return hashlib.sha256(data.encode()).hexdigest()
+
+    def get(self, key: str) -> list[str] | None:
+        """Return cached violations or None if missing/expired."""
+        import time
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        if time.time() - entry.timestamp > self._ttl:
+            del self._store[key]
+            return None
+        return list(entry.violations)
+
+    def set(self, key: str, violations: list[str]) -> None:
+        """Store violations in cache."""
+        import time
+        self._store[key] = CacheEntry(
+            violations=list(violations),
+            timestamp=time.time(),
+        )
+        # LRU eviction
+        if len(self._store) > self._max:
+            # Remove oldest 10%
+            remove_count = max(1, self._max // 10)
+            sorted_keys = sorted(
+                self._store.keys(),
+                key=lambda k: self._store[k].timestamp,
+            )
+            for old_key in sorted_keys[:remove_count]:
+                del self._store[old_key]
+
+    def clear(self) -> int:
+        """Clear all cached entries. Returns count cleared."""
+        count = len(self._store)
+        self._store.clear()
+        logger.info(f"Rule cache cleared: {count} entries")
+        return count
+
+    def invalidate_by_rules(self, rules: list) -> int:
+        """Invalidate cache entries matching specific rules.
+
+        Called when critical_rules or semantic_rules change.
+        Returns count of invalidated entries.
+        """
+        import hashlib
+        import json as _json
+        rules_str = "|".join(
+            r if isinstance(r, str) else r.get("rule", _json.dumps(r, sort_keys=True))
+            for r in rules
+        )
+        rules_hash = hashlib.sha256(rules_str.encode()).hexdigest()[:16]
+        before = len(self._store)
+        # Remove entries whose key contains the rules hash prefix
+        # (simplified — full invalidation on any rules change)
+        self._store.clear()
+        count = before
+        logger.info(
+            f"Rule cache invalidated: {count} entries "
+            f"(rules changed, hash={rules_hash})"
+        )
+        return count
+
+    @property
+    def stats(self) -> dict:
+        """Cache statistics."""
+        import time
+        now = time.time()
+        active = sum(1 for e in self._store.values() if now - e.timestamp <= self._ttl)
+        expired = len(self._store) - active
+        return {
+            "total": len(self._store),
+            "active": active,
+            "expired": expired,
+            "ttl_seconds": self._ttl,
+            "max_entries": self._max,
+        }
+
+    @property
+    def ttl(self) -> int:
+        return self._ttl
+
+    @ttl.setter
+    def ttl(self, seconds: int) -> None:
+        self._ttl = max(60, seconds)
 
 
 @dataclass
