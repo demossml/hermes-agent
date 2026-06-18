@@ -454,6 +454,523 @@ class RuleChecker:
         return len(extracted)
 
 
+# ═══════════════════════════════════════════════════════════════
+# AdvancedRuleChecker — универсальная проверка правил
+# ═══════════════════════════════════════════════════════════════
+
+class RuleCategory:
+    """Категории правил (в порядке приоритета проверки)."""
+    TOOL_RESTRICTION = "tool_restriction"    # «НЕ используй terminal»
+    LANGUAGE = "language"                     # «отвечай только на русском»
+    CODE_RESTRICTION = "code_restriction"     # «НЕ пиши код»
+    FORBIDDEN_WORD = "forbidden_word"         # «НЕ {keyword}»
+    REGEX = "regex"                           # «regex: /pattern/»
+    DELEGATE = "delegate"                     # «используй delegate»
+    GATING = "gating"                         # «отвечай только когда...»
+    CUSTOM = "custom"                         # всё остальное
+
+
+# Порядок проверки: критические категории — первыми
+CATEGORY_CHECK_ORDER = [
+    RuleCategory.TOOL_RESTRICTION,
+    RuleCategory.LANGUAGE,
+    RuleCategory.CODE_RESTRICTION,
+    RuleCategory.FORBIDDEN_WORD,
+    RuleCategory.REGEX,
+    RuleCategory.DELEGATE,
+    RuleCategory.GATING,
+    RuleCategory.CUSTOM,
+]
+
+# Приоритет по умолчанию для каждой категории (меньше = выше)
+CATEGORY_DEFAULT_PRIORITY = {
+    RuleCategory.TOOL_RESTRICTION: 0,
+    RuleCategory.LANGUAGE: 1,
+    RuleCategory.CODE_RESTRICTION: 2,
+    RuleCategory.FORBIDDEN_WORD: 5,
+    RuleCategory.REGEX: 5,
+    RuleCategory.DELEGATE: 8,
+    RuleCategory.GATING: 8,
+    RuleCategory.CUSTOM: 10,
+}
+
+
+class Rule:
+    """Одно правило с автораспознаванием типа."""
+
+    __slots__ = (
+        "text", "priority", "category",
+        "forbidden_keywords", "regex", "target_language",
+        "forbidden_tools", "check_fn",
+    )
+
+    def __init__(
+        self,
+        text: str,
+        priority: int | None = None,
+        category: str | None = None,
+        forbidden_keywords: set[str] | None = None,
+        regex: "re.Pattern | None" = None,
+        target_language: str | None = None,
+        forbidden_tools: set[str] | None = None,
+        check_fn: "callable | None" = None,
+    ):
+        self.text = text
+        self.category = category or RuleCategory.CUSTOM
+        self.priority = (
+            priority if priority is not None
+            else CATEGORY_DEFAULT_PRIORITY.get(self.category, 10)
+        )
+        self.forbidden_keywords = forbidden_keywords or set()
+        self.regex = regex
+        self.target_language = target_language
+        self.forbidden_tools = forbidden_tools or set()
+        self.check_fn = check_fn
+
+    def __repr__(self) -> str:
+        return (
+            f"Rule(pri={self.priority}, cat={self.category}, "
+            f"text={self.text[:50]!r})"
+        )
+
+
+class AdvancedRuleChecker:
+    """Универсальная проверка правил с авто-парсингом.
+
+    Поддерживает:
+    - «НЕ {keyword}» — запрещённые слова в ответе
+    - «regex: /pattern/flags» — произвольные регулярные выражения
+    - «НЕ используй {tool}» — проверка tool_calls
+    - «отвечай только на {язык}» — детекция языка ответа
+    - «НЕ пиши код» — детекция кода
+    - Приоритеты правил — критические проверяются первыми
+    - Динамическое добавление правил через add_rule()
+
+    Использование::
+
+        checker = AdvancedRuleChecker()
+        checker.add_rule(\"НЕ упоминай ChatGPT\", priority=3)
+        checker.add_rule(\"НЕ используй terminal\", priority=0)
+        checker.add_rule(\"отвечай только на русском\", priority=1)
+        checker.add_rule(r\"regex: /TODO|FIXME|HACK/i\")
+
+        violations = checker.check(
+            response=\"Вот решение...\",
+            tool_calls=[{\"name\": \"terminal\", ...}],
+        )
+        # → [
+        #     (\"НЕ используй terminal\", 0, \"tool_restriction\",
+        #      \"Tool 'terminal' was called but is forbidden\"),
+        # ]
+    """
+
+    # ── Парсинг правил ────────────────────────────────────────
+
+    # Порядок важен — от специфичных к общим
+    _PARSERS: "list[tuple[str, callable]]" = []
+
+    @classmethod
+    def _init_parsers(cls):
+        """Ленивая инициализация парсеров (избегаем цикл. импортов)."""
+        if cls._PARSERS:
+            return
+        import re as _re
+
+        def _parse_regex(text: str) -> Rule | None:
+            m = _re.match(
+                r"^regex:\s*/(.+?)/([a-z]*)\s*$", text.strip(), _re.IGNORECASE,
+            )
+            if not m:
+                return None
+            pattern, flags_str = m.group(1), m.group(2)
+            flags = 0
+            if "i" in flags_str:
+                flags |= _re.IGNORECASE
+            if "m" in flags_str:
+                flags |= _re.MULTILINE
+            if "s" in flags_str:
+                flags |= _re.DOTALL
+            return Rule(
+                text=text, category=RuleCategory.REGEX,
+                regex=_re.compile(pattern, flags),
+            )
+
+        def _parse_tool_restriction(text: str) -> Rule | None:
+            m = _re.match(
+                r"(?i)(?:не\s+используй|don'?t\s+use|never\s+use|запрещено\s+использовать)\s+"
+                r"(\w+(?:\s*,\s*\w+)*)",
+                text.strip(),
+            )
+            if not m:
+                return None
+            tools_str = m.group(1)
+            tools = {t.strip().lower() for t in tools_str.split(",") if t.strip()}
+            return Rule(
+                text=text, category=RuleCategory.TOOL_RESTRICTION,
+                forbidden_tools=tools,
+            )
+
+        def _parse_language(text: str) -> Rule | None:
+            m = _re.match(
+                r"(?i)(?:отвечай|говори|пиши|respond|speak|answer)\s+"
+                r"(?:только|always|only)\s+на\s+"
+                r"(русском|английском|english|russian|русский|английский)",
+                text.strip(),
+            )
+            if not m:
+                return None
+            lang_raw = m.group(1).lower()
+            lang_map = {
+                "русском": "ru", "русский": "ru", "russian": "ru",
+                "английском": "en", "английский": "en", "english": "en",
+            }
+            lang = lang_map.get(lang_raw, lang_raw)
+            return Rule(
+                text=text, category=RuleCategory.LANGUAGE,
+                target_language=lang,
+            )
+
+        def _parse_code_restriction(text: str) -> Rule | None:
+            if _re.search(
+                r"(?i)(не пиши код|don'?t write code|never write code"
+                r"|do not write code|без кода|no code)",
+                text,
+            ):
+                return Rule(text=text, category=RuleCategory.CODE_RESTRICTION)
+            return None
+
+        def _parse_forbidden_word(text: str) -> Rule | None:
+            # «НЕ {word}» / «запрещено {word}» / «do not {word}» / «never {word}»
+            m = _re.match(
+                r"(?i)(?:НЕ|запрещено|do\s+not|don'?t|never)\s+"
+                r"(.+?)(?:\s*[.,;:!?]*)$",
+                text.strip(),
+            )
+            if not m:
+                return None
+            phrase = m.group(1).strip()
+            # Пропускаем слишком короткие / неинформативные фразы
+            if len(phrase) < 2:
+                return None
+            # Skip if it's a sub-case already handled (tool, code, language)
+            skip_patterns = [
+                r"(?i)^(?:используй|пиши код|отвечай|говори)",
+            ]
+            if any(_re.match(p, phrase) for p in skip_patterns):
+                return None
+            # Extract meaningful keywords (split by space, common words)
+            stop_words = {
+                "и", "или", "в", "на", "с", "по", "к", "из", "от", "для",
+                "the", "a", "an", "and", "or", "in", "on", "to", "of",
+            }
+            keywords = {
+                w.strip(".,;:!?()[]{}\"'").lower()
+                for w in phrase.split()
+                if w.strip(".,;:!?()[]{}\"'").lower() not in stop_words
+                and len(w.strip(".,;:!?()[]{}")) >= 2
+            }
+            if not keywords:
+                return None
+            return Rule(
+                text=text, category=RuleCategory.FORBIDDEN_WORD,
+                forbidden_keywords=keywords,
+            )
+
+        def _parse_delegate(text: str) -> Rule | None:
+            if _re.search(r"(?i)(?:используй|use)\s+delegate", text):
+                return Rule(text=text, category=RuleCategory.DELEGATE)
+            return None
+
+        def _parse_gating(text: str) -> Rule | None:
+            if _re.search(
+                r"(?i)(?:отвечай только|respond only|only respond"
+                r"|отвечай когда|respond when)",
+                text,
+            ):
+                return Rule(text=text, category=RuleCategory.GATING)
+            return None
+
+        cls._PARSERS = [
+            ("regex",           _parse_regex),
+            ("tool_restriction", _parse_tool_restriction),
+            ("language",         _parse_language),
+            ("code_restriction", _parse_code_restriction),
+            ("forbidden_word",   _parse_forbidden_word),
+            ("delegate",         _parse_delegate),
+            ("gating",           _parse_gating),
+        ]
+
+    @classmethod
+    def parse_rule(cls, text: str, priority: int | None = None) -> Rule:
+        """Распарсить текст правила в Rule с автоопределением категории."""
+        cls._init_parsers()
+        for _cat_name, parser in cls._PARSERS:
+            rule = parser(text)
+            if rule is not None:
+                if priority is not None:
+                    rule.priority = priority
+                return rule
+        # Fallback: custom rule — keyword match
+        keywords = {
+            w.strip(".,;:!?()[]{}\"'").lower()
+            for w in text.split()
+            if len(w.strip(".,;:!?()[]{}\"'")) >= 3
+        }
+        return Rule(
+            text=text,
+            category=RuleCategory.CUSTOM,
+            forbidden_keywords=keywords,
+            priority=priority if priority is not None else 10,
+        )
+
+    # ── Инициализация ─────────────────────────────────────────
+
+    def __init__(self, rules: list[str] | None = None):
+        self._rules: list[Rule] = []
+        if rules:
+            for r_text in rules:
+                self.add_rule(r_text)
+
+    @property
+    def has_rules(self) -> bool:
+        return len(self._rules) > 0
+
+    @property
+    def rules(self) -> list[Rule]:
+        return list(self._rules)
+
+    def add_rule(
+        self,
+        text: str,
+        priority: int | None = None,
+        *,
+        category: str | None = None,
+        forbidden_keywords: set[str] | None = None,
+        regex: "re.Pattern | None" = None,
+        target_language: str | None = None,
+        forbidden_tools: set[str] | None = None,
+    ) -> Rule:
+        """Добавить правило (автопарсинг или ручное)."""
+        if category is not None:
+            # Ручное добавление — не парсим
+            rule = Rule(
+                text=text,
+                priority=priority,
+                category=category,
+                forbidden_keywords=forbidden_keywords,
+                regex=regex,
+                target_language=target_language,
+                forbidden_tools=forbidden_tools,
+            )
+        else:
+            rule = self.parse_rule(text, priority=priority)
+        self._rules.append(rule)
+        self._rules.sort(key=lambda r: r.priority)
+        return rule
+
+    def remove_rule(self, text_substring: str) -> int:
+        """Удалить правила, содержащие подстроку. Возвращает число удалённых."""
+        before = len(self._rules)
+        self._rules = [r for r in self._rules if text_substring not in r.text]
+        return before - len(self._rules)
+
+    # ── Проверка ───────────────────────────────────────────────
+
+    def check(
+        self,
+        response: str,
+        tool_calls: list[dict] | None = None,
+    ) -> list[dict]:
+        """Проверить ответ + tool_calls на нарушения.
+
+        Returns:
+            Список нарушений, отсортированный по приоритету.
+            Каждое: ``{\"rule\": str, \"priority\": int, \"category\": str,
+            \"detail\": str}``
+        """
+        if not self._rules:
+            return []
+        if not response and not tool_calls:
+            return []
+
+        violations: list[dict] = []
+        reply_lower = response.lower() if response else ""
+
+        for rule in self._rules:
+            detail = None
+
+            if rule.category == RuleCategory.TOOL_RESTRICTION:
+                detail = self._check_tool_restriction(rule, tool_calls)
+            elif rule.category == RuleCategory.LANGUAGE:
+                detail = self._check_language(rule, response)
+            elif rule.category == RuleCategory.CODE_RESTRICTION:
+                detail = self._check_code(rule, response)
+            elif rule.category == RuleCategory.FORBIDDEN_WORD:
+                detail = self._check_forbidden_words(rule, reply_lower)
+            elif rule.category == RuleCategory.REGEX:
+                detail = self._check_regex(rule, response)
+            elif rule.category == RuleCategory.DELEGATE:
+                detail = self._check_delegate(rule, response)
+            elif rule.category == RuleCategory.GATING:
+                detail = self._check_gating(rule, reply_lower)
+            else:
+                detail = self._check_forbidden_words(rule, reply_lower)
+
+            if detail:
+                violations.append({
+                    "rule": rule.text,
+                    "priority": rule.priority,
+                    "category": rule.category,
+                    "detail": detail,
+                })
+
+        return violations
+
+    # ── Детекторы ──────────────────────────────────────────────
+
+    @staticmethod
+    def _check_tool_restriction(
+        rule: Rule, tool_calls: list[dict] | None,
+    ) -> str | None:
+        if not tool_calls or not rule.forbidden_tools:
+            return None
+        for tc in tool_calls:
+            name = (tc.get("name") or tc.get("function", {}).get("name", "")).lower()
+            if name in rule.forbidden_tools:
+                return (
+                    f"Tool '{name}' was called but is forbidden "
+                    f"by rule: {rule.text}"
+                )
+        return None
+
+    @staticmethod
+    def _check_language(rule: Rule, response: str) -> str | None:
+        if not response or not rule.target_language:
+            return None
+        target = rule.target_language
+        # Count Cyrillic vs Latin characters
+        cyrillic = sum(1 for c in response if "а" <= c.lower() <= "я" or c in "ёЁ")
+        latin = sum(1 for c in response if "a" <= c.lower() <= "z")
+        total = cyrillic + latin
+        if total < 10:
+            return None  # Too short to determine
+        if target == "ru" and cyrillic < total * 0.5:
+            return (
+                f"Response is mostly non-Russian "
+                f"(Cyrillic: {cyrillic}/{total} = {cyrillic*100//total}%)"
+            )
+        if target == "en" and latin < total * 0.5:
+            return (
+                f"Response is mostly non-English "
+                f"(Latin: {latin}/{total} = {latin*100//total}%)"
+            )
+        return None
+
+    @staticmethod
+    def _check_code(rule: Rule, response: str) -> str | None:
+        if not response:
+            return None
+        code_markers = [
+            "```", "def ", "class ", "import ",
+            "function ", "const ", "let ", "var ",
+            "return ", "async ", "await ",
+            "<?php", "#!/", "package ",
+        ]
+        found = [m for m in code_markers if m in response]
+        if found:
+            return f"Code detected (markers: {', '.join(found[:3])})"
+        return None
+
+    @staticmethod
+    def _check_forbidden_words(rule: Rule, reply_lower: str) -> str | None:
+        if not rule.forbidden_keywords:
+            return None
+        found = [kw for kw in rule.forbidden_keywords if kw in reply_lower]
+        if found:
+            return f"Forbidden keyword(s) found: {', '.join(found)}"
+        return None
+
+    @staticmethod
+    def _check_regex(rule: Rule, response: str) -> str | None:
+        if not rule.regex or not response:
+            return None
+        matches = rule.regex.findall(response)
+        if matches:
+            preview = matches[:3]
+            return f"Regex matched: {preview}"
+        return None
+
+    @staticmethod
+    def _check_delegate(rule: Rule, response: str) -> str | None:
+        if not response:
+            return None
+        has_code = bool(
+            "```" in response or "def " in response or "class " in response
+        )
+        if has_code and "delegate" not in response.lower():
+            return "Code detected without delegation keyword"
+        return None
+
+    @staticmethod
+    def _check_gating(rule: Rule, reply_lower: str) -> str | None:
+        """Check if response contains expected trigger name.
+        This is a SOFT check — Gateway handles the hard gate.
+        """
+        import re as _re
+        names = _re.findall(
+            r'"([^"]+)"|«([^»]+)»|called\s+(\w+)|имени\s+(\w+)',
+            rule.text, _re.IGNORECASE,
+        )
+        keywords = {w.lower() for group in names for w in group if w}
+        if not keywords:
+            words = rule.text.split()
+            for w in reversed(words):
+                w = w.strip('.,;:!?\"«»')
+                if w and w[0].isupper() and len(w) >= 3:
+                    keywords.add(w.lower())
+                    break
+        if keywords and not any(k in reply_lower for k in keywords):
+            return (
+                f"Response does not contain trigger name "
+                f"({', '.join(sorted(keywords))})"
+            )
+        return None
+
+    # ── Batch ──────────────────────────────────────────────────
+
+    @classmethod
+    def from_yaml_rules(cls, rules: list[str]) -> "AdvancedRuleChecker":
+        """Создать чекер из списка правил (как в YAML critical_rules)."""
+        checker = cls()
+        for rule_text in rules:
+            checker.add_rule(rule_text)
+        return checker
+
+    def parse_from_system_prompt(self, system_prompt: str) -> int:
+        """Извлечь правила из [CRITICAL RULES] блока system_prompt."""
+        if not system_prompt:
+            return 0
+        import re as _re
+        match = _re.search(
+            r"\[CRITICAL RULES\](.*?)(?:\[/CRITICAL RULES\]|\n\n(?:\[|These))",
+            system_prompt, _re.DOTALL | _re.IGNORECASE,
+        )
+        if not match:
+            return 0
+        block = match.group(1).strip()
+        rules_text = [
+            _re.sub(r"^\d+\.\s*", "", line.strip())
+            for line in block.splitlines()
+            if line.strip() and not line.strip().startswith("These rules")
+        ]
+        rules_text = [r for r in rules_text if len(r) > 5]
+        count = 0
+        for rt in rules_text:
+            self.add_rule(rt)
+            count += 1
+        return count
+
+
 class AgentRegistry:
     """Registry and orchestrator for sub-agents.
 
@@ -1753,7 +2270,14 @@ class AgentRegistry:
                 if rules:
                     corrected = False
                     for correction_attempt in range(2):
-                        violations = self._check_violations(agent_id, reply)
+                        # Extract tool_calls from result (if available)
+                        result_tc = (
+                            result.get("tool_calls") or result.get("tool_results")
+                            if isinstance(result, dict) else None
+                        )
+                        violations = self._check_violations(
+                            agent_id, reply, tool_calls=result_tc,
+                        )
                         if not violations:
                             if corrected:
                                 reply = f"[✅ Исправлено после {correction_attempt+1} попытки самокоррекции]\n\n{reply}"
@@ -1822,35 +2346,39 @@ class AgentRegistry:
 
         return f"Error from agent '{agent_id}': {last_error}"
 
-    def _check_violations(self, agent_id: str, reply: str) -> "list[str]":
-        """Check agent reply against its critical_rules. Returns list of violated rules.
+    def _check_violations(
+        self, agent_id: str, reply: str,
+        tool_calls: list[dict] | None = None,
+    ) -> "list[str]":
+        """Check agent reply against its critical_rules.
 
-        Uses keyword matching for speed (no LLM call).
+        Uses AdvancedRuleChecker — universal rule engine supporting:
+        - «НЕ {keyword}» — forbidden words in response
+        - «regex: /pattern/» — arbitrary regex
+        - «НЕ используй {tool}» — tool_calls inspection
+        - «отвечай только на {язык}» — language detection
+        - «НЕ пиши код» — code detection
+        - Priority-based checking (critical rules first)
+
+        Returns list of violated rule texts.
         """
         cfg = self._agents.get(agent_id, {})
         rules = cfg.get("critical_rules", [])
-        if not rules or not reply:
+        if not rules:
             return []
 
-        # Keyword patterns that indicate rule violations
-        # Each rule is checked with simple substring matching
-        violations = []
-        reply_lower = reply.lower()
+        # Build / reuse checker for this agent
+        checker_key = f"__adv_checker__{agent_id}"
+        checker = self._agents[agent_id].get(checker_key)
+        if checker is None:
+            checker = AdvancedRuleChecker.from_yaml_rules(rules)
+            self._agents[agent_id][checker_key] = checker
 
-        for rule in rules:
-            r = rule.lower()
-            # Rule: "НЕ пиши код" → check for code blocks
-            if ("не пиши код" in r or "не пиши код" in r) and ("```" in reply or "def " in reply):
-                violations.append(rule)
-            # Rule: "DELEGATE" → check for missing delegate when code present
-            if "delegate" in r and ("```" in reply or "def " in reply) and "delegate:" not in reply_lower:
-                violations.append(rule)
-            # Rule: "НЕ используй terminal" → check for execute/terminal
-            if "не используй terminal" in r or "не используй execute" in r:
-                if "execute_code" in reply or "subprocess" in reply or "terminal(" in reply:
-                    violations.append(rule)
+        if not reply and not tool_calls:
+            return []
 
-        return list(set(violations))  # deduplicate
+        violations = checker.check(response=reply, tool_calls=tool_calls)
+        return [v["rule"] for v in violations]
 
     def _check_isolation(self, caller_id: str, agent_id: str, target_cfg: dict) -> str | None:
         if caller_id == "orchestrator" or caller_id not in self._agents:
