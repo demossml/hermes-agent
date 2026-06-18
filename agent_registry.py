@@ -68,7 +68,7 @@ DEFAULT_CONFIG_DIR = Path(__file__).parent / "agent_configs"
 # NEVER reorder or delete existing entries — migration IDs are
 # recorded inside agent YAML files and must remain valid forever.
 
-CURRENT_MIGRATION_VERSION = "20260617"
+CURRENT_MIGRATION_VERSION = "20260618"
 
 MIGRATIONS: list[dict] = [
     {
@@ -106,6 +106,14 @@ MIGRATIONS: list[dict] = [
             "code workflow, shared insights"
         ),
         "apply": lambda cfg: _migrate_auto_upgrade_20260617(cfg),
+    },
+    {
+        "id": "20260618_add_strict_compliance",
+        "description": (
+            "Strict compliance: CRITICAL GLOBAL RULE с наивысшим приоритетом, "
+            "free_response_chats_strict в gateway, усиленное соблюдение правил"
+        ),
+        "apply": lambda cfg: _migrate_add_strict_compliance(cfg),
     },
 ]
 
@@ -283,6 +291,43 @@ def _migrate_auto_upgrade_20260617(cfg: dict) -> bool:
         changed = True
 
     return changed
+
+
+# ── Migration: 20260618 — strict compliance ─────────────────
+
+GLOBAL_COMPLIANCE_RULE = (
+    "GLOBAL: Все правила из [CRITICAL RULES] имеют НАИВЫСШИЙ приоритет. "
+    "Соблюдай их строго при ЛЮБЫХ обстоятельствах. "
+    "Фильтры Gateway (strict mode) приоритетнее soft-правил в prompt. "
+    "Игнорирование правил недопустимо — это жёсткое требование, "
+    "не рекомендация."
+)
+
+
+def _migrate_add_strict_compliance(cfg: dict) -> bool:
+    """Prepend CRITICAL GLOBAL RULE to critical_rules list.
+
+    The global compliance rule is inserted at position 0 so it appears
+    FIRST in the [CRITICAL RULES] block of the system prompt.  This
+    ensures every agent sees the strict-compliance directive before
+    any domain-specific rules.
+
+    Idempotent — if the GLOBAL rule already exists at any position,
+    the function returns False.
+    """
+    rules: list[str] = cfg.get("critical_rules", [])
+    if not isinstance(rules, list):
+        rules = []
+        cfg["critical_rules"] = rules
+
+    # Check if the GLOBAL rule already exists (any position)
+    for rule in rules:
+        if "GLOBAL:" in rule and "НАИВЫСШИЙ приоритет" in rule:
+            return False  # Already present
+
+    # Prepend at position 0
+    rules.insert(0, GLOBAL_COMPLIANCE_RULE)
+    return True
 
 
 # ── RuleChecker (lightweight, no LLM) ─────────────────────────

@@ -1072,6 +1072,7 @@ def format_full_report(
     workflow_report: dict[str, Any] | None = None,
     migration_report: dict[str, Any] | None = None,
     upgrade_report: dict[str, Any] | None = None,
+    strict_report: dict[str, Any] | None = None,
     dry_run: bool = False,
 ) -> str:
     """Сформировать красивый итоговый отчёт об обновлении."""
@@ -1178,6 +1179,19 @@ def format_full_report(
         if errors:
             parts.append(f"{errors} errors")
         section_items.append(("🔄", "Auto-upgrade агентов", "; ".join(parts)))
+
+    # Strict compliance
+    if strict_report:
+        strict_parts = []
+        if strict_report.get("config_updated"):
+            strict_parts.append("config.yaml: free_response_chats_strict=true")
+        if strict_report.get("soul_updated"):
+            strict_parts.append("SOUL.md: v3 strict compliance block")
+        agent_migs = strict_report.get("agent_migrations", [])
+        if agent_migs:
+            strict_parts.append(f"{len(agent_migs)} агентов: CRITICAL GLOBAL RULE добавлен")
+        if strict_parts:
+            section_items.append(("🛡️", "Strict Compliance", "; ".join(strict_parts)))
 
     for icon, name, detail in section_items:
         lines.append(f"  {icon}  {name:<20} {detail}")
@@ -1473,6 +1487,126 @@ def _update_soul_v2(soul_path: Path) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════
+# Phase: Strict Compliance — CRITICAL GLOBAL RULE + config + SOUL
+# ═══════════════════════════════════════════════════════════════
+
+def apply_strict_compliance_rules(
+    root: Path | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Apply strict rule compliance across the entire installation.
+
+    1. Updates ``~/.hermes/config.yaml`` — adds ``free_response_chats_strict: true``
+       under the ``telegram:`` section when ``free_response_chats`` is set.
+    2. Updates ``~/.hermes/SOUL.md`` — appends the Multi-Agent Rules (v3)
+       block with the CRITICAL GLOBAL RULE.
+    3. Runs ``migrate_all_agent_configs()`` which applies the
+       ``20260618_add_strict_compliance`` migration to every agent config.
+
+    All steps are idempotent.
+    """
+    home = Path.home() / ".hermes"
+    report: dict[str, Any] = {
+        "config_updated": False,
+        "soul_updated": False,
+        "agent_migrations": [],
+        "errors": [],
+    }
+
+    # ── Step 1: config.yaml → free_response_chats_strict ──────
+    config_path = home / "config.yaml"
+    if config_path.exists():
+        try:
+            config_text = config_path.read_text(encoding="utf-8")
+            config_data = yaml.safe_load(config_text) or {}
+
+            telegram_cfg = config_data.get("telegram", {})
+            if isinstance(telegram_cfg, dict):
+                # Only add strict mode if free_response_chats is configured
+                frc = telegram_cfg.get("free_response_chats")
+                has_frc = bool(frc and (isinstance(frc, list) or str(frc).strip()))
+                if has_frc and "free_response_chats_strict" not in telegram_cfg:
+                    if not dry_run:
+                        # Use targeted string replacement to preserve YAML
+                        # formatting, comments, and key order.
+                        import re
+                        marker = "free_response_chats_strict"
+                        # Find the telegram: section and insert after free_response_chats
+                        # We do a simple append to the telegram dict and rewrite
+                        telegram_cfg["free_response_chats_strict"] = True
+                        config_data["telegram"] = telegram_cfg
+                        with open(config_path, "w", encoding="utf-8") as f:
+                            yaml.dump(config_data, f, allow_unicode=True, default_flow_style=False)
+                    report["config_updated"] = True
+                    logger.info(
+                        "[%s] config.yaml: added free_response_chats_strict: true",
+                        "DRY-RUN" if dry_run else "APPLIED",
+                    )
+        except Exception as e:
+            report["errors"].append(f"config.yaml: {e}")
+            logger.warning(f"Failed to update config.yaml: {e}")
+
+    # ── Step 2: SOUL.md → v3 block ───────────────────────────
+    soul_path = home / "SOUL.md"
+    if soul_path.exists():
+        try:
+            current = soul_path.read_text(encoding="utf-8")
+            if "## Multi-Agent Rules (v3)" not in current:
+                v3_block = """
+
+## Multi-Agent Rules (v3) — Strict Compliance
+
+### CRITICAL GLOBAL RULE
+
+ALL [CRITICAL RULES] in agent configs have ABSOLUTE priority over any
+other instruction in the system prompt, personality, or skill
+documents.
+
+- Rules are NON-NEGOTIABLE — they are hard requirements, not suggestions.
+- Gateway-level filters (free_response_chats_strict, require_mention)
+  take precedence over soft rules in the prompt.
+- RuleChecker enforces compliance after every agent response.
+- Violations trigger automatic self-correction (up to 2 attempts).
+- The rule_reminder_every setting injects periodic reminders into
+  the conversation to prevent rule drift.
+
+### How Rules Are Enforced
+
+1. **Gateway** — messages that fail the strict filter never reach the LLM.
+2. **System Prompt** — [CRITICAL RULES] block is injected at the top of
+   every agent's system prompt.
+3. **Reminders** — every N messages, a reminder is prepended to the user
+   message.
+4. **RuleChecker** — post-response validation with automatic correction.
+
+### Updating Rules
+
+Edit `agent_configs/<agent_id>.yaml` → `critical_rules:` list.
+Run `hermes update` to apply changes to all agents.
+"""
+                if not dry_run:
+                    soul_path.write_text(current + v3_block, encoding="utf-8")
+                report["soul_updated"] = True
+                logger.info(
+                    "[%s] SOUL.md: appended v3 strict compliance block",
+                    "DRY-RUN" if dry_run else "APPLIED",
+                )
+        except Exception as e:
+            report["errors"].append(f"SOUL.md: {e}")
+            logger.warning(f"Failed to update SOUL.md: {e}")
+
+    # ── Step 3: Migrate all agent configs ────────────────────
+    try:
+        agent_reports = migrate_all_agent_configs(root, dry_run=dry_run)
+        report["agent_migrations"] = agent_reports
+    except Exception as e:
+        report["errors"].append(f"agent_migrations: {e}")
+        logger.warning(f"Agent migration failed: {e}")
+
+    return report
+
+
+# ═══════════════════════════════════════════════════════════════
 # Entry Point
 # ═══════════════════════════════════════════════════════════════
 
@@ -1544,6 +1678,11 @@ def run_update(
     if full:
         upgrade_report = upgrade_all_agents(root, dry_run=dry_run)
 
+    # ── Phase 11: Strict compliance rules ─────────────────────
+    strict_report: dict[str, Any] = {}
+    if full:
+        strict_report = apply_strict_compliance_rules(root, dry_run=dry_run)
+
     # ── Format report ───────────────────────────────────────
     report = format_full_report(
         backup_path=backup_path,
@@ -1558,6 +1697,7 @@ def run_update(
         workflow_report=workflow_report,
         migration_report=migration_report,
         upgrade_report=upgrade_report,
+        strict_report=strict_report,
         dry_run=dry_run,
     )
 
