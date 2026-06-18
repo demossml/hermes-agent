@@ -290,6 +290,20 @@ def _migrate_auto_upgrade_20260617(cfg: dict) -> bool:
         cfg["soul_version"] = 2
         changed = True
 
+    # ── Semantic rules (second LLM pass) ────────────────
+    if "semantic_rules" not in cfg:
+        cfg["semantic_rules"] = []
+        changed = True
+    if "semantic_check_enabled" not in cfg:
+        cfg["semantic_check_enabled"] = False
+        changed = True
+    if "semantic_check_provider" not in cfg:
+        cfg["semantic_check_provider"] = "deepseek"
+        changed = True
+    if "semantic_check_model" not in cfg:
+        cfg["semantic_check_model"] = "deepseek-chat"
+        changed = True
+
     return changed
 
 
@@ -2378,7 +2392,135 @@ class AgentRegistry:
             return []
 
         violations = checker.check(response=reply, tool_calls=tool_calls)
-        return [v["rule"] for v in violations]
+        violation_texts = [v["rule"] for v in violations]
+
+        # ── Semantic check: second LLM pass for semantic/critical rules ──
+        semantic_rules = cfg.get("semantic_rules", [])
+        if semantic_rules and cfg.get("semantic_check_enabled", False):
+            try:
+                semantic_violations = self._semantic_check_violations(
+                    agent_id, reply, semantic_rules,
+                )
+                violation_texts.extend(semantic_violations)
+            except Exception as e:
+                logger.warning(
+                    f"Semantic check failed for '{agent_id}': {e}"
+                )
+
+        return violation_texts
+
+    def _semantic_check_violations(
+        self, agent_id: str, reply: str, semantic_rules: list[str],
+    ) -> list[str]:
+        """Run a second LLM pass to check semantic/critical rules.
+
+        Uses a cheap model (configurable via semantic_check_provider / model)
+        to detect violations that keyword-based checks miss:
+        - косвенные нарушения (псевдокод, намёки, синонимы)
+        - нарушения стиля / тона
+        - обход запретов через иносказания
+
+        Batch mode: all rules are checked in a single LLM call.
+
+        Returns list of violated rule texts.
+        """
+        if not semantic_rules or not reply:
+            return []
+
+        cfg = self._agents.get(agent_id, {})
+        provider_name = cfg.get("semantic_check_provider", "deepseek")
+        model_name = cfg.get("semantic_check_model", "deepseek-chat")
+
+        # Build batch prompt
+        rules_block = "\n".join(
+            f"{i+1}. {rule}" for i, rule in enumerate(semantic_rules)
+        )
+        prompt = (
+            f"You are a strict rule-compliance checker. "
+            f"Your ONLY job: detect rule violations.\n\n"
+            f"RULES TO CHECK:\n{rules_block}\n\n"
+            f"AGENT RESPONSE:\n{reply[:2000]}\n\n"
+            f"For EACH rule, answer exactly:\n"
+            f"  Rule N: VIOLATION — <brief reason>\n"
+            f"  Rule N: OK\n\n"
+            f"Only flag a violation if the response CLEARLY breaks the rule. "
+            f"Be strict but fair."
+        )
+
+        try:
+            result_text = self._call_cheap_llm(
+                provider_name, model_name, prompt,
+            )
+        except Exception as e:
+            logger.warning(
+                f"Semantic check LLM call failed for '{agent_id}': {e}"
+            )
+            return []
+
+        # Parse result: look for "VIOLATION" in each rule's line
+        violated = []
+        result_lower = result_text.lower() if result_text else ""
+        for i, rule in enumerate(semantic_rules):
+            rule_key = f"rule {i+1}:"
+            # Find the line containing this rule number
+            for line in result_lower.splitlines():
+                if rule_key in line and "violation" in line:
+                    violated.append(rule)
+                    logger.info(
+                        f"Semantic check: agent '{agent_id}' violated "
+                        f"rule: {rule[:60]}..."
+                    )
+                    break
+
+        return violated
+
+    def _call_cheap_llm(
+        self, provider_name: str, model_name: str, prompt: str,
+    ) -> str:
+        """Make a single-turn call to a cheap LLM for rule checking.
+
+        Uses OpenAI-compatible API via the openai library (DeepSeek, etc).
+        Requires the provider's API key in environment.
+        """
+        import os
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider(
+            requested=provider_name,
+            target_model=model_name,
+        )
+        if not runtime:
+            raise RuntimeError(
+                f"Cannot resolve provider '{provider_name}' "
+                f"for semantic check"
+            )
+
+        # Use OpenAI-compatible chat completion
+        try:
+            from openai import OpenAI
+        except ImportError:
+            raise RuntimeError(
+                "openai package required for semantic check. "
+                "Install: pip install openai"
+            )
+
+        base_url = runtime.get("base_url") or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+        api_key = runtime.get("api_key") or os.getenv("DEEPSEEK_API_KEY", "")
+
+        if not api_key:
+            raise RuntimeError(
+                f"No API key for semantic check provider '{provider_name}'. "
+                f"Set DEEPSEEK_API_KEY or configure semantic_check_provider."
+            )
+
+        client = OpenAI(api_key=api_key, base_url=base_url, timeout=15)
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=256,
+            temperature=0.0,
+        )
+        return response.choices[0].message.content or ""
 
     def _check_isolation(self, caller_id: str, agent_id: str, target_cfg: dict) -> str | None:
         if caller_id == "orchestrator" or caller_id not in self._agents:

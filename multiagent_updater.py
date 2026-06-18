@@ -67,6 +67,8 @@ NEW_FIELDS = [
     "fallback_models", "temperature", "max_tokens", "top_p",
     "priority", "auto_select", "reasoning_effort",
     "inherit_from_parent", "critical_rules", "rule_reminder_every",
+    "semantic_rules", "semantic_check_enabled",
+    "semantic_check_provider", "semantic_check_model",
 ]
 
 CORE_FILES = ["agent_registry.py", "cli.py"]
