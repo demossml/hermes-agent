@@ -256,26 +256,109 @@ class ResearchPipeline:
     async def _cross_validate(
         self, sub_questions: list[SubQuestion],
     ) -> float:
-        """Verify facts across sources for each sub-question.
+        """Adversarial cross-validation with two validators + adjudicator.
 
-        Returns average confidence (0-1) across all sub-questions.
+        Validator A (Corroborator): checks if other sources support claims.
+        Validator B (Contradictor): checks if any source contradicts claims.
+        Adjudicator: resolves disputes with additional targeted search.
+
+        Returns average adjusted confidence across all claims.
         """
-        if not sub_questions:
-            return 0.0
+        from research.cross_validator import (
+            CrossValidator, Adjudicator,
+        )
 
-        scores = []
+        all_scores: list[float] = []
+
         for sq in sub_questions:
-            # More sources = higher confidence (naive heuristic)
-            source_count = len(sq.sources)
-            if source_count == 0:
-                scores.append(0.0)
-            elif source_count == 1:
-                scores.append(0.3)
-            elif source_count == 2:
-                scores.append(0.6)
-            elif source_count >= 3:
-                scores.append(min(0.95, 0.7 + 0.05 * source_count))
-        return sum(scores) / len(scores) if scores else 0.0
+            if not sq.sources:
+                all_scores.append(0.0)
+                continue
+
+            # Build claims from facts (legacy: facts are strings)
+            claims = self._facts_to_claims(sq.facts, sq.sources)
+
+            # Run adversarial validation
+            validator = CrossValidator()
+            report = await validator.validate(claims, sq.sources, sq.id)
+
+            # Adjudicate disputes
+            if report.disputed > 0:
+                source_pool = CrossValidator._build_source_pool(sq.sources)
+                adjudicator = Adjudicator()
+                disputed = [c for c in report.claims if c.status == "disputed"]
+                resolved = await adjudicator.adjudicate(disputed, source_pool)
+
+                for rc in resolved:
+                    for i, oc in enumerate(report.claims):
+                        if oc.text == rc.text:
+                            report.claims[i] = rc
+                            if rc.status == "confirmed":
+                                report.confirmed += 1
+                                report.disputed -= 1
+                            elif rc.status == "rejected":
+                                report.rejected += 1
+                                report.disputed -= 1
+                            break
+
+                if report.claims:
+                    report.average_confidence = (
+                        sum(c.adjusted_confidence for c in report.claims)
+                        / len(report.claims)
+                    )
+
+            # Update facts with validation status
+            sq.facts = [
+                f"[{c.status.upper()}] {c.text} "
+                f"(confidence: {c.adjusted_confidence:.0%}, "
+                f"corroborated: {c.corroborating_sources})"
+                for c in report.claims
+            ]
+
+            all_scores.append(report.average_confidence)
+
+        avg = sum(all_scores) / len(all_scores) if all_scores else 0.0
+        logger.info(
+            "Stage 4: cross-validation complete, avg confidence=%.2f", avg,
+        )
+        return avg
+
+    @staticmethod
+    def _facts_to_claims(
+        facts: list[str], sources: list[dict[str, Any]],
+    ) -> list[Any]:
+        """Convert fact strings back to Claim-like objects for validation."""
+        from research.agents import Claim
+        claims = []
+        for i, fact in enumerate(facts):
+            # Extract source info from fact format: [Title] text (confidence: X%, source: URL)
+            source_url = ""
+            source_title = ""
+            conf = 0.5
+            text = fact
+
+            import re
+            m = re.match(r"\[(.*?)\]\s*(.*)", fact)
+            if m:
+                source_title = m.group(1)
+                text = m.group(2)
+
+            m = re.search(r"confidence:\s*(\d+)%", fact)
+            if m:
+                conf = int(m.group(1)) / 100
+
+            m = re.search(r"source:\s*(\S+)", fact)
+            if m:
+                source_url = m.group(1)
+
+            claims.append(Claim(
+                text=text[:300],
+                source_url=source_url,
+                source_title=source_title,
+                confidence=conf,
+                citation=text[:200],
+            ))
+        return claims
 
     # ── Stage 5: Synthesize ─────────────────────────────────
 
