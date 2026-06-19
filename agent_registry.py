@@ -3603,7 +3603,23 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
 
         # ── 2. PromptEngineer (conditional) ─────────────────
         use_pe = self.wants_prompt_engineer(user_request)
+
+        # ── Inject shared project insights into task ─────────
         task = user_request
+        try:
+            from projects.project_context import get_current_project_id
+            pid = get_current_project_id()
+            if pid:
+                from projects.project_manager import ProjectManager
+                pm = ProjectManager()
+                insights = pm.get_relevant_insights(pid, user_request, n_results=3)
+                if insights:
+                    task = f"{user_request}\n\n[PROJECT INSIGHTS]\n" + "\n".join(
+                        f"- {ins['text']}" for ins in insights
+                    )
+        except Exception:
+            pass
+
         agents_used = []
 
         if use_pe:
@@ -3666,6 +3682,21 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
                     )
             except Exception as e:
                 logger.debug(f"Project code save skipped: {e}")
+
+        # ── 6. Auto-extract insight on success ──────────────
+        if wf_result.get("status") == "passed" and code:
+            try:
+                from projects.project_context import get_current_project_id
+                pid2 = get_current_project_id()
+                if pid2:
+                    insight_text = (
+                        f"Code task '{user_request[:100]}' completed successfully "
+                        f"after {wf_result.get('iterations', 0)} iteration(s). "
+                        f"Final code: {len(code)} chars in {project_path or 'memory'}."
+                    )
+                    pm.add_insight(pid2, insight_text, importance=0.5, source="workflow")
+            except Exception:
+                pass
 
         return {
             "display": display_text,

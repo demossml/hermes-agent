@@ -7934,6 +7934,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_rules(cmd_original)
         elif canonical == "semantic":
             self._handle_semantic(cmd_original)
+        elif canonical == "insights" or canonical == "insight":
+            self._handle_insights(cmd_original)
         elif canonical in ("project", "proj"):
             self._handle_project(cmd_original)
         elif canonical in ("projects", "projs"):
@@ -9661,6 +9663,42 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         _cprint(f"  Semantic check log (last {len(entries)} entries):")
         report = format_semantic_log_entries(entries)
         _cprint(report)
+
+    def _handle_insights(self, cmd: str):
+        """/insights — show project insights. /insight add <text> — add one."""
+        from projects.project_context import get_current_project_id
+        from projects.project_manager import ProjectManager
+
+        pid = get_current_project_id()
+        if not pid:
+            _cprint("  [red]No active project.[/] Use /project switch first.")
+            return
+
+        pm = ProjectManager()
+        parts = cmd.strip().split()
+
+        if len(parts) >= 2 and parts[1] == "add":
+            text = " ".join(parts[2:])
+            if not text.strip():
+                _cprint("  [red]Usage: /insight add <text>[/]")
+                return
+            doc_id = pm.add_insight(pid, text, importance=0.7, source="manual")
+            if doc_id:
+                _cprint(f"  ✅ Insight added: {text[:80]}...")
+            else:
+                _cprint("  [red]Failed to add insight (ChromaDB may not be available)[/]")
+        elif len(parts) >= 2 and parts[1] == "clear":
+            _cprint("  [yellow]Use /project delete to remove a project.[/] "
+                      "Insights are scoped to the project.")
+        else:
+            insights = pm.get_relevant_insights(pid, "lessons best practices", n_results=10)
+            if not insights:
+                _cprint("  [dim]No insights yet.[/] Use /insight add \"text\" to add one.")
+            else:
+                _cprint(f"\\n  [bold]Project Insights: {pid}[/]")
+                for i, ins in enumerate(insights, 1):
+                    _cprint(f"  {i}. [dim]{ins['source']}[/] → {ins['text'][:120]}")
+                _cprint(f"\\n  /insight add <text>  — добавить вручную")
 
     def _handle_project(self, cmd: str):
         """Handle /project — manage Hermes projects.

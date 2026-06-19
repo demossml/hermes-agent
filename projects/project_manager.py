@@ -241,6 +241,96 @@ class ProjectManager:
             logger.warning(f"ChromaDB init failed for '{project_id}': {e}")
             return False
 
+    # ── Shared Insights ──────────────────────────────────────
+
+    def ensure_insights_collection(self, project_id: str) -> bool:
+        """Create/get the shared insights ChromaDB collection."""
+        if not HAS_CHROMA:
+            return False
+        coll_name = f"project_{project_id}_insights"
+        chroma_dir = self.subdir_memory(project_id)
+        try:
+            client = chromadb.PersistentClient(path=str(chroma_dir),
+                settings=ChromaSettings(anonymized_telemetry=False))
+            client.get_or_create_collection(name=coll_name,
+                metadata={"hnsw:space": "cosine"})
+            return True
+        except Exception as e:
+            logger.warning(f"Insights ChromaDB init failed for '{project_id}': {e}")
+            return False
+
+    def add_insight(
+        self, project_id: str, text: str,
+        importance: float = 0.5, source: str = "manual",
+    ) -> str | None:
+        """Add an insight to the project's shared knowledge base.
+
+        Returns the insight ID or None on failure.
+        """
+        if not HAS_CHROMA or not text.strip():
+            return None
+        try:
+            self.ensure_insights_collection(project_id)
+            coll_name = f"project_{project_id}_insights"
+            chroma_dir = self.subdir_memory(project_id)
+            client = chromadb.PersistentClient(path=str(chroma_dir),
+                settings=ChromaSettings(anonymized_telemetry=False))
+            coll = client.get_or_create_collection(name=coll_name,
+                metadata={"hnsw:space": "cosine"})
+
+            import uuid, time
+            doc_id = f"insight-{project_id}-{uuid.uuid4().hex[:8]}"
+            coll.add(
+                ids=[doc_id],
+                documents=[text],
+                metadatas=[{
+                    "importance": importance,
+                    "source": source,
+                    "timestamp": time.time(),
+                }],
+            )
+            logger.info(f"Insight added to '{project_id}': {text[:60]}...")
+            return doc_id
+        except Exception as e:
+            logger.warning(f"Failed to add insight to '{project_id}': {e}")
+            return None
+
+    def get_relevant_insights(
+        self, project_id: str, query: str, n_results: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Retrieve top-N relevant insights for a task context."""
+        if not HAS_CHROMA:
+            return []
+        try:
+            coll_name = f"project_{project_id}_insights"
+            chroma_dir = self.subdir_memory(project_id)
+            if not (chroma_dir / "chroma.sqlite3").exists():
+                return []
+            client = chromadb.PersistentClient(path=str(chroma_dir),
+                settings=ChromaSettings(anonymized_telemetry=False))
+            try:
+                coll = client.get_collection(name=coll_name)
+            except Exception:
+                return []
+
+            results = coll.query(query_texts=[query], n_results=n_results)
+            if not results.get("ids") or not results["ids"][0]:
+                return []
+
+            insights = []
+            for i, doc_id in enumerate(results["ids"][0]):
+                doc = results["documents"][0][i] if results.get("documents") and results["documents"][0] else ""
+                meta = results["metadatas"][0][i] if results.get("metadatas") and results["metadatas"][0] else {}
+                insights.append({
+                    "id": doc_id, "text": doc,
+                    "importance": meta.get("importance", 0.5),
+                    "source": meta.get("source", "unknown"),
+                })
+            return insights
+        except Exception as e:
+            logger.debug(f"Failed to get insights for '{project_id}': {e}")
+            return []
+
     # ── Public API ────────────────────────────────────────────
 
     def create_project(self, name: str) -> dict[str, Any]:

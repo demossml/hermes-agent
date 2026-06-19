@@ -185,7 +185,8 @@ class TesterAgent(WorkflowAgent):
 
     def __init__(self, agent_id: str, registry: Any, task_id: str):
         super().__init__(agent_id, registry, task_id)
-        self.subtree_session_id = f"subtree-{agent_id}-{task_id}"
+        # STRICT isolation: tester MUST NOT share memory with coder or orchestrator
+        self.subtree_session_id = f"tester-isolated-{task_id}"
 
     async def review_code(self, code: str, session_id: str = "") -> str:
         """Review code — run real tests first, then LLM review.
