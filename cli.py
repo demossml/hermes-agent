@@ -7938,6 +7938,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_insights(cmd_original)
         elif canonical == "research":
             self._handle_research(cmd_original)
+        elif canonical == "hypothesis":
+            self._handle_hypothesis(cmd_original)
         elif canonical in ("project", "proj"):
             self._handle_project(cmd_original)
         elif canonical in ("projects", "projs"):
@@ -9703,39 +9705,126 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 _cprint(f"\\n  /insight add <text>  — добавить вручную")
 
     def _handle_research(self, cmd: str):
-        """/research <topic> — run deep research pipeline."""
-        topic = " ".join(cmd.strip().split()[1:])
-        if not topic:
-            _cprint("  [red]Usage: /research <topic>[/]")
+        """/research <topic|status|stop> — deep research pipeline."""
+        parts = cmd.strip().split()
+        action = parts[1].lower() if len(parts) > 1 else ""
+
+        if action == "status":
+            active = getattr(self, "_research_active", None)
+            if active:
+                stage, topic, elapsed = active
+                _cprint(f"\n  🔬 [bold]Research in progress[/]")
+                _cprint(f"     Topic: {topic[:80]}")
+                _cprint(f"     Stage: {stage}")
+                _cprint(f"     Elapsed: {elapsed:.1f}s")
+            else:
+                _cprint("  [dim]No active research.[/] Use /research <topic> to start.")
             return
 
-        _cprint(f"\\n  🔬 [bold]Research: {topic}[/]\\n")
+        if action == "stop":
+            if getattr(self, "_research_active", None):
+                self._research_active = None
+                _cprint("  🛑 Research cancelled.")
+            else:
+                _cprint("  [dim]No active research to stop.[/]")
+            return
 
-        try:
-            import asyncio
-            from research.pipeline import ResearchPipeline
-            from agent_registry import get_registry
+        topic = " ".join(parts[1:])
+        if not topic:
+            _cprint("  🔬 /research <topic>    — deep research")
+            _cprint("  /research status        — show progress")
+            _cprint("  /research stop          — cancel")
+            _cprint("  /hypothesis <claim>     — validate a claim")
+            return
 
-            registry = get_registry()
-            pipeline = ResearchPipeline(registry)
-            result = asyncio.run(pipeline.run(topic))
+        import asyncio, time
+        from pathlib import Path
+        from research.pipeline import ResearchPipeline, decompose_research_query
+        from agent_registry import get_registry
 
-            _cprint(f"  ✅ Research completed in {result.elapsed_s:.1f}s")
-            _cprint(f"  📊 Confidence: {result.confidence:.0%}")
-            _cprint(f"  📚 Sources: {len(result.sources)}")
-            _cprint(f"  🔍 Sub-questions: {len(result.sub_questions)}")
-            _cprint("")
+        registry = get_registry()
+        pipeline = ResearchPipeline(registry)
+        t0 = time.time()
 
-            for sec in result.sections:
-                _cprint(f"  [bold]{sec['heading']}[/]")
-                content = sec.get("content", "")[:300]
-                if len(sec.get("content", "")) > 300:
-                    content += "..."
-                _cprint(f"  {content}")
-                _cprint("")
+        self._research_active = ("decompose", topic, 0.0)
+        _cprint(f"\n  🔬 [bold]{topic}[/]")
+        _cprint(f"  ⠋ Decomposing...")
+        questions = asyncio.run(decompose_research_query(topic, max_questions=5))
+        _cprint(f"  ✅ Decomposed into {len(questions)} sub-questions")
+        self._research_active = ("search+read", topic, time.time() - t0)
 
-        except Exception as e:
-            _cprint(f"  [red]Research failed: {e}[/]")
+        _cprint(f"  ⠋ Searching & analysing...")
+        result = asyncio.run(pipeline.run(topic))
+        self._research_active = None
+        elapsed = result.elapsed_s or (time.time() - t0)
+
+        conf_pct = int(result.confidence * 100)
+        bar = "█" * (conf_pct // 5) + "░" * (20 - conf_pct // 5)
+        lines = []
+        lines.append(f"")
+        lines.append(f"  ╔══════════════════════════════════════════╗")
+        lines.append(f"  ║  🔬 Research Complete                   ║")
+        lines.append(f"  ╠══════════════════════════════════════════╣")
+        lines.append(f"  ║  Confidence: {bar} {result.confidence:.0%}    ║")
+        lines.append(f"  ║  Sources: {len(result.sources):>3}  |  Questions: {len(result.sub_questions)}  |  Time: {elapsed:.1f}s     ║")
+        lines.append(f"  ╠══════════════════════════════════════════╣")
+
+        for sec in result.sections[1:4]:
+            heading = sec.get("heading", "")[:45]
+            content = sec.get("content", "")[:120].replace("\n", " ")
+            lines.append(f"  ║  [bold]{heading}[/]")
+            for chunk in [content[i:i+42] for i in range(0, len(content), 42)]:
+                if chunk.strip():
+                    lines.append(f"  ║  {chunk}")
+            lines.append(f"  ║")
+
+        if result.report_path:
+            lines.append(f"  ╠══════════════════════════════════════════╣")
+            lines.append(f"  ║  📄 {Path(result.report_path).name[:38]}")
+        lines.append(f"  ╚══════════════════════════════════════════╝")
+        lines.append(f"")
+
+        if result.confidence >= 0.7:
+            lines.append(f"  💡 [bold]Next:[/] /code {topic[:45]} — начать разработку")
+        elif result.confidence >= 0.4:
+            lines.append(f"  💡 [bold]Next:[/] /hypothesis "<утверждение>" — проверить")
+        else:
+            lines.append(f"  💡 [bold]Next:[/] уточните запрос — /research <конкретнее>")
+
+        _cprint("\n".join(lines))
+
+    def _handle_hypothesis(self, cmd: str):
+        """/hypothesis <claim> — validate a claim via adversarial check."""
+        claim = " ".join(cmd.strip().split()[1:])
+        if not claim:
+            _cprint("  [red]Usage: /hypothesis <claim>[/]")
+            _cprint("  Example: /hypothesis Python 3.12 is 40% faster than 3.11")
+            return
+
+        import asyncio
+        from research.cross_validator import CrossValidator
+        from research.agents import Claim
+
+        _cprint(f"\n  🧪 [bold]Testing hypothesis:[/] {claim}")
+
+        sources = [{"title": "Hypothesis source", "snippet": claim}]
+        claims = [Claim(text=claim, source_url="hypothesis", source_title="User claim", confidence=0.7, citation=claim)]
+        validator = CrossValidator()
+        report = asyncio.run(validator.validate(claims, sources, "hypothesis"))
+
+        if not report.claims:
+            _cprint("  [red]Validation failed.[/]")
+            return
+
+        vc = report.claims[0]
+        icon = {"confirmed": "✅", "disputed": "⚠️", "rejected": "❌"}.get(vc.status, "•")
+        _cprint(f"")
+        _cprint(f"  {icon} [bold]{vc.status.upper()}[/]")
+        _cprint(f"     Confidence: {vc.adjusted_confidence:.0%}")
+        _cprint(f"     Corroboration: {'found' if vc.validator_a == 'supported' else 'none'}")
+        _cprint(f"     Contradiction: {'found' if vc.validator_b == 'contradicted' else 'none'}")
+        if vc.adjudicator_note:
+            _cprint(f"     Note: {vc.adjudicator_note}")
 
     def _handle_project(self, cmd: str):
         """Handle /project — manage Hermes projects.
