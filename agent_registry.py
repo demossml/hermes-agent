@@ -2506,6 +2506,14 @@ class AgentRegistry:
             # Simple task — direct answer, 1 API call
             return await self._ask_orchestrator_direct(session_id, message)
 
+        # ── Phase 0.5: Auto-trigger Research Mode ─────────────────
+        if self.is_research_task(message):
+            research_result = await self._run_research_if_needed(
+                session_id, message,
+            )
+            if research_result:
+                return research_result
+
         plan = await self._ask_orchestrator(session_id, message)
 
         # Parse delegation directives
@@ -3475,6 +3483,65 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
             if trigger in msg:
                 return len(msg) > 30
         return False
+
+    @classmethod
+    async def _run_research_if_needed(
+        cls, session_id: str, message: str,
+    ) -> str | None:
+        """Auto-trigger Research Mode for research-oriented questions.
+
+        Runs the full 5-stage pipeline and returns a formatted result
+        with a 'next step' suggestion.  Returns None if research
+        should not run or failed.
+        """
+        try:
+            from research.pipeline import ResearchPipeline
+
+            pipeline = ResearchPipeline()
+            result = await pipeline.run(message, language="ru")
+
+            # Build response
+            lines = [
+                f"🔬 **Research Complete: {result.title}**",
+                f"",
+                f"📊 Confidence: {result.confidence:.0%} | "
+                f"📚 Sources: {len(result.sources)} | "
+                f"⏱️ {result.elapsed_s:.1f}s",
+                f"",
+            ]
+
+            for sec in result.sections[1:4]:  # skip overview, show 3 sections
+                lines.append(f"**{sec['heading']}**")
+                content = sec.get("content", "")[:200]
+                lines.append(f"{content}...")
+                lines.append(f"")
+
+            if result.report_path:
+                lines.append(f"📄 Full report: `{result.report_path}`")
+
+            # ── Suggest next step ─────────────────────────────
+            lines.append(f"")
+            lines.append(f"**💡 What's next?**")
+            if result.confidence >= 0.7:
+                lines.append(
+                    f"- Start coding: `/code {message[:80]}`\n"
+                    f"- Save insights: `/insight add \"<key finding>\"`"
+                )
+            elif result.confidence >= 0.4:
+                lines.append(
+                    f"- Refine research: `/research {message[:60]} --depth 3`\n"
+                    f"- Verify disputed claims manually"
+                )
+            else:
+                lines.append(
+                    f"- Try different query: `/research <more specific topic>`\n"
+                    f"- Check source quality"
+                )
+
+            return "\n".join(lines)
+        except Exception as e:
+            logger.info("Auto-research skipped: %s", e)
+            return None
 
     _CODE_INDICATORS: list[str] = [
         "```", "def ", "class ", "import ", "from ",
