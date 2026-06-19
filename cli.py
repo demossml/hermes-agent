@@ -7936,6 +7936,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_semantic(cmd_original)
         elif canonical == "insights" or canonical == "insight":
             self._handle_insights(cmd_original)
+        elif canonical == "research":
+            self._handle_research(cmd_original)
         elif canonical in ("project", "proj"):
             self._handle_project(cmd_original)
         elif canonical in ("projects", "projs"):
@@ -9699,6 +9701,41 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 for i, ins in enumerate(insights, 1):
                     _cprint(f"  {i}. [dim]{ins['source']}[/] → {ins['text'][:120]}")
                 _cprint(f"\\n  /insight add <text>  — добавить вручную")
+
+    def _handle_research(self, cmd: str):
+        """/research <topic> — run deep research pipeline."""
+        topic = " ".join(cmd.strip().split()[1:])
+        if not topic:
+            _cprint("  [red]Usage: /research <topic>[/]")
+            return
+
+        _cprint(f"\\n  🔬 [bold]Research: {topic}[/]\\n")
+
+        try:
+            import asyncio
+            from research.pipeline import ResearchPipeline
+            from agent_registry import get_registry
+
+            registry = get_registry()
+            pipeline = ResearchPipeline(registry)
+            result = asyncio.run(pipeline.run(topic))
+
+            _cprint(f"  ✅ Research completed in {result.elapsed_s:.1f}s")
+            _cprint(f"  📊 Confidence: {result.confidence:.0%}")
+            _cprint(f"  📚 Sources: {len(result.sources)}")
+            _cprint(f"  🔍 Sub-questions: {len(result.sub_questions)}")
+            _cprint("")
+
+            for sec in result.sections:
+                _cprint(f"  [bold]{sec['heading']}[/]")
+                content = sec.get("content", "")[:300]
+                if len(sec.get("content", "")) > 300:
+                    content += "..."
+                _cprint(f"  {content}")
+                _cprint("")
+
+        except Exception as e:
+            _cprint(f"  [red]Research failed: {e}[/]")
 
     def _handle_project(self, cmd: str):
         """Handle /project — manage Hermes projects.

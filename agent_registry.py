@@ -3449,20 +3449,37 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
         ("c#", "csharp"),
     ]
 
+    _RESEARCH_TRIGGERS: list[str] = [
+        "почему не работает",
+        "почему не компилируется",
+        "как лучше сделать",
+        "как правильнее",
+        "сравни преимущества",
+        "чем отличается",
+        "какие альтернативы",
+        "best practices for",
+        "state of the art",
+        "deep dive",
+        "исследуй тему",
+        "разберись почему",
+        "какие подходы",
+    ]
+
+    @classmethod
+    def is_research_task(cls, message: str) -> bool:
+        """Quick check: does this message need deep research?"""
+        msg = message.lower().strip()
+        if msg.startswith("/research"):
+            return True
+        for trigger in cls._RESEARCH_TRIGGERS:
+            if trigger in msg:
+                return len(msg) > 30
+        return False
+
     _CODE_INDICATORS: list[str] = [
-        "```",
-        "def ",
-        "class ",
-        "import ",
-        "from ",
-        "function ",
-        "const ",
-        "let ",
-        "var ",
-        "return ",
-        "async ",
-        "await ",
-        "print(",
+        "```", "def ", "class ", "import ", "from ",
+        "function ", "const ", "let ", "var ", "return ",
+        "async ", "await ", "print(",
     ]
 
     @classmethod
