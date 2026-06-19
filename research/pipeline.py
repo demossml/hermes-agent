@@ -160,63 +160,96 @@ class ResearchPipeline:
     async def _parallel_search(
         self, sub_questions: list[SubQuestion], max_sources: int,
     ) -> None:
-        """Search each sub-question concurrently.
+        """Run 3-strategy parallel search for all sub-questions.
 
-        Uses web_search for external sources and session_search
-        for internal knowledge.
+        Uses SearcherAgent with BROAD, SPECIFIC, TECHNICAL strategies
+        running concurrently via asyncio.gather.
         """
+        from research.agents import SearcherAgent
+
+        searcher = SearcherAgent()
+
         async def _search_one(sq: SubQuestion) -> None:
-            try:
-                # Build search query from keywords
-                query = " ".join(sq.keywords[:5]) if sq.keywords else sq.question
-                # External web search (non-blocking)
-                try:
-                    from hermes_tools import web_search
-                    results = await asyncio.to_thread(
-                        web_search, query=query, limit=max_sources,
-                    )
-                    if results and results.get("results"):
-                        sq.sources = results["results"][:max_sources]
-                except Exception:
-                    sq.sources = []
-
-                # Internal knowledge search
-                try:
-                    from hermes_tools import session_search as _ss
-                    internal = await asyncio.to_thread(
-                        _ss, query=sq.question, limit=3,
-                    )
-                    if internal:
-                        sq.sources.append(
-                            {"title": "Internal", "content": str(internal)[:500]}
-                        )
-                except Exception:
-                    pass
-
-            except Exception as e:
-                logger.debug("Search failed for %s: %s", sq.id, e)
+            report = await searcher.search(
+                sq.question, question_id=sq.id,
+                max_per_strategy=max(3, max_sources // 3),
+            )
+            sq.sources = [
+                {
+                    "url": r.url,
+                    "title": r.title,
+                    "snippet": r.snippet,
+                    "strategy": r.strategy,
+                }
+                for r in report.results
+            ]
 
         # Run all searches concurrently
         tasks = [asyncio.create_task(_search_one(sq)) for sq in sub_questions]
         await asyncio.gather(*tasks, return_exceptions=True)
 
+        total = sum(len(sq.sources) for sq in sub_questions)
+        logger.info(
+            "Stage 2: %d sub-questions → %d total results (3 strategies each)",
+            len(sub_questions), total,
+        )
+
     # ── Stage 3: Deep Reading ───────────────────────────────
 
     async def _deep_read(self, sub_questions: list[SubQuestion]) -> None:
-        """Extract key facts from each source.
+        """Extract claims with citations from search results.
 
-        For each sub-question, read the top sources and extract
-        factual claims, data points, and quotes.
+        Uses ReaderAgent to deep-read top results per sub-question,
+        extracting factual claims with exact citations and source URLs.
         """
-        for sq in sub_questions:
-            if not sq.sources:
-                continue
-            # Extract snippets/urls as facts
-            for src in sq.sources[:5]:
-                title = src.get("title", "") or src.get("url", "")[:80]
-                snippet = src.get("content", "") or src.get("snippet", "")[:200]
-                if snippet:
-                    sq.facts.append(f"[{title}] {snippet}")
+        from research.agents import ReaderAgent
+
+        reader = ReaderAgent()
+
+        async def _read_one(sq: SubQuestion, sq_idx: int) -> None:
+            sources = sq.sources
+            if not sources:
+                return
+
+            # Build a mini SearchReport for the Reader
+            from research.agents import SearchResult
+            results = [
+                SearchResult(
+                    url=s.get("url", ""),
+                    title=s.get("title", ""),
+                    snippet=s.get("snippet", ""),
+                    strategy=s.get("strategy", "broad"),
+                    rank=i + 1,
+                )
+                for i, s in enumerate(sources)
+            ]
+
+            from research.agents import SearchReport
+            report = SearchReport(
+                question_id=sq.id,
+                question=sq.question,
+                results=results,
+            )
+
+            claims = await reader.read_and_extract(report, max_claims=5)
+            sq.facts = [
+                f"[{c.source_title}] {c.text} "
+                f"(confidence: {c.confidence:.0%}, source: {c.source_url})"
+                for c in claims
+            ]
+
+        # Read all sub-questions concurrently
+        tasks = [
+            asyncio.create_task(_read_one(sq, i))
+            for i, sq in enumerate(sub_questions)
+        ]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        total_facts = sum(len(sq.facts) for sq in sub_questions)
+        logger.info(
+            "Stage 3: extracted %d claims across %d sub-questions",
+            total_facts, len(sub_questions),
+        )
 
     # ── Stage 4: Cross-Validation ────────────────────────────
 

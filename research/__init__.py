@@ -12,6 +12,14 @@ from research.pipeline import (
     should_activate_research,
     decompose_research_query,
 )
+from research.agents import (
+    SearcherAgent,
+    ReaderAgent,
+    SearchResult,
+    Claim,
+    SearchReport,
+    run_search_and_read,
+)
 
 __all__ = [
     "ResearchPipeline",
@@ -19,4 +27,10 @@ __all__ = [
     "SubQuestion",
     "should_activate_research",
     "decompose_research_query",
+    "SearcherAgent",
+    "ReaderAgent",
+    "SearchResult",
+    "Claim",
+    "SearchReport",
+    "run_search_and_read",
 ]
