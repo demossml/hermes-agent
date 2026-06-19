@@ -549,8 +549,10 @@ class TestMessageStorage:
         user_msg = next(m for m in conv if m["role"] == "user")
         assistant_msg = next(m for m in conv if m["role"] == "assistant")
         assert user_msg.get("message_id") == "abc-123"
-        # Assistant row had no platform id — must not gain one spuriously.
-        assert "message_id" not in assistant_msg
+        # Assistant message auto-generates a fallback platform_message_id
+        # when none is passed (msg_<timestamp>).
+        assert "message_id" in assistant_msg
+        assert assistant_msg["message_id"].startswith("msg_")
 
     def test_replace_messages_preserves_platform_message_id(self, db):
         """``rewrite_transcript`` (which goes through replace_messages) must

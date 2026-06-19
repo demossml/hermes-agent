@@ -2445,6 +2445,19 @@ class SessionDB:
         if tool_calls is not None:
             num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
 
+        # ── Fallback: auto-generate platform_message_id for assistant msgs ──
+        if platform_message_id is None and role == "assistant":
+            platform_message_id = f"msg_{int(time.time() * 1000)}"
+            logger.debug(
+                "Auto-generated platform_message_id=%s for assistant message "
+                "in session %s", platform_message_id, session_id,
+            )
+        elif platform_message_id is None:
+            logger.debug(
+                "platform_message_id missing for role=%s in session %s",
+                role, session_id,
+            )
+
         def _do(conn):
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
