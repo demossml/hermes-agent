@@ -5937,15 +5937,76 @@ class TelegramAdapter(BasePlatformAdapter):
         if not msg or not msg.text:
             return
         asyncio.create_task(self._save_to_chat_history(msg, "command"))
+
+        # ── /rule off|on|list — handled locally, no LLM ──────
+        text = (msg.text or "").strip()
+        if text.startswith("/rule ") or text == "/rule":
+            await self._handle_rule_command_locally(msg, text)
+            return
+
         if not self._should_process_message(msg, is_command=True):
             return
         await self._ensure_forum_commands(msg)
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
-        await self._cache_replied_media(msg, event)
-        event = self._apply_telegram_group_observe_attribution(event)
-        await self.handle_message(event)
+    async def _handle_rule_command_locally(
+        self, msg, text: str,
+    ) -> None:
+        """Handle /rule off|on|list locally — zero LLM cost."""
+        from hermes_cli.chat_rules import (
+            disable_rule_by_text, enable_rule_by_text,
+            list_active_rules_text,
+        )
+
+        chat_id = str(msg.chat.id)
+        group_id = f"telegram:{chat_id}"
+        parts = text.strip().split(None, 2)  # ["/rule", "off", "молчи"]
+
+        action = parts[1].lower() if len(parts) > 1 else "list"
+        search_text = parts[2] if len(parts) > 2 else ""
+
+        reply_lines = []
+        if action == "off":
+            if not search_text:
+                reply_lines.append("⚠️ Укажите текст правила: /rule off <текст>")
+            else:
+                count = disable_rule_by_text(group_id, search_text)
+                reply_lines.append(
+                    f"🔇 Отключено правил: {count} "
+                    f"(поиск: «{search_text}»)"
+                )
+        elif action == "on":
+            if not search_text:
+                reply_lines.append("⚠️ Укажите текст правила: /rule on <текст>")
+            else:
+                count = enable_rule_by_text(group_id, search_text)
+                reply_lines.append(
+                    f"🔊 Включено правил: {count} "
+                    f"(поиск: «{search_text}»)"
+                )
+        elif action == "list":
+            rules = list_active_rules_text(group_id)
+            if rules:
+                reply_lines.append(f"📋 Правила чата ({len(rules)}):")
+                for i, r in enumerate(rules, 1):
+                    reply_lines.append(f"  {i}. {r}")
+            else:
+                reply_lines.append("📋 Нет активных правил.")
+        else:
+            reply_lines.append(
+                "📋 Доступно: /rule list, /rule off <текст>, /rule on <текст>"
+            )
+
+        reply_text = "\n".join(reply_lines)
+        try:
+            await self._bot.send_message(
+                chat_id=int(chat_id),
+                text=reply_text,
+                reply_to_message_id=msg.message_id,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send /rule reply: {e}")
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""

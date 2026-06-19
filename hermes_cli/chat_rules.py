@@ -62,12 +62,22 @@ def _get_conn():
             priority INTEGER DEFAULT 0,
             active BOOLEAN DEFAULT true,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            created_by TEXT DEFAULT 'system'
+            created_by TEXT DEFAULT 'system',
+            expires_at TIMESTAMP
         )
     """)
     _conn.execute("""
         CREATE SEQUENCE IF NOT EXISTS seq_chat_rules_id START 1
     """)
+    # Migration: add expires_at column if missing
+    try:
+        cols = _conn.execute("PRAGMA table_info('chat_rules')").fetchall()
+        col_names = {c[1] for c in cols}
+        if "expires_at" not in col_names:
+            _conn.execute("ALTER TABLE chat_rules ADD COLUMN expires_at TIMESTAMP")
+            logger.info("Added expires_at column to chat_rules")
+    except Exception:
+        pass
     # Ensure id auto-increments
     try:
         _conn.execute("""
@@ -86,20 +96,14 @@ def _get_conn():
 def get_rules_for_group(group_id: str) -> list[str]:
     """Return active rules for a group, ordered by priority.
 
-    Called by the gateway BEFORE every LLM invocation.
-    One SQL query — microseconds.
-
-    Args:
-        group_id: e.g. "telegram:123456" or "discord:#general"
-
-    Returns:
-        List of rule strings, highest priority first.
+    Automatically filters out expired rules (expires_at <= now()).
     """
     try:
         conn = _get_conn()
         rows = conn.execute(
             "SELECT rule FROM chat_rules "
             "WHERE group_id = ? AND active = true "
+            "AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP) "
             "ORDER BY priority DESC, id ASC",
             [group_id],
         ).fetchall()
@@ -129,17 +133,37 @@ def format_rules_prompt(rules: list[str]) -> str:
 # ── Management API (for CLI and agent tools) ─────────────────
 
 
-def add_rule(group_id: str, rule: str, priority: int = 0, created_by: str = "system") -> int:
-    """Add a rule to a group. Returns the new rule ID."""
+def add_rule(group_id: str, rule: str, priority: int = 0, created_by: str = "system", ttl: str | None = None) -> int:
+    """Add a rule to a group. Returns the new rule ID.
+
+    Args:
+        ttl: Duration string like '30m', '1h', '2h30m', '1d'.
+             Rule auto-expires after this duration.
+    """
+    import re as _re
+
+    expires_at = None
+    if ttl:
+        seconds = _parse_ttl(ttl)
+        if seconds:
+            expires_at = f"CURRENT_TIMESTAMP + INTERVAL {seconds} SECONDS"
+
     conn = _get_conn()
-    conn.execute(
-        "INSERT INTO chat_rules (group_id, rule, priority, created_by) "
-        "VALUES (?, ?, ?, ?)",
-        [group_id, rule, priority, created_by],
-    )
+    if expires_at:
+        conn.execute(
+            f"INSERT INTO chat_rules (group_id, rule, priority, created_by, expires_at) "
+            f"VALUES (?, ?, ?, ?, {expires_at})",
+            [group_id, rule, priority, created_by],
+        )
+    else:
+        conn.execute(
+            "INSERT INTO chat_rules (group_id, rule, priority, created_by) "
+            "VALUES (?, ?, ?, ?)",
+            [group_id, rule, priority, created_by],
+        )
     row = conn.execute("SELECT currval('seq_chat_rules_id')").fetchone()
     rule_id = int(row[0]) if row else 0
-    logger.info(f"Added chat rule {rule_id} for {group_id}: {rule[:60]}...")
+    logger.info(f"Added chat rule {rule_id} for {group_id}: {rule[:60]}... ttl={ttl}")
     return rule_id
 
 
@@ -217,6 +241,66 @@ def rule_count(group_id: str | None = None) -> int:
     else:
         row = conn.execute("SELECT COUNT(*) FROM chat_rules").fetchone()
     return int(row[0]) if row else 0
+
+
+def _parse_ttl(duration: str) -> int | None:
+    """Parse TTL string like '30m', '1h', '2h30m', '1d' to seconds."""
+    import re
+    total = 0
+    pattern = re.compile(r"(\d+)\s*(d|h|m|s)")
+    for m in pattern.finditer(duration.lower()):
+        val = int(m.group(1))
+        unit = m.group(2)
+        if unit == "d":
+            total += val * 86400
+        elif unit == "h":
+            total += val * 3600
+        elif unit == "m":
+            total += val * 60
+        elif unit == "s":
+            total += val
+    return total if total > 0 else None
+
+
+def disable_rule_by_text(group_id: str, text: str) -> int:
+    """Disable rules matching text (LIKE %...%) in the group. Returns count."""
+    conn = _get_conn()
+    conn.execute(
+        "UPDATE chat_rules SET active = false "
+        "WHERE group_id = ? AND rule LIKE ? AND active = true",
+        [group_id, f"%{text}%"],
+    )
+    return conn.execute("SELECT CHANGES()").fetchone()[0]
+
+
+def enable_rule_by_text(group_id: str, text: str) -> int:
+    """Enable previously disabled rules matching text. Returns count."""
+    conn = _get_conn()
+    conn.execute(
+        "UPDATE chat_rules SET active = true "
+        "WHERE group_id = ? AND rule LIKE ? AND active = false",
+        [group_id, f"%{text}%"],
+    )
+    return conn.execute("SELECT CHANGES()").fetchone()[0]
+
+
+def list_active_rules_text(group_id: str) -> list[str]:
+    """Return active rule texts with optional TTL info."""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT rule, expires_at FROM chat_rules "
+        "WHERE group_id = ? AND active = true "
+        "AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP) "
+        "ORDER BY priority DESC, id ASC",
+        [group_id],
+    ).fetchall()
+    result = []
+    for rule, exp in rows:
+        if exp:
+            result.append(f"{rule} [истекает: {str(exp)[:16]}]")
+        else:
+            result.append(rule)
+    return result
 
 
 # ── Gateway integration ──────────────────────────────────────
