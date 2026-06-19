@@ -158,6 +158,24 @@ class ProjectManager:
             f"yaml={'created' if not yaml_path.exists() else 'ok'})"
         )
 
+        # ── SOUL.md for project agents (idempotent) ─────────
+        soul_path = root / "agents" / "SOUL.md"
+        if not soul_path.exists():
+            soul_path.write_text(
+                f"# {display_name}\n\n"
+                f"Project ID: `{project_id}`\n\n"
+                f"All agents in this project share:\n"
+                f"- Memory: `project-{project_id}/` subtree\n"
+                f"- ChromaDB: `project_{project_id}` collection\n"
+                f"- Data: `~/.hermes/projects/{project_id}/data/`\n\n"
+                f"## Rules\n\n"
+                f"- Work STRICTLY within this project\n"
+                f"- Do NOT access other projects' data\n"
+                f"- Use the project's memory and tools\n",
+                encoding="utf-8",
+            )
+            logger.info(f"Project '{project_id}' SOUL.md created")
+
         return meta
 
     def subdir_data(self, project_id: str) -> Path:
