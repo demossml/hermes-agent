@@ -3377,40 +3377,58 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
         ("напиши скрипт", "python"),
         ("напиши класс", "python"),
         ("напиши модуль", "python"),
+        ("напиши программу", "python"),
+        ("напиши api", "python"),
+        ("напиши парсер", "python"),
+        ("напиши бота", "python"),
+        ("напиши тест", "python"),
+        ("напиши тесты", "python"),
         ("write a function", "python"),
-        ("write a", "python"),
-        ("write code", "python"),
         ("write a script", "python"),
         ("write a class", "python"),
+        ("write a test", "python"),
+        ("write tests", "python"),
+        ("write code", "python"),
+        ("create a function", "python"),
+        ("create a class", "python"),
+        ("create a script", "python"),
         ("создай функцию", "python"),
         ("создай класс", "python"),
         ("создай скрипт", "python"),
-        ("create a function", "python"),
-        ("create a class", "python"),
+        ("создай программу", "python"),
+        ("создай модуль", "python"),
         ("реализуй алгоритм", "python"),
+        ("реализуй функцию", "python"),
+        ("реализуй класс", "python"),
+        ("реализуй метод", "python"),
         ("implement algorithm", "python"),
         ("implement a function", "python"),
-        ("реализуй функцию", "python"),
+        ("implement a class", "python"),
+        ("implement a method", "python"),
         ("исправь код", "python"),
         ("исправь ошибку", "python"),
+        ("исправь баг", "python"),
         ("почини код", "python"),
+        ("почини баг", "python"),
         ("fix the code", "python"),
         ("fix this code", "python"),
         ("fix the bug", "python"),
+        ("fix bug", "python"),
         ("debug", "python"),
         ("отрефактори", "python"),
         ("рефакторинг", "python"),
         ("refactor", "python"),
         ("добавь фичу", "python"),
         ("добавь функцию", "python"),
+        ("добавь метод", "python"),
         ("add a feature", "python"),
         ("add feature", "python"),
         ("оптимизируй", "python"),
         ("optimize", "python"),
-        ("напиши тест", "python"),
-        ("напиши тесты", "python"),
-        ("write a test", "python"),
-        ("write tests", "python"),
+        ("сгенерируй код", "python"),
+        ("generate code", "python"),
+        ("сделай код", "python"),
+        ("make code", "python"),
         ("javascript", "javascript"),
         ("typescript", "typescript"),
         ("напиши на js", "javascript"),
@@ -3618,19 +3636,46 @@ Output NOTHING else. No explanations. No markdown. Just DELEGATE lines or NONE.
         isolation = {
             "coder_subtree": manager.coder_session_id[:32] if manager.coder_session_id else "N/A",
             "tester_subtree": manager.tester_session_id[:32] if manager.tester_session_id else "N/A",
-            "tester_tools": [],  # enforced by TesterAgent._build_config
+            "tester_tools": [],
             "different_subtrees": manager.coder_session_id != manager.tester_session_id,
             "ok": manager.coder_session_id != manager.tester_session_id,
         }
 
+        # ── 5. Save to project (if active) ──────────────────
+        code = wf_result.get("code", "")
+        project_path = ""
+        if code:
+            try:
+                from projects.project_context import get_current_project_id
+                pid = get_current_project_id()
+                if pid:
+                    from projects.project_manager import ProjectManager
+                    pm = ProjectManager()
+                    code_dir = pm.subdir_data(pid).parent / "code"
+                    code_dir.mkdir(parents=True, exist_ok=True)
+                    # Generate filename from task description
+                    import re as _re
+                    safe_name = _re.sub(r"[^a-z0-9_]+", "_", user_request[:40].lower().strip())[:40]
+                    fname = f"{safe_name}_{manager.task_id}.py"
+                    fpath = code_dir / fname
+                    fpath.write_text(code, encoding="utf-8")
+                    project_path = str(fpath)
+                    logger.info(
+                        f"Code saved to project '{pid}': {fpath} "
+                        f"({len(code)} chars)"
+                    )
+            except Exception as e:
+                logger.debug(f"Project code save skipped: {e}")
+
         return {
             "display": display_text,
             "status": wf_result.get("status", "completed"),
-            "code": wf_result.get("code", ""),
+            "code": code,
             "review": wf_result.get("review", ""),
             "iterations": wf_result.get("iterations", 0),
             "agents": agents_used,
             "isolation": isolation,
+            "project_path": project_path,
         }
 
     async def start_code_workflow(
