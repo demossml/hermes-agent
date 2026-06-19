@@ -1094,6 +1094,7 @@ def format_full_report(
     migration_report: dict[str, Any] | None = None,
     upgrade_report: dict[str, Any] | None = None,
     strict_report: dict[str, Any] | None = None,
+    platform_id_report: dict[str, Any] | None = None,
     dry_run: bool = False,
 ) -> str:
     """Сформировать красивый итоговый отчёт об обновлении."""
@@ -1213,6 +1214,16 @@ def format_full_report(
             strict_parts.append(f"{len(agent_migs)} агентов: CRITICAL GLOBAL RULE добавлен")
         if strict_parts:
             section_items.append(("🛡️", "Strict Compliance", "; ".join(strict_parts)))
+
+    # platform_message_id backfill
+    if platform_id_report:
+        bf = platform_id_report.get("backfilled", 0)
+        ok = platform_id_report.get("already_ok", 0)
+        if bf:
+            section_items.append(
+                ("🆔", "platform_message_id backfill",
+                 f"{bf} assistant messages backfilled, {ok} already OK")
+            )
 
     for icon, name, detail in section_items:
         lines.append(f"  {icon}  {name:<20} {detail}")
@@ -1628,6 +1639,77 @@ Run `hermes update` to apply changes to all agents.
 
 
 # ═══════════════════════════════════════════════════════════════
+# Phase 12: platform_message_id backfill
+# ═══════════════════════════════════════════════════════════════
+
+def backfill_platform_message_ids(dry_run: bool = False) -> dict[str, Any]:
+    """Backfill platform_message_id for old assistant messages.
+
+    Idempotent — only updates rows where platform_message_id IS NULL
+    and role='assistant'.  Generates msg_<microsecond_timestamp> IDs.
+    """
+    report: dict[str, Any] = {"backfilled": 0, "already_ok": 0, "error": None}
+
+    home = Path.home() / ".hermes"
+    state_db = home / "state.db"
+    if not state_db.exists():
+        return report
+
+    try:
+        import sqlite3
+        import time
+
+        conn = sqlite3.connect(str(state_db))
+        # Check if column exists
+        cols = conn.execute("PRAGMA table_info(messages)").fetchall()
+        col_names = {c[1] for c in cols}
+        if "platform_message_id" not in col_names:
+            conn.close()
+            return report
+
+        # Count rows needing backfill
+        count = conn.execute(
+            "SELECT COUNT(*) FROM messages "
+            "WHERE role='assistant' AND platform_message_id IS NULL"
+        ).fetchone()[0]
+
+        report["already_ok"] = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE platform_message_id IS NOT NULL"
+        ).fetchone()[0]
+
+        if count == 0:
+            conn.close()
+            return report
+
+        if dry_run:
+            report["backfilled"] = count
+            conn.close()
+            return report
+
+        # Batch update with unique IDs
+        base_ts = int(time.time() * 1_000_000)
+        conn.execute(
+            "UPDATE messages SET platform_message_id = "
+            "'msg_' || CAST(? + rowid AS TEXT) "
+            "WHERE role='assistant' AND platform_message_id IS NULL",
+            (base_ts,),
+        )
+        conn.commit()
+        report["backfilled"] = count
+        conn.close()
+
+        logger.info(
+            "platform_message_id backfill: %d rows updated, %d already OK",
+            count, report["already_ok"],
+        )
+    except Exception as e:
+        report["error"] = str(e)
+        logger.warning("platform_message_id backfill failed: %s", e)
+
+    return report
+
+
+# ═══════════════════════════════════════════════════════════════
 # Entry Point
 # ═══════════════════════════════════════════════════════════════
 
@@ -1704,9 +1786,12 @@ def run_update(
     if full:
         strict_report = apply_strict_compliance_rules(root, dry_run=dry_run)
     else:
-        # Always apply strict compliance (critical_rules + config)
-        # even without --full — it's idempotent and backward-compatible
         strict_report = apply_strict_compliance_rules(root, dry_run=dry_run)
+
+    # ── Phase 12: platform_message_id backfill ─────────────────
+    platform_id_report: dict[str, Any] = {}
+    if full:
+        platform_id_report = backfill_platform_message_ids(dry_run=dry_run)
 
     # ── Format report ───────────────────────────────────────
     report = format_full_report(
@@ -1723,6 +1808,7 @@ def run_update(
         migration_report=migration_report,
         upgrade_report=upgrade_report,
         strict_report=strict_report,
+        platform_id_report=platform_id_report,
         dry_run=dry_run,
     )
 

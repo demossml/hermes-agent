@@ -2447,7 +2447,7 @@ class SessionDB:
 
         # ── Fallback: auto-generate platform_message_id for assistant msgs ──
         if platform_message_id is None and role == "assistant":
-            platform_message_id = f"msg_{int(time.time() * 1000)}"
+            platform_message_id = f"msg_{int(time.time() * 1_000_000)}"
             logger.debug(
                 "Auto-generated platform_message_id=%s for assistant message "
                 "in session %s", platform_message_id, session_id,
