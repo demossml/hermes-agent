@@ -5,6 +5,18 @@ Activation:
     /research <topic>           — explicit
     should_activate_research()  — auto-detect from user message
 """
-from research.pipeline import ResearchPipeline, ResearchResult, SubQuestion, should_activate_research
+from research.pipeline import (
+    ResearchPipeline,
+    ResearchResult,
+    SubQuestion,
+    should_activate_research,
+    decompose_research_query,
+)
 
-__all__ = ["ResearchPipeline", "ResearchResult", "SubQuestion", "should_activate_research"]
+__all__ = [
+    "ResearchPipeline",
+    "ResearchResult",
+    "SubQuestion",
+    "should_activate_research",
+    "decompose_research_query",
+]

@@ -137,45 +137,23 @@ class ResearchPipeline:
     async def _decompose(
         self, topic: str, language: str, max_depth: int,
     ) -> list[SubQuestion]:
-        """Break the topic into independent sub-questions.
+        """Break topic into 3-6 independent sub-questions.
 
-        Uses a lightweight classifier or a small LLM call to
-        generate 3-7 focused sub-questions that can be researched
-        independently.
+        Uses decompose_research_query() which tries LLM first,
+        falls back to domain-aware heuristic.
         """
-        prompt = (
-            f"Разбей тему на 3-7 независимых подвопросов для исследования. "
-            f"Каждый подвопрос должен быть самодостаточным.\n\n"
-            f"Тема: {topic}\n\n"
-            f"Формат: один вопрос на строку, без нумерации."
+        questions = await decompose_research_query(
+            topic, language=language, max_questions=max_depth * 3,
+            registry=self._registry, pipeline_id=self._pipeline_id,
         )
-
-        # Try using orchestrator if available, else use simple heuristic
-        if self._registry and hasattr(self._registry, "orchestrate"):
-            try:
-                response = await self._registry.orchestrate(
-                    session_id=f"research-decompose-{self._pipeline_id}",
-                    user_message=prompt,
-                )
-                lines = [
-                    line.strip("- •1234567890. \t")
-                    for line in (response or "").split("\n")
-                    if len(line.strip()) > 10 and "?" in line
-                ]
-                if lines:
-                    return [
-                        SubQuestion(
-                            id=f"q{i+1}-{self._pipeline_id}",
-                            question=line,
-                            keywords=_extract_keywords(line),
-                        )
-                        for i, line in enumerate(lines[:max_depth * 3])
-                    ]
-            except Exception as e:
-                logger.debug("Decompose via orchestrate failed: %s", e)
-
-        # Fallback: simple keyword-based decomposition
-        return _heuristic_decompose(topic, self._pipeline_id)
+        return [
+            SubQuestion(
+                id=f"q{i+1}-{self._pipeline_id}",
+                question=q,
+                keywords=_extract_keywords(q),
+            )
+            for i, q in enumerate(questions)
+        ]
 
     # ── Stage 2: Parallel Search ────────────────────────────
 
@@ -375,22 +353,238 @@ def _extract_keywords(text: str) -> list[str]:
     return [w for w in words if w not in stop][:10]
 
 
-def _heuristic_decompose(
-    topic: str, pipeline_id: str,
-) -> list[SubQuestion]:
-    """Fallback: simple rule-based decomposition."""
-    aspects = [
-        "текущее состояние и основные подходы",
-        "ключевые технологии и инструменты",
-        "преимущества и недостатки",
-        "примеры использования и best practices",
-        "альтернативы и сравнение",
-    ]
-    return [
-        SubQuestion(
-            id=f"q{i+1}-{pipeline_id}",
-            question=f"{topic}: {aspect}",
-            keywords=_extract_keywords(f"{topic} {aspect}"),
+# ═══════════════════════════════════════════════════════════════
+# Decompose: break research query into sub-questions
+# ═══════════════════════════════════════════════════════════════
+
+# Domain-specific decomposition stratagems
+_DECOMPOSE_STRATAGEMS = {
+    "compare": [
+        "What is {focus} in {topic}?",
+        "How does {alt1} compare to {alt2} on {metric}?",
+        "Trade-offs: {tradeoff1} vs {tradeoff2}",
+        "Real-world performance benchmarks for {topic}",
+        "Community adoption and ecosystem maturity",
+    ],
+    "how_to": [
+        "Какие технологии/библиотеки существуют для {focus}?",
+        "Пошаговая реализация {core_task}",
+        "Типичные ошибки и как их избежать при работе с {focus}",
+        "Best practices и паттерны для {focus}",
+        "Сравнение инструментов: плюсы и минусы каждого",
+        "Обработка ошибок, edge cases и безопасность",
+    ],
+    "why": [
+        "Root cause analysis of {problem}",
+        "Alternative approaches that were tried",
+        "Historical context: how {topic} evolved",
+        "Underlying principles and theory",
+        "Known limitations and workarounds",
+    ],
+    "architecture": [
+        "Core components and their interactions",
+        "Data flow and state management",
+        "Scalability considerations for {topic}",
+        "Security and authentication patterns",
+        "Deployment and infrastructure requirements",
+        "Monitoring and observability",
+    ],
+    "general": [
+        "Current state of the art in {topic}",
+        "Key technologies and tools for {topic}",
+        "Major advantages and disadvantages",
+        "Real-world examples and case studies",
+        "Best practices and conventions (2024-2026)",
+        "Common challenges and solutions",
+    ],
+}
+
+
+async def decompose_research_query(
+    query: str,
+    *,
+    language: str = "ru",
+    max_questions: int = 6,
+    registry=None,
+    pipeline_id: str = "",
+) -> list[str]:
+    """Break a research query into 3-6 independent, specific sub-questions.
+
+    Strategy:
+    1. Detect query type (compare/how-to/why/architecture)
+    2. Try LLM decomposition via registry.orchestrate()
+    3. Fall back to domain-aware heuristic stratagems
+
+    Args:
+        query: The research topic/question
+        language: Output language ('ru' or 'en')
+        max_questions: Maximum number of sub-questions (3-10)
+        registry: AgentRegistry for LLM decomposition (optional)
+        pipeline_id: Pipeline identifier for logging
+
+    Returns:
+        List of sub-question strings.
+    """
+    max_questions = max(3, min(max_questions, 10))
+    query_lower = query.lower()
+
+    # ── 1. Detect query type ────────────────────────────────
+    stratagem_key = "general"
+    if any(w in query_lower for w in ("как", "how to", "реализовать", "сделать", "написать", "implement", "build", "создать", "разработать")):
+        stratagem_key = "how_to"
+    elif any(w in query_lower for w in ("почему", "why", "причина", "cause", "root", "не работает", "ошибка")):
+        stratagem_key = "why"
+    elif any(w in query_lower for w in ("сравни", "compare", "vs", "против", "лучше", "отличие", "difference")):
+        stratagem_key = "compare"
+    elif any(w in query_lower for w in ("архитектур", "architecture", "design", "pattern", "проектирован")):
+        stratagem_key = "architecture"
+
+    # ── 2. LLM decomposition ────────────────────────────────
+    if registry and hasattr(registry, "orchestrate"):
+        try:
+            prompt = _build_decompose_prompt(query, language, max_questions, stratagem_key)
+            raw = await registry.orchestrate(
+                session_id=f"research-decomp-{pipeline_id or 'anon'}",
+                user_message=prompt,
+            )
+            parsed = _parse_decompose_response(raw, max_questions)
+            if parsed and len(parsed) >= 2:
+                logger.info("Decompose: LLM produced %d sub-questions", len(parsed))
+                return parsed
+        except Exception as e:
+            logger.debug("LLM decompose failed: %s", e)
+
+    # ── 3. Fallback: domain-aware heuristic ─────────────────
+    result = _apply_stratagem(query, stratagem_key, max_questions)
+    logger.info("Decompose: heuristic produced %d sub-questions (%s)", len(result), stratagem_key)
+    return result
+
+
+def _build_decompose_prompt(
+    query: str, language: str, max_q: int, stratagem: str,
+) -> str:
+    """Build a structured prompt for LLM decomposition."""
+    lang_hint = "на русском языке" if language == "ru" else "in English"
+    return (
+        f"You are a research strategist. Break this research topic "
+        f"into exactly {max_q} independent, specific sub-questions "
+        f"({lang_hint}).\n\n"
+        f"RESEARCH TOPIC: {query}\n"
+        f"QUERY TYPE: {stratagem}\n\n"
+        f"RULES:\n"
+        f"1. Each sub-question must be self-contained and researchable.\n"
+        f"2. No overlap between sub-questions.\n"
+        f"3. Cover different angles: tools, trade-offs, examples, pitfalls.\n"
+        f"4. Be specific — replace generic phrases with concrete terms.\n"
+        f"5. Output format: one question per line, NO numbers/bullets.\n"
+        f"6. Output ONLY the questions — no preamble, no summary.\n"
+    )
+
+
+def _parse_decompose_response(raw: str, max_q: int) -> list[str]:
+    """Parse LLM output into sub-question list."""
+    import re
+    lines = []
+    for line in (raw or "").split("\n"):
+        stripped = line.strip()
+        # Remove numbering (1. 2) 3. etc.)
+        stripped = re.sub(r"^\s*[\d]+[\.\)]\s*", "", stripped)
+        # Remove bullet characters
+        stripped = stripped.lstrip("-•*→›» \t")
+        # Must be a meaningful question-like line
+        if len(stripped) > 15 and "?" in stripped:
+            lines.append(stripped)
+        elif len(stripped) > 30:
+            # Non-question but substantial — add question mark if missing
+            if not stripped.endswith("?"):
+                stripped = _to_question(stripped)
+            lines.append(stripped)
+
+    # Deduplicate near-duplicates
+    seen = set()
+    result = []
+    for line in lines:
+        norm = _normalize_for_dedup(line)
+        if norm not in seen:
+            seen.add(norm)
+            result.append(line)
+    return result[:max_q]
+
+
+def _to_question(text: str) -> str:
+    """Convert a statement to a question form."""
+    text = text.rstrip(".!;,")
+    if text.lower().startswith(("как", "how", "what", "why", "когда", "where")):
+        return text + "?"
+    if text.lower().startswith(("сравни", "compare")):
+        return text + "?"
+    return f"What are the key aspects of {text}?"
+
+
+def _normalize_for_dedup(text: str) -> str:
+    """Normalize text for deduplication."""
+    import re
+    return re.sub(r"[^\w\s]", "", text.lower().strip())[:60]
+
+
+def _apply_stratagem(
+    query: str, stratagem_key: str, max_q: int,
+) -> list[str]:
+    """Generate sub-questions using domain-aware stratagems."""
+    templates = _DECOMPOSE_STRATAGEMS.get(stratagem_key, _DECOMPOSE_STRATAGEMS["general"])
+
+    # Extract focus terms from query
+    words = query.lower().split()
+    # Try to detect alternatives (for compare mode)
+    alt1 = alt2 = ""
+    if stratagem_key == "compare":
+        import re
+        parts = re.split(r"\b(vs|против|или|compared to|versus|and)\b", query, flags=re.IGNORECASE)
+        if len(parts) >= 3:
+            alt1 = parts[0].strip()
+            alt2 = parts[-1].strip() if len(parts) >= 3 else ""
+
+    # Fill templates
+    # Clean focus: strip common prefixes and stopwords
+    focus = query
+    for prefix in ("как лучше всего ", "как правильно ", "как ", "how to best ", "how to ", "что такое ", "what is "):
+        if focus.lower().startswith(prefix):
+            focus = focus[len(prefix):]
+            break
+    # Remove filler words from focus
+    for filler in ("лучше всего ", "правильно ", "реализовать ", "сделать ", "написать ", "создать ", "разработать "):
+        if focus.lower().startswith(filler):
+            focus = focus[len(filler):]
+            break
+    focus = focus[:60].strip()
+    if not focus:
+        focus = query[:60]
+    core_task = next((w for w in words if len(w) > 4 and w not in ("лучше", "всего", "правильно", "реализовать", "сделать")), "implementation")
+    problem = focus
+    tradeoff1 = "simplicity"
+    tradeoff2 = "performance"
+    metric = "scalability"
+
+    result = []
+    for tmpl in templates:
+        filled = tmpl.format(
+            topic=query, focus=focus, core_task=core_task,
+            problem=problem, alt1=alt1 or "Option A",
+            alt2=alt2 or "Option B", tradeoff1=tradeoff1,
+            tradeoff2=tradeoff2, metric=metric,
         )
-        for i, aspect in enumerate(aspects)
-    ]
+        result.append(filled)
+
+    # Add query-specific questions
+    result.append(f"What are the most common mistakes in {focus}?")
+    result.append(f"What do experts recommend for {focus} in 2025-2026?")
+
+    # Deduplicate and limit
+    seen = set()
+    out = []
+    for r in result:
+        norm = _normalize_for_dedup(r)
+        if norm not in seen:
+            seen.add(norm)
+            out.append(r)
+    return out[:max_q]
