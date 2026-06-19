@@ -51,12 +51,13 @@ class SubQuestion:
 class ResearchResult:
     """Final research output."""
     title: str
-    sections: list[dict[str, Any]]  # [{heading, content, sources}]
-    sources: list[str]              # deduplicated source URLs/refs
-    confidence: float               # 0-1 average cross-validation score
+    sections: list[dict[str, Any]]
+    sources: list[str]
+    confidence: float
     sub_questions: list[SubQuestion]
     elapsed_s: float
-    status: str                     # "completed" | "partial" | "failed"
+    status: str
+    report_path: str = ""       # path to saved .md report
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -109,7 +110,7 @@ class ResearchPipeline:
             return ResearchResult(
                 title=topic, sections=[], sources=[], confidence=0.0,
                 sub_questions=[], elapsed_s=time.time() - t0,
-                status="failed",
+                status="failed", report_path="",
             )
 
         # ── Stage 2: Parallel Search ────────────────────────
@@ -369,15 +370,27 @@ class ResearchPipeline:
         language: str,
         confidence: float,
     ) -> ResearchResult:
-        """Produce the final structured research report."""
-        # Build sections from sub-questions
+        """Produce structured Markdown report with evidence chains.
+
+        Uses Synthesizer to:
+        - Build executive summary, detailed sections, source table
+        - Save report to project's research/<topic>.md
+        """
+        from research.synthesizer import Synthesizer
+
+        synth = Synthesizer()
+        report_text, filepath = await synth.synthesize(
+            topic, sub_questions, confidence, language,
+        )
+
+        # Build sections from sub-questions for the result object
         sections = []
         all_sources: list[str] = []
 
         for sq in sub_questions:
             src_urls = [
                 s.get("url", "") or s.get("title", "") or ""
-                for s in sq.sources[:3]
+                for s in (sq.sources or [])[:3]
                 if s
             ]
             all_sources.extend(u for u in src_urls if u and u not in all_sources)
@@ -389,11 +402,17 @@ class ResearchPipeline:
                 "sub_question_id": sq.id,
             })
 
-        # Build a summary section at the top
+        # Build summary
+        total_confirmed = sum(
+            1 for sq in sub_questions
+            for f in (sq.facts or [])
+            if "[CONFIRMED]" in f or "[confirmed]" in f.lower()
+        )
         summary = (
             f"Исследование по теме «{topic}». "
             f"Рассмотрено {len(sub_questions)} подвопросов, "
             f"проанализировано {len(all_sources)} источников. "
+            f"Подтверждено утверждений: {total_confirmed}. "
             f"Уверенность: {confidence:.0%}."
         )
         sections.insert(0, {
@@ -408,8 +427,9 @@ class ResearchPipeline:
             sources=all_sources,
             confidence=confidence,
             sub_questions=sub_questions,
-            elapsed_s=0,  # filled by caller
+            elapsed_s=0,
             status="completed",
+            report_path=filepath,
         )
 
 
