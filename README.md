@@ -640,6 +640,47 @@ Run multiple code tasks simultaneously — each with its own isolated coder+test
 /workflow list                   # show all stored workflow history
 ```
 
+### Advanced Research Mode
+
+Hermes now supports a powerful multi-agent deep research pipeline that goes far beyond simple web search.
+
+**Activation:**
+```bash
+/research "FastAPI best practices 2026"
+/hypothesis "gRPC is 40% faster than REST in production"
+# auto-trigger on: "почему не работает", "как лучше сделать", "изучи тему"
+```
+
+**5-Stage Pipeline:**
+1. **Decompose** — breaks topic into 4-7 sub-questions (8 domain types)
+2. **Parallel Search** — 3 independent search strategies concurrently
+3. **Deep Reading** — factual claims with citations + source URLs
+4. **Cross-Validation** — Validator A (Corroborator) + B (Contradictor) + Adjudicator
+5. **Synthesize** — structured Markdown report with evidence chains
+
+**Key Features:**
+- **Adversarial Validation** — two agents check each other's findings
+- **Evidence Chains** — every fact has source URL, citation, confidence score
+- **Quality Score** — 5-dimension assessment (diversity, freshness, contradiction, depth)
+- **Smart Fallback** — automatic heuristic mode when API unavailable
+- **Human-in-the-Loop** — pause, add sources, approve plans, resolve disputes
+- **Cache (TTL 24h)** — instant repeat research
+- **Research Memory** — all past research searchable via `/research recall <query>`
+- **8 Domain Types** — comparison, troubleshooting, hypothesis, best practices, architecture, how-to, why, general
+
+**Commands:**
+```bash
+/research <topic>              # start research
+/research status               # show current stage
+/research pause / continue     # human-in-the-loop
+/research recall <keywords>    # search past research
+/research quality <topic>      # evaluate quality
+/research add_source <url>     # add source manually
+/hypothesis "<claim>"         # validate specific claim
+```
+
+**Quality Grades:** 🌟 Excellent (>85%) | ✅ Good (>70%) | ⚠️ Fair (>55%) | ❌ Poor
+
 ### Per-Agent LLM Config
 
 ```bash
