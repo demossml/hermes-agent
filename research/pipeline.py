@@ -58,7 +58,20 @@ class ResearchResult:
     elapsed_s: float
     status: str
     report_path: str = ""
-    health: dict[str, Any] | None = None   # API health report
+    health: dict[str, Any] | None = None
+    quality: "QualityScore | None" = None
+
+
+@dataclass
+class QualityScore:
+    """Multi-dimensional research quality assessment."""
+    overall: float          # 0-1 composite score
+    source_diversity: float # unique domains / total sources
+    source_freshness: float # sources from last 2 years
+    contradiction_rate: float  # disputed + rejected / total claims
+    depth_score: float      # sub-questions × sources per question
+    grade: str              # "excellent" | "good" | "fair" | "poor"
+    recommendations: list[str]   # API health report
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -217,6 +230,7 @@ class ResearchPipeline:
         result.elapsed_s = time.time() - t0
         result.status = "completed" if health["mode"] == "api" else "partial"
         result.health = health
+        result.quality = _compute_quality(sub_questions, result.sources, confidence)
         _research_cache.set(topic, result)
 
         # ── Save to project history ─────────────────────────
@@ -574,6 +588,91 @@ def _collect_disputed(sub_questions: list[SubQuestion]) -> list[str]:
             if "[DISPUTED]" in fact or "[disputed]" in fact.lower():
                 disputed.append(fact[:120])
     return disputed
+
+
+def _compute_quality(
+    sub_questions: list[SubQuestion], sources: list[str], cross_val_conf: float,
+) -> QualityScore:
+    """Compute multi-dimensional research quality score."""
+    from urllib.parse import urlparse
+
+    n_sq = max(1, len(sub_questions))
+    n_src = max(1, len(sources))
+
+    # Source diversity: unique domains / total sources
+    domains = set()
+    for s in sources:
+        try:
+            parsed = urlparse(s)
+            if parsed.netloc:
+                domains.add(parsed.netloc)
+        except Exception:
+            pass
+    diversity = min(1.0, len(domains) / max(1, n_src))
+
+    # Freshness: heuristic — check for year mentions in facts
+    import re
+    fresh_count = 0
+    total_facts = 0
+    for sq in sub_questions:
+        for f in (sq.facts or []):
+            total_facts += 1
+            if re.search(r"202[4-6]", f):
+                fresh_count += 1
+    freshness = fresh_count / max(1, total_facts) if total_facts else 0.5
+
+    # Contradiction rate: disputed + rejected / total
+    disputed = sum(1 for sq in sub_questions for f in (sq.facts or [])
+                   if "[DISPUTED]" in f or "[disputed]" in f.lower())
+    rejected = sum(1 for sq in sub_questions for f in (sq.facts or [])
+                   if "[REJECTED]" in f or "[rejected]" in f.lower())
+    total_claims = max(1, sum(len(sq.facts) for sq in sub_questions))
+    contradiction = (disputed + rejected) / total_claims
+
+    # Depth: sub-questions × avg sources per question
+    avg_sources = n_src / n_sq
+    depth = min(1.0, avg_sources / 5)  # 5+ sources per question = full depth
+
+    # Composite: weighted average
+    weights = {"diversity": 0.25, "freshness": 0.15, "contradiction": 0.25, "depth": 0.20, "cross_val": 0.15}
+    overall = (
+        weights["diversity"] * diversity +
+        weights["freshness"] * freshness +
+        weights["contradiction"] * (1.0 - contradiction) +
+        weights["depth"] * depth +
+        weights["cross_val"] * cross_val_conf
+    )
+
+    # Grade
+    if overall >= 0.85:
+        grade = "excellent"
+    elif overall >= 0.70:
+        grade = "good"
+    elif overall >= 0.55:
+        grade = "fair"
+    else:
+        grade = "poor"
+
+    # Recommendations
+    recs = []
+    if overall < 0.65:
+        recs.append(f"Низкий confidence ({overall:.0%}). Попробуйте /research с --depth high")
+    if diversity < 0.4:
+        recs.append("Мало уникальных источников — добавьте /research add_source <url>")
+    if contradiction > 0.3:
+        recs.append(f"Высокий уровень противоречий ({contradiction:.0%}) — проверьте спорные claims")
+    if depth < 0.3:
+        recs.append("Мало источников на вопрос — увеличьте depth или добавьте свои")
+
+    return QualityScore(
+        overall=round(overall, 2),
+        source_diversity=round(diversity, 2),
+        source_freshness=round(freshness, 2),
+        contradiction_rate=round(contradiction, 2),
+        depth_score=round(depth, 2),
+        grade=grade,
+        recommendations=recs,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════

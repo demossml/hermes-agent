@@ -9764,6 +9764,31 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 _cprint("  [dim]No active research to pause.[/]")
             return
 
+        # ── /research quality <topic> ────────────────────────
+        if action == "quality":
+            query = " ".join(parts[2:])
+            if not query:
+                _cprint("  [red]Usage: /research quality <topic>[/]")
+                return
+            try:
+                from projects.project_context import get_current_project_id
+                from projects.project_manager import ProjectManager
+                pid3 = get_current_project_id()
+                if not pid3:
+                    _cprint("  [red]No active project.[/]")
+                    return
+                pm = ProjectManager()
+                items = pm.recall_research(pid3, query, n_results=3)
+                if not items:
+                    _cprint("  [dim]No past research found.[/]")
+                else:
+                    _cprint(f"\\n  📊 [bold]Quality: {query}[/]")
+                    for i, item in enumerate(items, 1):
+                        _cprint(f"  {i}. {item['topic'][:80]}")
+            except Exception as e:
+                _cprint(f"  [red]Quality check failed: {e}[/]")
+            return
+
         # ── /research continue ───────────────────────────────
         if action == "continue":
             saved = getattr(self, "_research_paused", None)
@@ -9875,6 +9900,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         lines.append(f"  ╠══════════════════════════════════════════╣")
         lines.append(f"  ║  Confidence: {bar} {result.confidence:.0%}    ║")
         lines.append(f"  ║  Sources: {len(result.sources):>3}  |  Questions: {len(result.sub_questions)}  |  Time: {elapsed:.1f}s     ║")
+        # Quality line
+        if result.quality:
+            grade_icon = {"excellent": "🌟", "good": "✅", "fair": "⚠️", "poor": "❌"}.get(result.quality.grade, "•")
+            lines.append(f"  ║  Quality: {grade_icon} {result.quality.grade.upper()} ({result.quality.overall:.0%})                    ║")
+            for rec in result.quality.recommendations:
+                lines.append(f"  ║  💡 {rec[:42]}")
         lines.append(f"  ╠══════════════════════════════════════════╣")
 
         for sec in result.sections[1:4]:
