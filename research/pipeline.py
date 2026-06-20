@@ -597,45 +597,140 @@ def _extract_keywords(text: str) -> list[str]:
 # Decompose: break research query into sub-questions
 # ═══════════════════════════════════════════════════════════════
 
-# Domain-specific decomposition stratagems
-_DECOMPOSE_STRATAGEMS = {
-    "compare": [
-        "What is {focus} in {topic}?",
-        "How does {alt1} compare to {alt2} on {metric}?",
-        "Trade-offs: {tradeoff1} vs {tradeoff2}",
-        "Real-world performance benchmarks for {topic}",
-        "Community adoption and ecosystem maturity",
+# 8 domain-specific stratagem sets with 2025-2026 anchoring
+_DECOMPOSE_STRATAGEMS_V2 = {
+    "best_practices": {
+        "templates": [
+            "Best practices and conventions for {focus} in 2025-2026",
+            "Common pitfalls and anti-patterns when working with {focus}",
+            "Real-world production experience and case studies: {focus}",
+            "Recommended tools and libraries for {focus} in production",
+            "Performance and scalability considerations for {focus}",
+        ],
+        "triggers": ("best practice", "лучшие практик", "best way", "лучший способ",
+                     "рекомендаци", "recommend", "production ready", "продакшен"),
+    },
+    "troubleshooting": {
+        "templates": [
+            "Common causes of {focus} and how to diagnose them",
+            "Step-by-step solutions for {focus}",
+            "Version-specific issues and compatibility for {focus}",
+            "Workarounds and quick fixes for {focus}",
+            "How to prevent {focus} from recurring in production",
+        ],
+        "triggers": ("не работает", "ошибка", "error", "fix", "исправить",
+                     "починить", "debug", "troubleshoot", "проблема", "issue",
+                     "bug", "fail", "crash", "broken", "сломан"),
+    },
+    "hypothesis": {
+        "templates": [
+            "Arguments supporting that {focus}",
+            "Arguments against that {focus}",
+            "Counter-examples and edge cases where {focus} is false",
+            "Empirical evidence and data for and against {focus}",
+            "Expert opinions and community consensus on {focus}",
+        ],
+        "triggers": ("is it true", "правда ли", "действительно ли",
+                     "значительный прирост", "faster than", "быстрее чем"),
+    },
+    "comparison": {
+        "templates": [
+            "Key differences between {alt1} and {alt2} for {metric}",
+            "Performance benchmarks: {alt1} vs {alt2}",
+            "Developer experience and ecosystem: {alt1} vs {alt2}",
+            "Production readiness and scaling: {alt1} vs {alt2}",
+            "Community adoption trends 2025-2026: {alt1} vs {alt2}",
+        ],
+        "triggers": ("сравни", "compare", "vs", "против", "лучше", "отличие",
+                     "difference", "преимуществ", "недостатк", "плюсы", "минусы"),
+    },
+    "how_to": {
+        "templates": [
+            "What technologies and libraries exist for {focus}?",
+            "Step-by-step implementation guide for {focus}",
+            "Common mistakes and how to avoid them: {focus}",
+            "Production-ready patterns and architecture for {focus}",
+            "Security, error handling and edge cases for {focus}",
+        ],
+        "triggers": ("как ", "how to ", "реализовать", "сделать", "написать",
+                     "implement", "build", "создать", "разработать", "настроить",
+                     "установить", "подключить", "задеплоить"),
+    },
+    "why": {
+        "templates": [
+            "Root causes of {focus} — technical deep dive",
+            "Historical evolution: how {focus} developed over time",
+            "Alternative approaches that were tried and why they failed",
+            "Underlying principles and theory behind {focus}",
+            "Known limitations and when NOT to use {focus}",
+        ],
+        "triggers": ("почему", "why", "причина", "cause", "root",
+                     "из-за чего", "в чём смысл", "зачем"),
+    },
+    "architecture": {
+        "templates": [
+            "Core architectural components of {focus} and their interactions",
+            "Data flow, state management, and communication patterns: {focus}",
+            "Scalability and performance architecture for {focus}",
+            "Security, authentication, and authorization in {focus}",
+            "Deployment, infrastructure and monitoring for {focus}",
+        ],
+        "triggers": ("архитектур", "architecture", "design pattern", "структур",
+                     "проектирован", "компонент", "микросервис", "system design"),
+    },
+    "general": {
+        "templates": [
+            "Current state of the art for {focus} in 2025-2026",
+            "Key technologies and tools in the {focus} ecosystem",
+            "Major advantages and trade-offs of {focus}",
+            "Real-world examples, case studies, and adoption of {focus}",
+            "Common challenges and solutions for {focus}",
+        ],
+        "triggers": (),
+    },
+}
+
+
+_DEEP_ANGLES = {
+    "best_practices": [
+        "Edge cases and boundary conditions for {focus}",
+        "Migration and upgrade strategies for {focus}",
+        "Testing and quality assurance for {focus}",
+    ],
+    "troubleshooting": [
+        "Log analysis and monitoring for {focus}",
+        "Incident response and rollback for {focus}",
+        "Long-term prevention strategies for {focus}",
+    ],
+    "comparison": [
+        "Total cost of ownership: {alt1} vs {alt2}",
+        "Hiring and talent availability: {alt1} vs {alt2}",
+        "Future roadmap and long-term viability: {alt1} vs {alt2}",
     ],
     "how_to": [
-        "Какие технологии/библиотеки существуют для {focus}?",
-        "Пошаговая реализация {core_task}",
-        "Типичные ошибки и как их избежать при работе с {focus}",
-        "Best practices и паттерны для {focus}",
-        "Сравнение инструментов: плюсы и минусы каждого",
-        "Обработка ошибок, edge cases и безопасность",
+        "Testing and CI/CD integration for {focus}",
+        "Monitoring and observability for {focus}",
+        "Documentation and knowledge sharing for {focus}",
     ],
     "why": [
-        "Root cause analysis of {problem}",
-        "Alternative approaches that were tried",
-        "Historical context: how {topic} evolved",
-        "Underlying principles and theory",
-        "Known limitations and workarounds",
+        "Academic research and papers on {focus}",
+        "Industry case studies: {focus} in practice",
+        "Future evolution and predictions for {focus}",
     ],
     "architecture": [
-        "Core components and their interactions",
-        "Data flow and state management",
-        "Scalability considerations for {topic}",
-        "Security and authentication patterns",
-        "Deployment and infrastructure requirements",
-        "Monitoring and observability",
+        "Cost optimization and resource planning for {focus}",
+        "Disaster recovery and high availability for {focus}",
+        "Multi-region and edge deployment for {focus}",
+    ],
+    "hypothesis": [
+        "Controlled experiments testing {focus}",
+        "Statistical significance of claims about {focus}",
+        "Replication studies and meta-analyses of {focus}",
     ],
     "general": [
-        "Current state of the art in {topic}",
-        "Key technologies and tools for {topic}",
-        "Major advantages and disadvantages",
-        "Real-world examples and case studies",
-        "Best practices and conventions (2024-2026)",
-        "Common challenges and solutions",
+        "Competitive landscape and alternatives to {focus}",
+        "Regulatory and compliance considerations for {focus}",
+        "Community and ecosystem health for {focus}",
     ],
 }
 
@@ -645,44 +740,29 @@ async def decompose_research_query(
     *,
     language: str = "ru",
     max_questions: int = 6,
+    depth: str = "normal",
     registry=None,
     pipeline_id: str = "",
 ) -> list[str]:
-    """Break a research query into 3-6 independent, specific sub-questions.
+    """Break a research query into 4-6 context-aware sub-questions.
 
-    Strategy:
-    1. Detect query type (compare/how-to/why/architecture)
-    2. Try LLM decomposition via registry.orchestrate()
-    3. Fall back to domain-aware heuristic stratagems
-
-    Args:
-        query: The research topic/question
-        language: Output language ('ru' or 'en')
-        max_questions: Maximum number of sub-questions (3-10)
-        registry: AgentRegistry for LLM decomposition (optional)
-        pipeline_id: Pipeline identifier for logging
-
-    Returns:
-        List of sub-question strings.
+    Features:
+    - 8 domain types with specialized templates
+    - Relevance scoring (keyword match count)
+    - Deduplication with normalized keys
+    - --depth high adds +3 deeper questions
+    - LLM decompose → domain-aware heuristic fallback
     """
-    max_questions = max(3, min(max_questions, 10))
+    max_questions = max(4, min(max_questions, 8))
     query_lower = query.lower()
 
-    # ── 1. Detect query type ────────────────────────────────
-    stratagem_key = "general"
-    if any(w in query_lower for w in ("как", "how to", "реализовать", "сделать", "написать", "implement", "build", "создать", "разработать")):
-        stratagem_key = "how_to"
-    elif any(w in query_lower for w in ("почему", "why", "причина", "cause", "root", "не работает", "ошибка")):
-        stratagem_key = "why"
-    elif any(w in query_lower for w in ("сравни", "compare", "vs", "против", "лучше", "отличие", "difference")):
-        stratagem_key = "compare"
-    elif any(w in query_lower for w in ("архитектур", "architecture", "design", "pattern", "проектирован")):
-        stratagem_key = "architecture"
+    # ── 1. Detect domain type (8 types, best match first) ────
+    domain = _detect_domain(query_lower)
 
     # ── 2. LLM decomposition ────────────────────────────────
     if registry and hasattr(registry, "orchestrate"):
         try:
-            prompt = _build_decompose_prompt(query, language, max_questions, stratagem_key)
+            prompt = _build_decompose_prompt_v2(query, language, max_questions, domain)
             raw = await registry.orchestrate(
                 session_id=f"research-decomp-{pipeline_id or 'anon'}",
                 user_message=prompt,
@@ -694,30 +774,137 @@ async def decompose_research_query(
         except Exception as e:
             logger.debug("LLM decompose failed: %s", e)
 
-    # ── 3. Fallback: domain-aware heuristic ─────────────────
-    result = _apply_stratagem(query, stratagem_key, max_questions)
-    logger.info("Decompose: heuristic produced %d sub-questions (%s)", len(result), stratagem_key)
+    # ── 3. Domain-aware heuristic with relevance scoring ─────
+    result = _apply_stratagem_v2(query, domain, max_questions)
+
+    # ── 4. Deep mode: add specialized angles ─────────────────
+    if depth == "high" and len(result) < max_questions + 3:
+        deep = _DEEP_ANGLES.get(domain, _DEEP_ANGLES["general"])
+        focus, alt1, alt2 = _extract_focus_v2(query, domain)
+        for tmpl in deep:
+            filled = tmpl.format(focus=focus, alt1=alt1, alt2=alt2)
+            if filled not in result:
+                result.append(filled)
+            if len(result) >= max_questions + 3:
+                break
+
+    logger.info("Decompose: heuristic produced %d sub-questions (%s, depth=%s)",
+                len(result), domain, depth)
+    return result[:max_questions + 3]
+
+
+_DOMAIN_SIGNAL_WEIGHTS = {
+    # Strong signals — override generic words
+    "почему": 50, "why": 50, "зачем": 40, "root cause": 40,
+    "не работает": 40, "error": 35, "fix": 35, "bug": 35,
+    "is it true": 45, "правда ли": 45, "гипотез": 45,
+    "сравни": 30, "compare": 30, "vs": 35, "лучше": 25,
+    "best practice": 35, "лучшие практик": 35, "best way": 30,
+    "архитектур": 30, "architecture": 30, "system design": 35, "проектирован": 30,
+    "как ": 20, "how to ": 20, "implement": 25,
+}
+
+
+def _detect_domain(query_lower: str) -> str:
+    """Detect research domain by keyword scoring (best match wins).
+
+    Uses weighted keyword matching — strong signals ('почему', 'is it true')
+    get higher weight than generic words ('архитектур').
+    """
+    best_domain = "general"
+    best_score = 0
+    for domain, config in _DECOMPOSE_STRATAGEMS_V2.items():
+        score = 0
+        for t in config["triggers"]:
+            if t in query_lower:
+                w = _DOMAIN_SIGNAL_WEIGHTS.get(t, len(t))
+                score += w
+        if score > best_score:
+            best_score = score
+            best_domain = domain
+    return best_domain
+
+
+def _extract_focus_v2(query: str, domain: str) -> tuple[str, str, str]:
+    """Extract focus, alt1, alt2 from query based on domain."""
+    import re
+    focus = query
+    # Strip common prefixes
+    for pfx in ("как лучше всего ", "как правильно ", "как ", "how to best ",
+                "how to ", "что такое ", "what is ", "почему ", "why "):
+        if focus.lower().startswith(pfx):
+            focus = focus[len(pfx):]
+            break
+    # Strip filler words
+    for filler in ("лучше всего ", "правильно ", "реализовать ", "сделать ",
+                   "написать ", "создать ", "разработать ", "исправить "):
+        if focus.lower().startswith(filler):
+            focus = focus[len(filler):]
+            break
+
+    alt1 = alt2 = ""
+    if domain == "comparison":
+        parts = re.split(r"\b(vs|против|или|compared to|versus|and)\b", query, flags=re.IGNORECASE)
+        if len(parts) >= 3:
+            alt1 = parts[0].strip()
+            alt2 = parts[-1].strip()
+
+    return focus[:60].strip(), alt1, alt2
+
+
+def _apply_stratagem_v2(
+    query: str, domain: str, max_q: int,
+) -> list[str]:
+    """Generate scored, deduplicated sub-questions."""
+    config = _DECOMPOSE_STRATAGEMS_V2.get(domain, _DECOMPOSE_STRATAGEMS_V2["general"])
+    focus, alt1, alt2 = _extract_focus_v2(query, domain)
+    metric = "performance"
+
+    # Fill templates
+    scored: list[tuple[int, str]] = []
+    for tmpl in config["templates"]:
+        filled = tmpl.format(focus=focus, alt1=alt1 or "Option A",
+                             alt2=alt2 or "Option B", metric=metric)
+        # Score: how many query keywords appear in the filled question
+        score = sum(1 for w in focus.lower().split() if len(w) > 3 and w in filled.lower())
+        scored.append((score, filled))
+
+    # Sort by relevance (higher score = more relevant)
+    scored.sort(reverse=True)
+
+    # Deduplicate and limit
+    seen = set()
+    result = []
+    for score, q in scored:
+        norm = _normalize_for_dedup(q)
+        if norm not in seen:
+            seen.add(norm)
+            result.append(q)
+        if len(result) >= max_q:
+            break
     return result
 
 
-def _build_decompose_prompt(
-    query: str, language: str, max_q: int, stratagem: str,
+def _build_decompose_prompt_v2(
+    query: str, language: str, max_q: int, domain: str,
 ) -> str:
-    """Build a structured prompt for LLM decomposition."""
+    """Build domain-specific prompt for LLM decomposition."""
     lang_hint = "на русском языке" if language == "ru" else "in English"
+    domain_hints = {
+        "best_practices": "Focus on conventions, production experience, pitfalls.",
+        "troubleshooting": "Focus on causes, solutions, version-specific issues.",
+        "hypothesis": "Focus on evidence, counter-arguments, data.",
+        "comparison": "Focus on benchmarks, trade-offs, ecosystem differences.",
+        "how_to": "Focus on implementation steps, tools, patterns.",
+        "why": "Focus on root causes, principles, historical context.",
+        "architecture": "Focus on components, data flow, infrastructure.",
+    }
+    hint = domain_hints.get(domain, "Cover different angles comprehensively.")
     return (
-        f"You are a research strategist. Break this research topic "
-        f"into exactly {max_q} independent, specific sub-questions "
-        f"({lang_hint}).\n\n"
-        f"RESEARCH TOPIC: {query}\n"
-        f"QUERY TYPE: {stratagem}\n\n"
-        f"RULES:\n"
-        f"1. Each sub-question must be self-contained and researchable.\n"
-        f"2. No overlap between sub-questions.\n"
-        f"3. Cover different angles: tools, trade-offs, examples, pitfalls.\n"
-        f"4. Be specific — replace generic phrases with concrete terms.\n"
-        f"5. Output format: one question per line, NO numbers/bullets.\n"
-        f"6. Output ONLY the questions — no preamble, no summary.\n"
+        f"Research domain: {domain}. {hint}\n"
+        f"Break into exactly {max_q} self-contained sub-questions ({lang_hint}).\n\n"
+        f"TOPIC: {query}\n\n"
+        f"Output: one question per line, NO numbering. Questions ONLY."
     )
 
 
@@ -767,11 +954,24 @@ def _normalize_for_dedup(text: str) -> str:
     return re.sub(r"[^\w\s]", "", text.lower().strip())[:60]
 
 
-def _apply_stratagem(
+def _to_question(text: str) -> str:
+    """Convert a statement to a question form."""
+    text = text.rstrip(".!;,")
+    if text.lower().startswith(("как", "how", "what", "why", "когда", "where")):
+        return text + "?"
+    if text.lower().startswith(("сравни", "compare")):
+        return text + "?"
+    return f"What are the key aspects of {text}?"
+
+
+def __apply_stratagem_legacy__(
     query: str, stratagem_key: str, max_q: int,
 ) -> list[str]:
-    """Generate sub-questions using domain-aware stratagems."""
-    templates = _DECOMPOSE_STRATAGEMS.get(stratagem_key, _DECOMPOSE_STRATAGEMS["general"])
+    """REMOVED — replaced by _apply_stratagem_v2"""
+    return []
+
+
+def _to_question(text: str) -> str:
 
     # Extract focus terms from query
     words = query.lower().split()
