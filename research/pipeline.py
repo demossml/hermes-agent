@@ -198,6 +198,21 @@ class ResearchPipeline:
         # ── Cache the result ─────────────────────────────────
         _research_cache.set(topic, result)
 
+        # ── Save to project research history ─────────────────
+        from research.synthesizer import Synthesizer
+        report_text, _ = await Synthesizer().synthesize(
+            topic, sub_questions, confidence, language,
+        )
+        try:
+            from projects.project_context import get_current_project_id
+            pid = get_current_project_id()
+            if pid:
+                from projects.project_manager import ProjectManager
+                pm = ProjectManager()
+                pm.save_research_history(pid, topic, report_text)
+        except Exception:
+            pass
+
         logger.info(
             "Research pipeline %s: done in %.1fs, confidence=%.2f, mode=%s",
             self._pipeline_id, result.elapsed_s, result.confidence, health["mode"],

@@ -9720,7 +9720,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             else:
                 _cprint("  [dim]No active research.[/] Use /research <topic> to start.")
             return
-
+        # ── /research stop ──────────────────────────────────
         if action == "stop":
             if getattr(self, "_research_active", None):
                 self._research_active = None
@@ -9729,6 +9729,33 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 _cprint("  [dim]No active research to stop.[/]")
             return
 
+        # ── /research recall <query> ─────────────────────────
+        if action == "recall":
+            query = " ".join(parts[2:])
+            if not query:
+                _cprint("  [red]Usage: /research recall <topic or keyword>[/]")
+                return
+            try:
+                from projects.project_context import get_current_project_id
+                from projects.project_manager import ProjectManager
+                pid2 = get_current_project_id()
+                if not pid2:
+                    _cprint("  [red]No active project.[/] Use /project switch first.")
+                    return
+                pm = ProjectManager()
+                items = pm.recall_research(pid2, query, n_results=5)
+                if not items:
+                    _cprint("  [dim]No past research found for this query.[/]")
+                else:
+                    _cprint(f"\\n  📚 [bold]Past Research: {query}[/] ({len(items)} found)")
+                    for i, item in enumerate(items, 1):
+                        _cprint(f"  {i}. {item['topic'][:80]}")
+                        _cprint(f"     {item['text'][:120]}...")
+            except Exception as e:
+                _cprint(f"  [red]Recall failed: {e}[/]")
+            return
+
+        # ── /research <topic> ───────────────────────────────
         topic = " ".join(parts[1:])
         if not topic:
             _cprint("  🔬 /research <topic>    — deep research")

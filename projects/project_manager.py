@@ -329,9 +329,108 @@ class ProjectManager:
             return insights
         except Exception as e:
             logger.debug(f"Failed to get insights for '{project_id}': {e}")
-            return []
+            return insights
 
-    # ── Public API ────────────────────────────────────────────
+    # ── Research Memory ─────────────────────────────────────
+
+    def save_research_history(
+        self, project_id: str, topic: str, report_text: str,
+    ) -> str | None:
+        """Save completed research to project history.
+
+        Returns the filepath or None on failure.
+        """
+        import re
+        from datetime import datetime
+
+        history_dir = self._project_dir(project_id) / "research" / "history"
+        history_dir.mkdir(parents=True, exist_ok=True)
+
+        safe_topic = re.sub(r"[^a-z0-9_а-яё-]+", "_", topic.lower().strip())[:40]
+        date_str = datetime.now().strftime("%Y%m%d")
+        fname = f"{safe_topic}_{date_str}.md"
+        fpath = history_dir / fname
+
+        # Avoid overwriting — append counter if exists
+        if fpath.exists():
+            base = fname.replace(".md", "")
+            i = 2
+            while (history_dir / f"{base}_{i}.md").exists():
+                i += 1
+            fpath = history_dir / f"{base}_{i}.md"
+
+        fpath.write_text(report_text, encoding="utf-8")
+        logger.info("Research history saved: %s", fpath)
+
+        # Also store in vector memory
+        self._add_to_research_memory(project_id, topic, report_text, str(fpath))
+        return str(fpath)
+
+    def _add_to_research_memory(
+        self, project_id: str, topic: str, text: str, filepath: str,
+    ) -> None:
+        """Index research in ChromaDB for semantic recall."""
+        if not HAS_CHROMA:
+            return
+        try:
+            coll_name = f"project_{project_id}_research_memory"
+            chroma_dir = self.subdir_memory(project_id)
+            client = chromadb.PersistentClient(path=str(chroma_dir),
+                settings=ChromaSettings(anonymized_telemetry=False))
+            coll = client.get_or_create_collection(name=coll_name,
+                metadata={"hnsw:space": "cosine"})
+
+            import uuid, time
+            doc_id = f"research-{project_id}-{uuid.uuid4().hex[:8]}"
+            coll.add(
+                ids=[doc_id],
+                documents=[f"{topic}\n\n{text[:2000]}"],
+                metadatas=[{
+                    "topic": topic,
+                    "filepath": filepath,
+                    "timestamp": time.time(),
+                }],
+            )
+            logger.debug("Research indexed: %s → %s", topic[:40], doc_id)
+        except Exception as e:
+            logger.debug("Failed to index research: %s", e)
+
+    def recall_research(
+        self, project_id: str, query: str, n_results: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Semantic recall of past research relevant to query."""
+        if not HAS_CHROMA:
+            return []
+        try:
+            coll_name = f"project_{project_id}_research_memory"
+            chroma_dir = self.subdir_memory(project_id)
+            if not (chroma_dir / "chroma.sqlite3").exists():
+                return []
+            client = chromadb.PersistentClient(path=str(chroma_dir),
+                settings=ChromaSettings(anonymized_telemetry=False))
+            try:
+                coll = client.get_collection(name=coll_name)
+            except Exception:
+                return []
+
+            results = coll.query(query_texts=[query], n_results=n_results)
+            if not results.get("ids") or not results["ids"][0]:
+                return []
+
+            items = []
+            for i, doc_id in enumerate(results["ids"][0]):
+                doc = results["documents"][0][i] if results["documents"] else ""
+                meta = results["metadatas"][0][i] if results["metadatas"] else {}
+                items.append({
+                    "id": doc_id,
+                    "text": (doc or "")[:300],
+                    "topic": meta.get("topic", ""),
+                    "filepath": meta.get("filepath", ""),
+                })
+            return items
+        except Exception as e:
+            logger.debug("Research recall failed: %s", e)
+            return []
 
     def create_project(self, name: str) -> dict[str, Any]:
         name = name.strip()
