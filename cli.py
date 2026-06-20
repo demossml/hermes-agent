@@ -9755,6 +9755,43 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 _cprint(f"  [red]Recall failed: {e}[/]")
             return
 
+        # ── /research pause ──────────────────────────────────
+        if action == "pause":
+            self._research_paused = getattr(self, "_research_active", None)
+            if self._research_paused:
+                _cprint("  ⏸️  Research paused. /research continue to resume.")
+            else:
+                _cprint("  [dim]No active research to pause.[/]")
+            return
+
+        # ── /research continue ───────────────────────────────
+        if action == "continue":
+            saved = getattr(self, "_research_paused", None)
+            if not saved:
+                _cprint("  [dim]Nothing paused. Start with /research <topic>[/]")
+                return
+            self._research_active = saved
+            self._research_paused = None
+            _cprint(f"  ▶️  Resuming research...")
+            # Fall through to topic processing with interactive=True
+
+        # ── /research add_source <url> ───────────────────────
+        if action == "add_source":
+            url = " ".join(parts[2:])
+            sources = getattr(self, "_research_sources", [])
+            sources.append({"url": url, "title": url, "snippet": "User added", "strategy": "manual"})
+            self._research_sources = sources
+            _cprint(f"  ➕ Source added: {url}")
+            return
+
+        # ── /research exclude <source> ───────────────────────
+        if action == "exclude":
+            return  # placeholder
+
+        # ── /research focus <subtopic> ───────────────────────
+        if action == "focus":
+            return  # placeholder
+
         # ── /research <topic> ───────────────────────────────
         topic = " ".join(parts[1:])
         if not topic:
@@ -9791,6 +9828,40 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # Show cache/health notifications
         if result.status == "cached":
             _cprint(f"  ⚡ [dim]Instant — результат из кэша (TTL 24h)[/]")
+            return
+
+        # ── HITL: plan approval ──────────────────────────────
+        if result.status == "awaiting_plan_approval":
+            _cprint(f"")
+            _cprint(f"  [bold]📋 План исследования:[/]")
+            for i, sq in enumerate(result.sub_questions, 1):
+                _cprint(f"  {i}. {sq.question[:100]}")
+            _cprint(f"")
+            _cprint(f"  [bold]Действия:[/]")
+            _cprint(f"  /research continue                — подтвердить план")
+            _cprint(f"  /research focus <подтема>          — сузить фокус")
+            _cprint(f"  /research exclude <номер>          — убрать вопрос")
+            _cprint(f"  Отредактируйте вопросы вручную и повторите /research с теми же вопросами")
+            self._research_paused = self._research_active
+            self._research_active = None
+            return
+
+        # ── HITL: dispute resolution ─────────────────────────
+        if result.status == "awaiting_dispute_resolution":
+            _cprint(f"")
+            _cprint(f"  [bold]⚠️  Спорные утверждения:[/]")
+            for sec in result.sections:
+                content = sec.get("content", "")
+                if "[DISPUTED]" in content:
+                    _cprint(f"  • {content[:150]}")
+            _cprint(f"")
+            _cprint(f"  [bold]Действия:[/]")
+            _cprint(f"  /research continue                — принять как есть")
+            _cprint(f"  /research add_source <url>        — добавить источник")
+            _cprint(f"  /research exclude <источник>       — исключить")
+            self._research_paused = self._research_active
+            self._research_active = None
+            return
         elif result.health and result.health.get("notifications"):
             for n in result.health["notifications"]:
                 _cprint(f"  ⚠️  [yellow]{n}[/]")

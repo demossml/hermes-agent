@@ -117,32 +117,29 @@ class ResearchPipeline:
         max_sources: int = 10,
         max_depth: int = 2,
         force_api: bool = False,
+        interactive: bool = False,
+        user_feedback: dict[str, Any] | None = None,
     ) -> ResearchResult:
         """Execute the full 5-stage research pipeline.
 
         Features:
         - Cache check (TTL 24h) — instant return on repeated topics
         - Smart fallback — heuristic deep mode if all API calls fail
-        - Health tracking — warns user about API degradation
+        - Interactive mode — pauses for user confirmation at key stages
         """
         t0 = time.time()
         health: dict[str, Any] = {
             "search_ok": 0, "search_fail": 0,
             "mode": "api", "notifications": [],
         }
+        feedback = user_feedback or {}
 
         # ── Cache check ──────────────────────────────────────
         cached = _research_cache.get(topic)
         if cached and not force_api:
             cached.elapsed_s = time.time() - t0
             cached.status = "cached"
-            logger.info("Research cache HIT for '%s'", topic[:60])
             return cached
-
-        logger.info(
-            "Research pipeline %s: topic=%s lang=%s",
-            self._pipeline_id, topic[:80], language,
-        )
 
         # ── Stage 1: Decompose ──────────────────────────────
         sub_questions = await self._decompose(topic, language, max_depth)
@@ -153,37 +150,63 @@ class ResearchPipeline:
                 status="failed", report_path="",
             )
 
-        # ── Stage 2: Parallel Search (with health tracking) ─
+        # ── Interactive: show plan, accept edits ─────────────
+        if interactive and not feedback.get("plan_confirmed"):
+            return ResearchResult(
+                title=topic, sections=[], sources=[], confidence=0.0,
+                sub_questions=sub_questions,
+                elapsed_s=time.time() - t0,
+                status="awaiting_plan_approval", report_path="",
+            )
+
+        # ── Apply user edits to sub-questions ────────────────
+        if feedback.get("edited_questions"):
+            edited = feedback["edited_questions"]
+            if isinstance(edited, list) and len(edited) > 0:
+                sub_questions = [
+                    SubQuestion(
+                        id=f"q{i+1}-{self._pipeline_id}",
+                        question=q if isinstance(q, str) else str(q),
+                        keywords=_extract_keywords(q if isinstance(q, str) else str(q)),
+                    )
+                    for i, q in enumerate(edited)
+                ]
+        if feedback.get("excluded_questions"):
+            exclude = set(feedback["excluded_questions"])
+            sub_questions = [sq for sq in sub_questions if sq.id not in exclude]
+        if feedback.get("focused_question"):
+            focused = feedback["focused_question"]
+            sub_questions = [sq for sq in sub_questions if focused.lower() in sq.question.lower()]
+
+        # ── Stage 2-4 (existing) ─────────────────────────────
         await self._parallel_search(sub_questions, max_sources)
         health = self._assess_search_health(sub_questions)
 
-        # Smart fallback: all strategies failed → heuristic deep mode
         if health["search_ok"] == 0 and health["search_fail"] > 0:
             health["mode"] = "heuristic"
             health["notifications"].append(
-                "Web search временно недоступен. Использую heuristic mode. "
-                "Качество ответа может быть ниже."
+                "Web search временно недоступен. Использую heuristic mode."
             )
-            logger.warning("All search strategies failed — switching to heuristic deep mode")
-            # Heuristic deep mode: expand decompose with local knowledge
             sub_questions = await self._heuristic_deep_mode(topic, sub_questions)
-        elif health["search_fail"] > 0:
-            health["notifications"].append(
-                f"Часть поисковых запросов не выполнена "
-                f"({health['search_fail']} из {health['search_ok'] + health['search_fail']}). "
-                f"Использую доступные результаты."
-            )
 
-        # ── Stage 3: Deep Reading ───────────────────────────
         await self._deep_read(sub_questions)
-
-        # ── Stage 4: Cross-Validation ───────────────────────
         confidence = await self._cross_validate(sub_questions)
 
-        # ── Stage 5: Synthesize ─────────────────────────────
+        # ── Interactive: show disputed claims ────────────────
+        disputed_claims = _collect_disputed(sub_questions)
+        if interactive and disputed_claims and not feedback.get("disputes_resolved"):
+            result = await self._synthesize(topic, sub_questions, language, confidence)
+            result.status = "awaiting_dispute_resolution"
+            result.elapsed_s = time.time() - t0
+            return result
+
+        # ── Apply user-added sources ─────────────────────────
+        if feedback.get("added_sources"):
+            for sq in sub_questions:
+                sq.sources.extend(feedback["added_sources"])
+
         result = await self._synthesize(topic, sub_questions, language, confidence)
 
-        # Inject health notifications into the result
         if health["notifications"]:
             result.sections.insert(1, {
                 "heading": "⚠️ Доступность API",
@@ -194,29 +217,20 @@ class ResearchPipeline:
         result.elapsed_s = time.time() - t0
         result.status = "completed" if health["mode"] == "api" else "partial"
         result.health = health
-
-        # ── Cache the result ─────────────────────────────────
         _research_cache.set(topic, result)
 
-        # ── Save to project research history ─────────────────
+        # ── Save to project history ─────────────────────────
         from research.synthesizer import Synthesizer
-        report_text, _ = await Synthesizer().synthesize(
-            topic, sub_questions, confidence, language,
-        )
+        report_text, _ = await Synthesizer().synthesize(topic, sub_questions, confidence, language)
         try:
             from projects.project_context import get_current_project_id
             pid = get_current_project_id()
             if pid:
                 from projects.project_manager import ProjectManager
-                pm = ProjectManager()
-                pm.save_research_history(pid, topic, report_text)
+                ProjectManager().save_research_history(pid, topic, report_text)
         except Exception:
             pass
 
-        logger.info(
-            "Research pipeline %s: done in %.1fs, confidence=%.2f, mode=%s",
-            self._pipeline_id, result.elapsed_s, result.confidence, health["mode"],
-        )
         return result
 
     # ── Stage 1: Decompose ──────────────────────────────────
@@ -550,6 +564,16 @@ class ResearchPipeline:
             status="completed",
             report_path=filepath,
         )
+
+
+def _collect_disputed(sub_questions: list[SubQuestion]) -> list[str]:
+    """Collect disputed facts for HITL display."""
+    disputed = []
+    for sq in sub_questions:
+        for fact in (sq.facts or []):
+            if "[DISPUTED]" in fact or "[disputed]" in fact.lower():
+                disputed.append(fact[:120])
+    return disputed
 
 
 # ═══════════════════════════════════════════════════════════════
