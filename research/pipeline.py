@@ -57,7 +57,37 @@ class ResearchResult:
     sub_questions: list[SubQuestion]
     elapsed_s: float
     status: str
-    report_path: str = ""       # path to saved .md report
+    report_path: str = ""
+    health: dict[str, Any] | None = None   # API health report
+
+
+# ═══════════════════════════════════════════════════════════════
+# Research Cache (TTL 24h)
+# ═══════════════════════════════════════════════════════════════
+
+
+class _ResearchCache:
+    """Simple in-memory cache for research results (TTL 24h)."""
+
+    def __init__(self, ttl_seconds: int = 86400):
+        self._cache: dict[str, tuple[float, ResearchResult]] = {}
+        self._ttl = ttl_seconds
+
+    def get(self, key: str) -> ResearchResult | None:
+        import time
+        if key in self._cache:
+            ts, result = self._cache[key]
+            if time.time() - ts < self._ttl:
+                return result
+            del self._cache[key]
+        return None
+
+    def set(self, key: str, result: ResearchResult) -> None:
+        import time
+        self._cache[key] = (time.time(), result)
+
+
+_research_cache = _ResearchCache(ttl_seconds=86400)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -86,19 +116,29 @@ class ResearchPipeline:
         language: str = "ru",
         max_sources: int = 10,
         max_depth: int = 2,
+        force_api: bool = False,
     ) -> ResearchResult:
         """Execute the full 5-stage research pipeline.
 
-        Args:
-            topic: Research topic/question
-            language: Output language (ru/en)
-            max_sources: Max sources per sub-question
-            max_depth: Max sub-question nesting depth
-
-        Returns:
-            ResearchResult with sections, sources, confidence.
+        Features:
+        - Cache check (TTL 24h) — instant return on repeated topics
+        - Smart fallback — heuristic deep mode if all API calls fail
+        - Health tracking — warns user about API degradation
         """
         t0 = time.time()
+        health: dict[str, Any] = {
+            "search_ok": 0, "search_fail": 0,
+            "mode": "api", "notifications": [],
+        }
+
+        # ── Cache check ──────────────────────────────────────
+        cached = _research_cache.get(topic)
+        if cached and not force_api:
+            cached.elapsed_s = time.time() - t0
+            cached.status = "cached"
+            logger.info("Research cache HIT for '%s'", topic[:60])
+            return cached
+
         logger.info(
             "Research pipeline %s: topic=%s lang=%s",
             self._pipeline_id, topic[:80], language,
@@ -113,8 +153,26 @@ class ResearchPipeline:
                 status="failed", report_path="",
             )
 
-        # ── Stage 2: Parallel Search ────────────────────────
+        # ── Stage 2: Parallel Search (with health tracking) ─
         await self._parallel_search(sub_questions, max_sources)
+        health = self._assess_search_health(sub_questions)
+
+        # Smart fallback: all strategies failed → heuristic deep mode
+        if health["search_ok"] == 0 and health["search_fail"] > 0:
+            health["mode"] = "heuristic"
+            health["notifications"].append(
+                "Web search временно недоступен. Использую heuristic mode. "
+                "Качество ответа может быть ниже."
+            )
+            logger.warning("All search strategies failed — switching to heuristic deep mode")
+            # Heuristic deep mode: expand decompose with local knowledge
+            sub_questions = await self._heuristic_deep_mode(topic, sub_questions)
+        elif health["search_fail"] > 0:
+            health["notifications"].append(
+                f"Часть поисковых запросов не выполнена "
+                f"({health['search_fail']} из {health['search_ok'] + health['search_fail']}). "
+                f"Использую доступные результаты."
+            )
 
         # ── Stage 3: Deep Reading ───────────────────────────
         await self._deep_read(sub_questions)
@@ -125,11 +183,24 @@ class ResearchPipeline:
         # ── Stage 5: Synthesize ─────────────────────────────
         result = await self._synthesize(topic, sub_questions, language, confidence)
 
+        # Inject health notifications into the result
+        if health["notifications"]:
+            result.sections.insert(1, {
+                "heading": "⚠️ Доступность API",
+                "content": "\n".join(health["notifications"]),
+                "sources": [],
+            })
+
         result.elapsed_s = time.time() - t0
-        result.status = "completed"
+        result.status = "completed" if health["mode"] == "api" else "partial"
+        result.health = health
+
+        # ── Cache the result ─────────────────────────────────
+        _research_cache.set(topic, result)
+
         logger.info(
-            "Research pipeline %s: done in %.1fs, confidence=%.2f",
-            self._pipeline_id, result.elapsed_s, result.confidence,
+            "Research pipeline %s: done in %.1fs, confidence=%.2f, mode=%s",
+            self._pipeline_id, result.elapsed_s, result.confidence, health["mode"],
         )
         return result
 
@@ -156,7 +227,40 @@ class ResearchPipeline:
             for i, q in enumerate(questions)
         ]
 
-    # ── Stage 2: Parallel Search ────────────────────────────
+    # ── Health + Fallback ──────────────────────────────────
+
+    @staticmethod
+    def _assess_search_health(sub_questions: list[SubQuestion]) -> dict[str, Any]:
+        """Count successful vs failed search strategies."""
+        ok = fail = 0
+        for sq in sub_questions:
+            strategies_seen = set()
+            for s in (sq.sources or []):
+                strategies_seen.add(s.get("strategy", "unknown"))
+            ok += len(strategies_seen)
+            fail += max(0, 3 - len(strategies_seen))  # 3 strategies expected
+        return {"search_ok": ok, "search_fail": fail, "mode": "api", "notifications": []}
+
+    async def _heuristic_deep_mode(
+        self, topic: str, sub_questions: list[SubQuestion],
+    ) -> list[SubQuestion]:
+        """Expand decomposition when API is unavailable.
+
+        Generates additional sub-questions covering angles that
+        the basic heuristic might miss.
+        """
+        deep_angles = [
+            f"Конкретные примеры и case studies: {topic}",
+            f"Типичные ошибки и как их избежать: {topic}",
+            f"Альтернативные подходы и компромиссы: {topic}",
+        ]
+        for angle in deep_angles:
+            sub_questions.append(SubQuestion(
+                id=f"deep-{len(sub_questions)+1}-{self._pipeline_id}",
+                question=angle,
+                keywords=angle.lower().split(),
+            ))
+        return sub_questions
 
     async def _parallel_search(
         self, sub_questions: list[SubQuestion], max_sources: int,

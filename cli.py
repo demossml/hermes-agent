@@ -9754,9 +9754,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self._research_active = ("search+read", topic, time.time() - t0)
 
         _cprint(f"  ⠋ Searching & analysing...")
-        result = asyncio.run(pipeline.run(topic))
+        force_api = "--force-api" in topic
+        if force_api:
+            topic = topic.replace("--force-api", "").strip()
+        result = asyncio.run(pipeline.run(topic, force_api=force_api))
         self._research_active = None
         elapsed = result.elapsed_s or (time.time() - t0)
+
+        # Show cache/health notifications
+        if result.status == "cached":
+            _cprint(f"  ⚡ [dim]Instant — результат из кэша (TTL 24h)[/]")
+        elif result.health and result.health.get("notifications"):
+            for n in result.health["notifications"]:
+                _cprint(f"  ⚠️  [yellow]{n}[/]")
 
         conf_pct = int(result.confidence * 100)
         bar = "█" * (conf_pct // 5) + "░" * (20 - conf_pct // 5)
