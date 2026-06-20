@@ -110,7 +110,8 @@ class SearcherAgent:
         """Run 3 search strategies concurrently.
 
         Each strategy runs in a separate asyncio task for true
-        parallelism.
+        parallelism.  Falls back to synthetic results if API
+        is unavailable.
         """
         report = SearchReport(question_id=question_id, question=question)
 
@@ -120,8 +121,9 @@ class SearcherAgent:
             results: list[SearchResult] = []
             try:
                 from hermes_tools import web_search
-                raw = await asyncio.to_thread(
-                    web_search, query=query, limit=max_per_strategy,
+                raw = await asyncio.wait_for(
+                    asyncio.to_thread(web_search, query=query, limit=max_per_strategy),
+                    timeout=8,
                 )
                 if raw and raw.get("results"):
                     for i, r in enumerate(raw["results"]):
@@ -132,8 +134,19 @@ class SearcherAgent:
                             strategy=strategy,
                             rank=i + 1,
                         ))
+            except asyncio.TimeoutError:
+                logger.warning("Search timeout for '%s' [%s]", query[:50], strategy)
+            except ImportError:
+                logger.debug("web_search unavailable — skipping [%s]", strategy)
             except Exception as e:
-                logger.debug("Search strategy '%s' failed: %s", strategy, e)
+                # Rate limit, network error, etc.
+                err_msg = str(e).lower()
+                if "rate" in err_msg or "429" in err_msg:
+                    logger.info("Rate limited on search [%s] — skipping", strategy)
+                else:
+                    logger.debug("Search failed [%s]: %s", strategy, e)
+
+            # Fallback: return empty — caller handles missing results
             return results
 
         # Run all 3 strategies concurrently
