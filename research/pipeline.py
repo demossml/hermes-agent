@@ -132,6 +132,7 @@ class ResearchPipeline:
         force_api: bool = False,
         interactive: bool = False,
         user_feedback: dict[str, Any] | None = None,
+        stage_callback: Any = None,
     ) -> ResearchResult:
         """Execute the full 5-stage research pipeline.
 
@@ -192,6 +193,7 @@ class ResearchPipeline:
             sub_questions = [sq for sq in sub_questions if focused.lower() in sq.question.lower()]
 
         # ── Stage 2-4 (existing) ─────────────────────────────
+        if stage_callback: stage_callback("search")
         await self._parallel_search(sub_questions, max_sources)
         health = self._assess_search_health(sub_questions)
 
@@ -202,7 +204,9 @@ class ResearchPipeline:
             )
             sub_questions = await self._heuristic_deep_mode(topic, sub_questions)
 
+        if stage_callback: stage_callback("read")
         await self._deep_read(sub_questions)
+        if stage_callback: stage_callback("validate")
         confidence = await self._cross_validate(sub_questions)
 
         # ── Interactive: show disputed claims ────────────────
@@ -218,6 +222,7 @@ class ResearchPipeline:
             for sq in sub_questions:
                 sq.sources.extend(feedback["added_sources"])
 
+        if stage_callback: stage_callback("synthesize")
         result = await self._synthesize(topic, sub_questions, language, confidence)
 
         if health["notifications"]:

@@ -9842,13 +9842,28 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         _cprint(f"  ✅ Decomposed into {len(questions)} sub-questions")
         self._research_active = ("search+read", topic, time.time() - t0)
 
-        _cprint(f"  ⠋ Searching & analysing...")
+        # Run pipeline with stage callbacks for progress bar
+        async def _stage_callback(stage: str):
+            icons = {"decompose": "🔍", "search": "🌐", "read": "📖", "validate": "⚖️", "synthesize": "📝"}
+            names = {"decompose": "Decompose", "search": "Search", "read": "Deep Read",
+                     "validate": "Cross-Validate", "synthesize": "Synthesize"}
+            icon = icons.get(stage, "•")
+            name = names.get(stage, stage)
+            self._research_active = (name, topic, time.time() - t0)
+            _cprint(f"  {icon} {name}...")
+
         force_api = "--force-api" in topic
         if force_api:
             topic = topic.replace("--force-api", "").strip()
-        result = asyncio.run(pipeline.run(topic, force_api=force_api))
+
+        _cprint(f"  ⠋ Starting pipeline...")
+        result = asyncio.run(pipeline.run(topic, force_api=force_api,
+                                           stage_callback=_stage_callback))
         self._research_active = None
         elapsed = result.elapsed_s or (time.time() - t0)
+
+        # Show 5-stage summary
+        _cprint(f"  {'✅' if result.status in ('completed','partial') else '⚠️'} Pipeline complete in {elapsed:.1f}s")
 
         # Show cache/health notifications
         if result.status == "cached":
