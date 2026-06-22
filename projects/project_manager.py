@@ -450,7 +450,7 @@ class ProjectManager:
             logger.debug("Research recall failed: %s", e)
             return []
 
-    def create_project(self, name: str) -> dict[str, Any]:
+    def create_project(self, name: str, link_cwd: bool = True) -> dict[str, Any]:
         name = name.strip()
         if not name:
             raise ValueError("Project name must not be empty")
@@ -460,6 +460,20 @@ class ProjectManager:
         self._ensure_chroma_collection(project_id)
         self._write_current(project_id)
         meta["project_dir"] = str(self._project_dir(project_id))
+
+        # ── Create .hermes-project marker in cwd ──────────
+        # So cd'ing to the user's working directory auto-switches
+        if link_cwd:
+            import os
+            try:
+                cwd = os.getenv("TERMINAL_CWD", os.getcwd())
+                marker = Path(cwd) / ".hermes-project"
+                if not marker.exists():
+                    marker.write_text(project_id + "\n", encoding="utf-8")
+                    logger.info(f"Created .hermes-project marker in {cwd}")
+            except Exception:
+                pass  # best-effort
+
         logger.info(f"Project '{name}' created (id={project_id})")
         return dict(meta)
 

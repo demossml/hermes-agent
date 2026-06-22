@@ -201,7 +201,29 @@ def detect_project_from_cwd(
 
     projects_dir = pm.projects_dir.resolve()
 
-    # Walk up from cwd to see if any ancestor is a project directory
+    # ── Strategy 1: .hermes-project marker file ──────────
+    # Walk up from cwd looking for a .hermes-project file
+    # containing a project slug.  This lets users link ANY
+    # directory to a Hermes project.
+    current = cwd
+    while current != current.parent:
+        marker = current / ".hermes-project"
+        try:
+            if marker.exists():
+                slug = marker.read_text(encoding="utf-8").strip()
+                if slug:
+                    meta = pm.get_project(slug)
+                    if meta:
+                        meta["_matched_by"] = "marker"
+                        meta["_cwd"] = str(cwd)
+                        meta["_marker_path"] = str(marker)
+                        return meta
+        except Exception:
+            pass
+        current = current.parent
+
+    # ── Strategy 2: Hermes projects directory ────────────
+    # Check if cwd is inside ~/.hermes/projects/<slug>/
     current = cwd
     while current != current.parent:  # stop at root
         try:

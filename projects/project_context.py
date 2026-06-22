@@ -52,6 +52,9 @@ _CURRENT_PROJECT_CACHE_TTL = 2.0
 _project_just_switched: bool = False
 _switch_new_prefix: str = ""
 
+# Last known mtime of .current_project — detects external writes (cd hook)
+_current_project_mtime: float = 0.0
+
 
 def notify_project_switched(new_prefix: str) -> None:
     """Signal that the project changed — conversation loop must rebuild CONTEXT."""
@@ -99,41 +102,95 @@ def check_and_apply_project_switch(agent) -> bool:
 
 
 def _lazy_load_current_project() -> None:
-    """Load current project from disk, with short TTL for cross-process sync.
+    """Load current project from disk, with short TTL + mtime tracking.
 
-    The gateway process never calls switch_project() — it relies on
-    the ``.current_project`` file written by the CLI process.
-
-    Cache TTL of 2s prevents excessive disk reads while still picking
-    up project switches within a single conversation turn.
+    Two trigger mechanisms:
+    1. **TTL (2s):** Normal periodic re-read — prevents excessive disk I/O
+    2. **Mtime change:** If ``.current_project`` mtime changed (e.g.
+       ``hermes_cd_hook`` wrote it), bypass TTL and auto-switch.
     """
     global _current_project_id, _current_project_name, _current_project_loaded_at
+    global _current_project_mtime
 
-    import time
+    import os, time
+    from pathlib import Path
+    from projects.project_manager import ProjectManager
+
+    pm = ProjectManager()
+    current_file = pm._current_file
     now = time.time()
 
-    # Short TTL: re-read even if already loaded (cross-process sync)
-    if _current_project_id is not None and (now - _current_project_loaded_at) < _CURRENT_PROJECT_CACHE_TTL:
-        return
+    # ── Check mtime for external writes (cd hook) ──────────
+    file_mtime = 0.0
+    try:
+        if current_file.exists():
+            file_mtime = current_file.stat().st_mtime
+    except OSError:
+        pass
+
+    external_change = (file_mtime > 0 and file_mtime != _current_project_mtime)
+
+    # TTL guard — skip only if no external change AND within TTL
+    if not external_change:
+        if _current_project_id is not None and (now - _current_project_loaded_at) < _CURRENT_PROJECT_CACHE_TTL:
+            return
 
     _current_project_loaded_at = now
 
     try:
-        from pathlib import Path
-        from projects.project_manager import ProjectManager
-        pm = ProjectManager()
         pid = pm._read_current()
         if pid and pid.strip():
+            # External change → do full switch (rebuilds context blocks)
+            if external_change and _current_project_id is not None and pid != _current_project_id:
+                _current_project_mtime = file_mtime
+                _do_auto_switch(pm, pid)
+                return
+
+            _current_project_mtime = file_mtime
             meta = pm._read_metadata(pid)
             if meta:
                 _current_project_id = meta.get("project_id", pid)
                 _current_project_name = meta.get("name", pid)
                 return
         # No current project
+        _current_project_mtime = file_mtime
         _current_project_id = None
         _current_project_name = None
     except Exception:
         pass
+
+
+def _do_auto_switch(pm, new_pid: str) -> None:
+    """Auto-switch when .current_project changed externally (cd hook).
+
+    Full switch: updates globals, notifies conversation loop, rebuilds
+    CONTEXT prefix.  Mirrors ``ProjectContextMiddleware.switch_project``
+    but without pause/save overhead — the external process handles that.
+    """
+    global _current_project_id, _current_project_name, _current_project_mtime
+    import logging
+    _log = logging.getLogger(__name__)
+
+    meta = pm._read_metadata(new_pid)
+    if not meta:
+        return
+
+    old_id = _current_project_id
+    _current_project_id = meta.get("project_id", new_pid)
+    _current_project_name = meta.get("name", new_pid)
+
+    # Sync mtime so we don't re-trigger on the same file
+    try:
+        if pm._current_file.exists():
+            _current_project_mtime = pm._current_file.stat().st_mtime
+    except OSError:
+        pass
+
+    notify_project_switched(get_response_prefix())
+    _log.info(
+        "Auto-switched project (external trigger): %s → %s (%s)",
+        old_id, new_pid, _current_project_name,
+    )
 
 
 def get_current_project_id() -> str | None:
@@ -325,14 +382,14 @@ class ProjectContextMiddleware:
             result["_notifications"] = notifications
         return result
 
-    def create_project(self, name: str) -> dict[str, Any]:
+    def create_project(self, name: str, link_cwd: bool = True) -> dict[str, Any]:
         """Create a new project and auto-switch to it.
 
         Returns the newly created project's metadata.
         """
         global _current_project_id, _current_project_name
 
-        proj = self._pm.create_project(name)
+        proj = self._pm.create_project(name, link_cwd=link_cwd)
         _current_project_id = proj["project_id"]
         _current_project_name = proj["name"]
 
@@ -491,9 +548,9 @@ def switch_project(project_id: str) -> dict[str, Any]:
     return ProjectContextMiddleware.get_instance().switch_project(project_id)
 
 
-def create_project(name: str) -> dict[str, Any]:
+def create_project(name: str, link_cwd: bool = True) -> dict[str, Any]:
     """Create a new project and auto-switch to it."""
-    return ProjectContextMiddleware.get_instance().create_project(name)
+    return ProjectContextMiddleware.get_instance().create_project(name, link_cwd=link_cwd)
 
 
 def list_projects() -> list[dict[str, Any]]:
