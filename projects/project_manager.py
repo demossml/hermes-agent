@@ -565,3 +565,120 @@ class ProjectManager:
             return False
         # Per-project config
         return self.get_config(project_id, "show_project_prefix", True)
+
+    # ── Fuzzy search ────────────────────────────────────────
+
+    def fuzzy_search(
+        self, query: str, limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        """Search projects by name or slug using fuzzy matching.
+
+        Scoring:
+        - Exact slug match: 100
+        - Exact name match: 90
+        - Name starts with query: 80
+        - Slug starts with query: 75
+        - Query is a substring of name: 60
+        - Query is a substring of slug: 55
+        - Name contains all chars in order (fuzzy): 40 + len match
+        - Name contains all chars (any order): 20 + len match
+
+        Returns results sorted by score desc, capped at *limit*.
+        """
+        import re
+
+        projects = self.list_projects(include_archived=False)
+        q = query.strip().lower()
+        if not q or not projects:
+            return projects[:limit]
+
+        scored = []
+        for p in projects:
+            pid = p.get("project_id", "").lower()
+            name = p.get("name", "").lower()
+            score = 0
+
+            # Exact match
+            if q == pid:
+                score = 100
+            elif q == name:
+                score = 90
+            elif name.startswith(q):
+                score = 80
+            elif pid.startswith(q):
+                score = 75
+            elif q in name:
+                score = 60
+            elif q in pid:
+                score = 55
+            else:
+                # Fuzzy: check if all chars in query appear in order
+                score_name = _fuzzy_score(q, name)
+                score_slug = _fuzzy_score(q, pid)
+                score = max(score_name, score_slug)
+
+            if score > 0:
+                scored.append((score, p))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [p for _, p in scored[:limit]]
+
+    def find_by_cwd(self, cwd: str | None = None) -> dict[str, Any] | None:
+        """Find a project by the current working directory.
+
+        If *cwd* is inside ``~/.hermes/projects/<slug>/`` (or any
+        subdirectory), return that project.  Otherwise return None.
+        """
+        from projects.project_auto import detect_project_from_cwd
+        return detect_project_from_cwd(cwd=cwd, hermes_home=str(self._home))
+
+
+def _fuzzy_score(query: str, target: str) -> int:
+    """Score how well *query* fuzzily matches *target*.
+
+    Returns 0–100 range, where higher = better match.
+    Scoring factors:
+    - Exact match: 100
+    - Starts with: 85
+    - Sequential substring with gap penalty
+    - Char coverage ratio
+    """
+    if not query or not target:
+        return 0
+
+    q = query.lower()
+    t = target.lower()
+
+    # Exact match
+    if q == t:
+        return 100
+    if t.startswith(q):
+        return 85
+
+    # Sequential character match (all chars of q appear in t in order)
+    pos = -1
+    gaps = 0
+    first_match = -1
+    for ch in q:
+        next_pos = t.find(ch, pos + 1)
+        if next_pos == -1:
+            # Not in order — check any-order match
+            if all(c in t for c in q):
+                # All chars present but order differs
+                ratio = len(q) / len(t)
+                return int(30 + ratio * 15)
+            return 0
+        if first_match == -1:
+            first_match = next_pos
+        if pos >= 0:
+            gaps += (next_pos - pos - 1)
+        pos = next_pos
+
+    # Score: 50 base + length bonus - gap penalty - position penalty
+    match_len = pos - first_match + 1
+    contiguity = max(0, len(q) - gaps)
+    length_bonus = min(15, contiguity * 2)
+    position_penalty = min(10, first_match // 2)
+
+    score = 50 + length_bonus - position_penalty - gaps
+    return max(10, min(84, score))

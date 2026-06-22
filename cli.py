@@ -6283,6 +6283,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 pass
             self._notify_session_boundary("on_session_reset")
 
+        # ── Auto-detect project from cwd after session reset ─
+        try:
+            self._auto_detect_project_on_startup()
+        except Exception:
+            pass
+
         if not silent:
             if title:
                 print(f"(^_^)v New session started: {title}")
@@ -10018,6 +10024,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._project_switch(ctx, rest)
         elif action == "current":
             self._project_show_current(ctx)
+        elif action == "here":
+            self._project_here(ctx)
         elif action == "rename":
             self._project_rename(ctx, rest)
         elif action in ("delete", "remove", "rm"):
@@ -10033,19 +10041,40 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         elif action == "open":
             self._project_open_last(ctx, rest)
         else:
-            # Ambiguous: treat as switch if it looks like a project_id
-            all_projects = ctx.list_projects()
-            match = None
-            for p in all_projects:
-                if p["project_id"] == action or p["name"].lower() == action.lower():
-                    match = p["project_id"]
-                    break
-            if match:
-                self._project_switch(ctx, match)
+            # Ambiguous: treat as switch — use fuzzy search
+            results = ctx.manager.fuzzy_search(action)
+            if len(results) == 1:
+                self._project_switch(ctx, results[0]["project_id"])
+            elif len(results) > 1:
+                _cprint(f"\n  [bold]Multiple matches for '{action}':[/]")
+                for i, p in enumerate(results[:8], 1):
+                    marker = " [bold green]← CURRENT[/]" if p.get("_is_active") else ""
+                    _cprint(f"  [bold]{i}.[/] {p['name']} [dim]({p['project_id']})[/]{marker}")
+                _cprint(f"\n  Type [bold]/project switch <id>[/] to switch.")
             else:
                 _cprint(f"\n  [red]Unknown subcommand:[/] {action}")
-                _cprint("  Usage: /project [new|list|switch|current|rename|delete]")
+                _cprint("  Usage: /project [new|list|switch|current|here|rename|delete]")
                 _cprint("  Try /project list to see all projects.")
+
+    def _auto_detect_project_on_startup(self) -> None:
+        """Auto-switch to a project if cwd is inside one.
+
+        Called once at CLI startup and after /new.  Silently binds
+        the session to the matching project — the user sees the
+        updated status bar on the next turn.
+        """
+        import os
+        try:
+            from projects.project_auto import auto_switch_if_in_project
+
+            cwd = os.getenv("TERMINAL_CWD", os.getcwd())
+            result = auto_switch_if_in_project(cwd=cwd)
+            if result and not result.get("_already_active"):
+                pid = result["project_id"]
+                name = result["name"]
+                _cprint(f"  [dim]📁 Auto-switched to project:[/] [bold]{name}[/] [dim]({pid})[/]")
+        except Exception:
+            pass  # Best-effort — never break startup
 
     def _project_show_current(self, ctx):
         """Show the currently active project."""
@@ -10095,6 +10124,37 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         except ValueError as e:
             _cprint(f"  [red]Error:[/] {e}")
 
+    def _project_here(self, ctx):
+        """Switch to the project matching the current working directory.
+
+        /project here — detects project from cwd and switches to it.
+        """
+        import os
+        from projects.project_auto import detect_project_from_cwd
+
+        cwd = os.getenv("TERMINAL_CWD", os.getcwd())
+        proj = detect_project_from_cwd(cwd=cwd)
+        if proj is None:
+            _cprint(f"\n  [dim]Current directory is not inside any Hermes project.[/]")
+            _cprint(f"  [dim]cwd: {cwd}[/]")
+            _cprint(f"  Use [bold]/project new <name>[/] to create one.")
+            return
+
+        pid = proj["project_id"]
+        current = ctx.active_project_id
+        if current == pid:
+            _cprint(f"\n  [bold]Already on project:[/] {proj['name']} [dim]({pid})[/]")
+            return
+
+        # Switch to it
+        switched = ctx.switch_project(pid)
+        from core.response_formatter import get_activity_prefix_rich
+        _pfx = get_activity_prefix_rich("orchestrator")
+        _cprint(f"\n  [bold green]✦ Auto-switched:[/] {_pfx}")
+        _cprint(f"    Matched by  cwd → {cwd}")
+        _cprint(f"    ID:         {switched['project_id']}")
+        _cprint(f"    Directory:  {switched['project_dir']}")
+
     def _project_list(self, ctx, include_archived: bool = False):
         """List all projects with status indicators. /project list [--archived]."""
         from projects.project_state import ProjectStateManager
@@ -10134,34 +10194,38 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         _cprint(f"  /project list --archived  — показать архивные")
 
     def _project_switch(self, ctx, target: str):
-        """Switch to a project by ID or name."""
+        """Switch to a project by ID, name, or fuzzy query.
+
+        Uses fuzzy matching when the exact ID is not found:
+        1. Exact ID match
+        2. Exact name match  
+        3. Fuzzy search (prefix, substring, sequential character match)
+        4. If multiple matches — show list for user to pick
+        5. If no match — suggest creation
+        """
         target = target.strip()
         if not target:
-            _cprint("  [red]Usage:[/] /project switch <project_id>")
+            _cprint("  [red]Usage:[/] /project switch <project_id | name | query>")
             return
         try:
             # Try exact ID first
             proj = ctx.switch_project(target)
         except ValueError:
-            # Try fuzzy match by name
-            projects = ctx.list_projects()
-            match = None
-            target_lower = target.lower()
-            for p in projects:
-                if p["name"].lower() == target_lower:
-                    match = p["project_id"]
-                    break
-            if not match:
-                # Partial match
-                for p in projects:
-                    if target_lower in p["name"].lower():
-                        match = p["project_id"]
-                        break
-            if match:
-                proj = ctx.switch_project(match)
-            else:
-                _cprint(f"  [red]Project not found:[/] {target}")
+            # Fuzzy search
+            results = ctx.manager.fuzzy_search(target)
+            if not results:
+                _cprint(f"\n  [red]Project not found:[/] {target}")
                 _cprint("  Use [bold]/project list[/] to see all projects.")
+                _cprint(f"  Or [bold]/project new {target}[/] to create it.")
+                return
+            if len(results) == 1:
+                proj = ctx.switch_project(results[0]["project_id"])
+            else:
+                _cprint(f"\n  [bold]Multiple matches for '{target}':[/]")
+                for i, p in enumerate(results[:8], 1):
+                    marker = " [bold green]← CURRENT[/]" if p.get("_is_active") else ""
+                    _cprint(f"  [bold]{i}.[/] {p['name']} [dim]({p['project_id']})[/]{marker}")
+                _cprint(f"\n  Type [bold]/project switch <id>[/] with the exact ID to switch.")
                 return
 
         # ── Show confirmation WITH instant prefix ────────────
@@ -10169,11 +10233,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         _pfx = get_activity_prefix_rich("orchestrator")
 
         _cprint(f"\n  [bold green]✦ Switched:[/] {_pfx}")
+        _cprint(f"    Name:        {proj['name']}")
         _cprint(f"    ID:          {proj['project_id']}")
-        _cprint(f"    Subtree:     {proj['subtree_session_id']}")
-        _cprint(f"    ChromaDB:    {proj['chroma_collection']}")
         _cprint(f"    Directory:   {proj['project_dir']}")
-        _cprint(f"    ⚡ Prefix updated instantly — all future messages will use it.")
+        _cprint(f"    Subtree:     {proj['subtree_session_id']}")
+        _cprint(f"    ⚡ Prefix updated — all future messages will use it.")
 
         # ── Show recent project artifacts ────────────────────
         try:
@@ -13521,6 +13585,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
             self._install_tool_callbacks()
+
+        # ── Auto-detect project from current directory ──────
+        self._auto_detect_project_on_startup()
 
         if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
             self._ensure_tirith_security()
