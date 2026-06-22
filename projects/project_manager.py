@@ -215,15 +215,33 @@ class ProjectManager:
                       and not d.name.startswith("."))
 
     def _read_current(self) -> str | None:
+        """Read the current project ID from ``.current_project`` file.
+
+        Uses ``fcntl.flock`` for cross-process safety on POSIX.
+        """
         try:
-            if self._current_file.exists():
-                return self._current_file.read_text(encoding="utf-8").strip() or None
+            if not self._current_file.exists():
+                return None
+            with open(self._current_file, "r", encoding="utf-8") as f:
+                _flock_shared(f)
+                content = f.read().strip()
+            return content or None
         except OSError:
-            pass
-        return None
+            return None
 
     def _write_current(self, project_id: str) -> None:
-        self._current_file.write_text(project_id + "\n", encoding="utf-8")
+        """Write the current project ID to ``.current_project`` file.
+
+        Uses ``fcntl.flock`` to prevent race conditions when multiple
+        Hermes processes write concurrently.
+        """
+        import os
+        self._current_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._current_file, "w", encoding="utf-8") as f:
+            _flock_exclusive(f)
+            f.write(project_id + "\n")
+            f.flush()
+            os.fsync(f.fileno())
 
     def _ensure_chroma_collection(self, project_id: str) -> bool:
         if not HAS_CHROMA:
@@ -575,13 +593,13 @@ class ProjectManager:
 
         Scoring:
         - Exact slug match: 100
-        - Exact name match: 90
-        - Name starts with query: 80
-        - Slug starts with query: 75
-        - Query is a substring of name: 60
-        - Query is a substring of slug: 55
-        - Name contains all chars in order (fuzzy): 40 + len match
-        - Name contains all chars (any order): 20 + len match
+        - Exact name match: 95
+        - Name starts with query: 85
+        - Slug starts with query: 80
+        - Query is a substring: 60–70
+        - Sequential char match with gap penalty: 10–84
+        - Levenshtein bonus for short queries: +0–10
+        - Any-order char match: 10–45
 
         Returns results sorted by score desc, capped at *limit*.
         """
@@ -602,26 +620,83 @@ class ProjectManager:
             if q == pid:
                 score = 100
             elif q == name:
-                score = 90
+                score = 95
             elif name.startswith(q):
-                score = 80
+                score = 85
             elif pid.startswith(q):
-                score = 75
+                score = 80
             elif q in name:
-                score = 60
+                # Substring match — earlier = better
+                pos = name.find(q)
+                score = 70 - min(15, pos // 2)
             elif q in pid:
-                score = 55
+                pos = pid.find(q)
+                score = 65 - min(15, pos // 2)
             else:
-                # Fuzzy: check if all chars in query appear in order
+                # Sequential fuzzy
                 score_name = _fuzzy_score(q, name)
                 score_slug = _fuzzy_score(q, pid)
                 score = max(score_name, score_slug)
+                # Levenshtein bonus for short queries (≤6 chars)
+                if score == 0 and len(q) <= 6:
+                    lev_bonus = _levenshtein_bonus(q, name, pid)
+                    score = max(score, lev_bonus)
 
             if score > 0:
                 scored.append((score, p))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         return [p for _, p in scored[:limit]]
+
+    def fuzzy_search_explain(
+        self, query: str, limit: int = 8,
+    ) -> dict[str, Any]:
+        """Like fuzzy_search but returns diagnostic info for UX feedback.
+
+        Returns
+        -------
+        dict
+            ``results`` — matched projects (same as fuzzy_search)
+            ``suggestions`` — list of project names for partial matches
+            ``missing_chars`` — chars from query not found in any project
+            ``closest_distance`` — min Levenshtein distance found
+        """
+        results = self.fuzzy_search(query, limit=limit)
+
+        q = query.strip().lower()
+        all_projects = self.list_projects(include_archived=False)
+
+        # Find which chars are missing from ALL projects
+        missing_chars = []
+        for ch in q:
+            found_anywhere = any(
+                ch in p.get("name", "").lower() or ch in p.get("project_id", "").lower()
+                for p in all_projects
+            )
+            if not found_anywhere:
+                missing_chars.append(ch)
+
+        # Find closest Levenshtein matches for suggestions
+        suggestions = []
+        if not results and all_projects:
+            scored_suggestions = []
+            for p in all_projects:
+                name = p.get("name", "").lower()
+                pid = p.get("project_id", "").lower()
+                dist = min(
+                    _levenshtein(q, name),
+                    _levenshtein(q, pid),
+                )
+                scored_suggestions.append((dist, p))
+            scored_suggestions.sort(key=lambda x: x[0])
+            suggestions = [p for _, p in scored_suggestions[:3]]
+
+        return {
+            "results": results,
+            "suggestions": suggestions,
+            "missing_chars": missing_chars,
+            "closest_distance": scored_suggestions[0][0] if suggestions else None,
+        }
 
     def find_by_cwd(self, cwd: str | None = None) -> dict[str, Any] | None:
         """Find a project by the current working directory.
@@ -637,11 +712,7 @@ def _fuzzy_score(query: str, target: str) -> int:
     """Score how well *query* fuzzily matches *target*.
 
     Returns 0–100 range, where higher = better match.
-    Scoring factors:
-    - Exact match: 100
-    - Starts with: 85
-    - Sequential substring with gap penalty
-    - Char coverage ratio
+    Uses sequential character matching with gap + position penalties.
     """
     if not query or not target:
         return 0
@@ -649,7 +720,6 @@ def _fuzzy_score(query: str, target: str) -> int:
     q = query.lower()
     t = target.lower()
 
-    # Exact match
     if q == t:
         return 100
     if t.startswith(q):
@@ -664,7 +734,6 @@ def _fuzzy_score(query: str, target: str) -> int:
         if next_pos == -1:
             # Not in order — check any-order match
             if all(c in t for c in q):
-                # All chars present but order differs
                 ratio = len(q) / len(t)
                 return int(30 + ratio * 15)
             return 0
@@ -674,11 +743,84 @@ def _fuzzy_score(query: str, target: str) -> int:
             gaps += (next_pos - pos - 1)
         pos = next_pos
 
-    # Score: 50 base + length bonus - gap penalty - position penalty
-    match_len = pos - first_match + 1
     contiguity = max(0, len(q) - gaps)
     length_bonus = min(15, contiguity * 2)
     position_penalty = min(10, first_match // 2)
 
     score = 50 + length_bonus - position_penalty - gaps
     return max(10, min(84, score))
+
+
+def _levenshtein(a: str, b: str) -> int:
+    """Compute Levenshtein edit distance between two strings.
+
+    Pure Python, no imports needed.  O(len(a)*len(b)) time, O(len(b)) space.
+    """
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+
+    la, lb = len(a), len(b)
+    # Use shorter string as inner dimension for memory efficiency
+    if la < lb:
+        return _levenshtein(b, a)
+
+    prev = list(range(lb + 1))
+    curr = [0] * (lb + 1)
+
+    for i in range(1, la + 1):
+        curr[0] = i
+        for j in range(1, lb + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            curr[j] = min(
+                prev[j] + 1,       # deletion
+                curr[j - 1] + 1,   # insertion
+                prev[j - 1] + cost,  # substitution
+            )
+        prev, curr = curr, prev
+
+    return prev[lb]
+
+
+def _levenshtein_bonus(query: str, name: str, slug: str) -> int:
+    """Levenshtein-based bonus for short queries (≤6 chars).
+
+    Converts edit distance into a 0–50 score.  Only used when the
+    sequential fuzzy matcher returns 0 — a safety net for typos
+    and character transpositions.
+    """
+    dist = min(_levenshtein(query, name), _levenshtein(query, slug))
+
+    max_len = max(len(query), len(name), len(slug))
+    if max_len == 0:
+        return 0
+
+    # Normalize: distance 0 = 50, distance ≈ len = 0
+    similarity = 1.0 - (dist / max_len)
+    if similarity <= 0.3:
+        return 0
+
+    return int(similarity * 50)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Cross-process safety: fcntl.flock for .current_project
+# ═══════════════════════════════════════════════════════════════
+
+def _flock_shared(f) -> None:
+    """Acquire a shared (read) lock on *f*."""
+    try:
+        import fcntl
+        fcntl.flock(f, fcntl.LOCK_SH)
+    except (ImportError, OSError):
+        pass  # Windows or unsupported FS — best-effort
+
+
+def _flock_exclusive(f) -> None:
+    """Acquire an exclusive (write) lock on *f*."""
+    try:
+        import fcntl
+        fcntl.flock(f, fcntl.LOCK_EX)
+    except (ImportError, OSError):
+        pass  # Windows or unsupported FS — best-effort

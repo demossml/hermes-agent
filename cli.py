@@ -10041,8 +10041,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         elif action == "open":
             self._project_open_last(ctx, rest)
         else:
-            # Ambiguous: treat as switch — use fuzzy search
-            results = ctx.manager.fuzzy_search(action)
+            # Ambiguous: treat as switch — use fuzzy search with diagnostics
+            diagnostic = ctx.manager.fuzzy_search_explain(action)
+            results = diagnostic["results"]
             if len(results) == 1:
                 self._project_switch(ctx, results[0]["project_id"])
             elif len(results) > 1:
@@ -10052,7 +10053,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     _cprint(f"  [bold]{i}.[/] {p['name']} [dim]({p['project_id']})[/]{marker}")
                 _cprint(f"\n  Type [bold]/project switch <id>[/] to switch.")
             else:
+                missing = diagnostic.get("missing_chars", [])
+                suggestions = diagnostic.get("suggestions", [])
                 _cprint(f"\n  [red]Unknown subcommand:[/] {action}")
+                if missing:
+                    _cprint(f"  [dim]No project contains: {', '.join(missing)}[/]")
+                if suggestions:
+                    _cprint(f"  [bold]Did you mean?[/]")
+                    for s in suggestions[:3]:
+                        _cprint(f"    {s['name']} [dim]({s['project_id']})[/]")
                 _cprint("  Usage: /project [new|list|switch|current|here|rename|delete]")
                 _cprint("  Try /project list to see all projects.")
 
@@ -10199,9 +10208,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         Uses fuzzy matching when the exact ID is not found:
         1. Exact ID match
         2. Exact name match  
-        3. Fuzzy search (prefix, substring, sequential character match)
+        3. Fuzzy search (prefix, substring, sequential, Levenshtein)
         4. If multiple matches — show list for user to pick
-        5. If no match — suggest creation
+        5. If no match — show diagnostic: missing chars + closest suggestions
         """
         target = target.strip()
         if not target:
@@ -10211,13 +10220,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             # Try exact ID first
             proj = ctx.switch_project(target)
         except ValueError:
-            # Fuzzy search
-            results = ctx.manager.fuzzy_search(target)
+            # Fuzzy search with diagnostics
+            diagnostic = ctx.manager.fuzzy_search_explain(target)
+            results = diagnostic["results"]
+
             if not results:
+                missing = diagnostic.get("missing_chars", [])
+                suggestions = diagnostic.get("suggestions", [])
+
                 _cprint(f"\n  [red]Project not found:[/] {target}")
-                _cprint("  Use [bold]/project list[/] to see all projects.")
+                if missing:
+                    missing_str = ", ".join(f"'{c}'" for c in missing)
+                    _cprint(f"  [dim]Characters not in any project: {missing_str}[/]")
+                if suggestions:
+                    _cprint(f"  [bold]Closest matches:[/]")
+                    for s in suggestions[:3]:
+                        _cprint(f"    {s['name']} [dim]({s['project_id']})[/]")
+                _cprint(f"  Use [bold]/project list[/] to see all projects.")
                 _cprint(f"  Or [bold]/project new {target}[/] to create it.")
                 return
+
             if len(results) == 1:
                 proj = ctx.switch_project(results[0]["project_id"])
             else:
