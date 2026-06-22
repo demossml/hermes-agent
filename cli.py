@@ -10012,6 +10012,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 pid = result["project_id"]
                 name = result["name"]
                 _cprint(f"  [dim]📁 Auto-switched to project:[/] [bold]{name}[/] [dim]({pid})[/]")
+                self._apply_project_switch_to_agent(name)
         except Exception:
             pass  # Best-effort — never break startup
 
@@ -10066,6 +10067,44 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._project_poller_thread.join(timeout=2.0)
             self._project_poller_thread = None
 
+    def _apply_project_switch_to_agent(self, project_name: str) -> None:
+        """Force the agent's system prompt CONTEXT line to update immediately.
+
+        Called after every project switch — ``/project switch``,
+        ``/project here``, auto-detect, cd hook.  Without this the
+        CONTEXT prefix (``📁 ProjectName``) only updates on the
+        NEXT user turn.  With this, it updates in the same response.
+
+        Also injects a ``[PROJECT SWITCHED]`` system message so the
+        model knows about the new project context right away.
+        """
+        agent = getattr(self, 'agent', None)
+        if agent is None:
+            return
+
+        try:
+            from projects.project_context import check_and_apply_project_switch
+            if check_and_apply_project_switch(agent):
+                # Inject a system message so the model sees the new context
+                meta_msg = {
+                    "role": "user",
+                    "content": (
+                        f"[PROJECT SWITCHED]\n"
+                        f"You are now working in project: {project_name}\n"
+                        f"All context, memory, and files are scoped to this project.\n"
+                        f"[/PROJECT SWITCHED]"
+                    ),
+                    "_meta": True,
+                    "_project_switch": True,
+                }
+                self.conversation_history.append(meta_msg)
+        except Exception:
+            pass
+
+        # Force UI refresh
+        if self._app:
+            self._app.invalidate()
+
     def _project_show_current(self, ctx):
         """Show the currently active project."""
         current = ctx.get_current_project()
@@ -10111,6 +10150,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _cprint(f"    ChromaDB:    {proj['chroma_collection']}")
             _cprint(f"    Directory:   {proj['project_dir']}")
             _cprint(f"    ⚡ Prefix active immediately.")
+
+            # Force agent CONTEXT rebuild
+            self._apply_project_switch_to_agent(proj['name'])
         except ValueError as e:
             _cprint(f"  [red]Error:[/] {e}")
 
@@ -10144,6 +10186,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         _cprint(f"    Matched by  cwd → {cwd}")
         _cprint(f"    ID:         {switched['project_id']}")
         _cprint(f"    Directory:  {switched['project_dir']}")
+
+        # Force agent CONTEXT rebuild
+        self._apply_project_switch_to_agent(switched['name'])
 
     def _project_list(self, ctx, include_archived: bool = False):
         """List all projects with status indicators. /project list [--archived]."""
@@ -10241,6 +10286,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         _cprint(f"    Directory:   {proj['project_dir']}")
         _cprint(f"    Subtree:     {proj['subtree_session_id']}")
         _cprint(f"    ⚡ Prefix updated — all future messages will use it.")
+
+        # ── Force agent CONTEXT rebuild + inject meta message ──
+        self._apply_project_switch_to_agent(proj['name'])
 
         # ── Show recent project artifacts ────────────────────
         try:

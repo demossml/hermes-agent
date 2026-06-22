@@ -89,7 +89,8 @@ critical_rules:
 rule_reminder_every: 0
 max_context_tokens: 8000
 max_iterations: 5
-enabled_toolsets: []
+enabled_toolsets:
+- web
 applied_migrations:
 - 20260609_add_subtree_session
 - 20260610_add_enabled_toolsets

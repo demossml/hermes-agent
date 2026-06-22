@@ -37,6 +37,7 @@ enabled_toolsets:
 - search
 - delegation
 - messaging
+- web
 model: claude-sonnet-4-20250514
 temperature: 0.7
 max_tokens: 8192
