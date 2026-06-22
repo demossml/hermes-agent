@@ -3603,6 +3603,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self._resize_recovery_timer = None
         self._resize_recovery_pending = False
 
+        # ── Project auto-switch poller ────────────────────
+        # Background thread that checks .current_project mtime
+        # every 500ms and auto-switches when cd hook fires.
+        self._project_poller_thread: threading.Thread | None = None
+        self._project_poller_stop = threading.Event()
+        self._project_poller_last_mtime: float = 0.0
+
         # Background task tracking: {task_id: threading.Thread}
         self._background_tasks: Dict[str, threading.Thread] = {}
         self._background_task_counter = 0
@@ -10008,6 +10015,57 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         except Exception:
             pass  # Best-effort — never break startup
 
+    def _start_project_mtime_poller(self) -> None:
+        """Start a background thread that polls .current_project mtime.
+
+        Every 500ms, checks if ``.current_project`` was modified externally
+        (by the ``hermes_cd_hook`` shell integration).  If so, auto-switches
+        the active project and forces a UI refresh so the user sees the
+        new ``[Project: ...]`` instantly.
+        """
+        if self._project_poller_thread is not None:
+            return  # already running
+
+        import os, time
+        from pathlib import Path
+        from projects.project_manager import ProjectManager
+        from projects.project_context import _lazy_load_current_project
+
+        def _poll_loop() -> None:
+            pm = ProjectManager()
+            current_file = pm._current_file
+
+            while not self._project_poller_stop.is_set():
+                try:
+                    if current_file.exists():
+                        mtime = current_file.stat().st_mtime
+                    else:
+                        mtime = 0.0
+
+                    if mtime > 0 and mtime != self._project_poller_last_mtime:
+                        self._project_poller_last_mtime = mtime
+                        _lazy_load_current_project()
+                        # Force UI refresh so status bar updates instantly
+                        if self._app:
+                            self._app.invalidate()
+                except Exception:
+                    pass
+
+                self._project_poller_stop.wait(0.5)
+
+        self._project_poller_stop.clear()
+        self._project_poller_thread = threading.Thread(
+            target=_poll_loop, daemon=True, name="project-mtime-poller"
+        )
+        self._project_poller_thread.start()
+
+    def _stop_project_mtime_poller(self) -> None:
+        """Stop the background project poller thread."""
+        self._project_poller_stop.set()
+        if self._project_poller_thread is not None:
+            self._project_poller_thread.join(timeout=2.0)
+            self._project_poller_thread = None
+
     def _project_show_current(self, ctx):
         """Show the currently active project."""
         current = ctx.get_current_project()
@@ -13693,6 +13751,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         # ── Auto-detect project from current directory ──────
         self._auto_detect_project_on_startup()
+
+        # ── Start background project poller (500ms) ─────────
+        # Detects cd-induced .current_project changes instantly
+        self._start_project_mtime_poller()
 
         if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
             self._ensure_tirith_security()
