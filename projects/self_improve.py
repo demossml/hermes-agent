@@ -1,451 +1,573 @@
 """
-Self-Improvement Loop — continuous agent improvement within a project.
+Self-Improvement Loop — непрерывное обучение агентов внутри проекта.
 
-After a significant task completes, the system:
-1. Analyzes the agent trajectory (what worked, what didn't)
-2. Extracts patterns and lessons
-3. Proposes concrete improvements (rules, prompts, skills)
-4. Shows proposals with confirmation
-5. Versions all changes for rollback
+После завершения workflow или исследования:
+- Анализирует trajectory (траекторию действий агента)
+- Извлекает уроки и лучшие практики
+- Предлагает улучшения critical_rules, system prompt или skills
+- Сохраняет версии промптов с возможностью отката
 
-Usage::
+Архитектура:
+  projects/self_improve.py  ← этот файл
+  project_{id}_improvements ← ChromaDB-коллекция истории улучшений
+  state/improvements/       ← версионированные промпты / правила / скиллы
 
-    from projects.self_improve import SelfImprover
-
-    si = SelfImprover("my-project")
-    proposals = si.analyze_trajectory(workflow.state)
-    for p in proposals:
-        print(p)
-    si.apply(proposals[0])  # after user confirmation
-
-    # CLI: /improve
+Запуск:
+  - Автоматически: после больших workflow (≥5 сообщений)
+  - Вручную: /improve
 """
 
 from __future__ import annotations
 
-import json, logging, re
-from dataclasses import dataclass, field
+import json, logging, re, time, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-
-# ═══════════════════════════════════════════════════════════════
-# Data models
-# ═══════════════════════════════════════════════════════════════
-
-@dataclass
-class Proposal:
-    """A concrete improvement suggestion."""
-    id: str
-    category: str          # "critical_rule" | "system_prompt" | "skill" | "tool_usage"
-    title: str             # one-line summary
-    description: str       # detailed explanation
-    before: str = ""       # current value (if modifying)
-    after: str = ""        # proposed value
-    confidence: float = 0.7  # 0-1, how sure is the analyzer
-    evidence: list[str] = field(default_factory=list)  # supporting trajectory quotes
-    applied: bool = False
-    applied_at: str = ""
-
-    def summary(self) -> str:
-        stars = "★" * min(int(self.confidence * 5), 5) + "☆" * max(5 - int(self.confidence * 5), 0)
-        return f"[{stars}] [{self.category}] {self.title}"
-
-
-@dataclass
-class ImprovementReport:
-    """Full report from an improvement analysis session."""
-    project_id: str
-    analyzed_at: str = ""
-    proposals: list[Proposal] = field(default_factory=list)
-    lessons_learned: list[str] = field(default_factory=list)
-    stats: dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self):
-        if not self.analyzed_at:
-            self.analyzed_at = datetime.now(timezone.utc).isoformat()
+try:
+    import chromadb
+    from chromadb.config import Settings as ChromaSettings
+    HAS_CHROMA = True
+except ImportError:
+    HAS_CHROMA = False
+    ChromaSettings = None
+    chromadb = None  # type: ignore
 
 
 # ═══════════════════════════════════════════════════════════════
-# Pattern matchers — zero-token trajectory analysis
+# Helpers
 # ═══════════════════════════════════════════════════════════════
 
-_ERROR_PATTERNS = [
-    (r"(?i)(?:error|traceback|exception|failed)\s*[:\-]\s*(.+)", "error"),
-    (r"(?i)(?:bug|issue|problem)\s*(?:#\d+)?[:\-]\s*(.+)", "bug"),
-    (r"(?i)(?:missing|forgot|should have|ought to)\s+(.+)", "oversight"),
-]
-
-_SUCCESS_PATTERNS = [
-    (r"(?i)(?:approved|score:\s*(?:[89]|10)/10|looks good|lgtm)", "high_score"),
-    (r"(?i)(?:elegant|clean|well.structured|idiomatic)", "quality"),
-    (r"(?i)(?:fast|efficient|performant|optimized)", "performance"),
-]
-
-_PROMPT_QUALITY_PATTERNS = [
-    (r"(?i)coder.*(?:understood|correct|accurate)", "coder_understood"),
-    (r"(?i)(?:wrong|misunderstood|off.track|hallucinat)", "coder_misunderstood"),
-    (r"(?i)(?:too verbose|too long|redundant|unnecessary)", "too_verbose"),
-    (r"(?i)(?:concise|precise|exact|spot.on)", "precise"),
-]
+def _get_hermes_home() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+        return get_hermes_home()
+    except ImportError:
+        import os
+        return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
 
 
-@dataclass
-class TrajectoryInsight:
-    text: str
-    category: str    # "error" | "success" | "pattern"
-    source_stage: str
-    confidence: float
-
-
-def _extract_insights(stages: list[Any]) -> list[TrajectoryInsight]:
-    """Zero-token extraction of insights from workflow stages."""
-    insights: list[TrajectoryInsight] = []
-
-    for stage in stages:
-        content = getattr(stage, "content", "")
-        stage_name = getattr(stage, "stage", "unknown")
-        if not content:
-            continue
-
-        # Errors
-        for pattern, label in _ERROR_PATTERNS:
-            for m in re.finditer(pattern, content):
-                insights.append(TrajectoryInsight(
-                    text=m.group(1).strip()[:120],
-                    category=f"error_{label}",
-                    source_stage=stage_name,
-                    confidence=0.8,
-                ))
-
-        # Successes
-        for pattern, label in _SUCCESS_PATTERNS:
-            if re.search(pattern, content):
-                insights.append(TrajectoryInsight(
-                    text=f"Pattern '{label}' detected in {stage_name}",
-                    category=f"success_{label}",
-                    source_stage=stage_name,
-                    confidence=0.6,
-                ))
-
-        # Prompt quality (tester stage only — evaluates coder's understanding)
-        if stage_name == "tester":
-            for pattern, label in _PROMPT_QUALITY_PATTERNS:
-                if re.search(pattern, content):
-                    insights.append(TrajectoryInsight(
-                        text=f"Prompt quality: {label}",
-                        category=f"prompt_{label}",
-                        source_stage=stage_name,
-                        confidence=0.65,
-                    ))
-
-    return insights
+def _improvements_dir(project_id: str) -> Path:
+    return _get_hermes_home() / "projects" / project_id / "state" / "improvements"
 
 
 # ═══════════════════════════════════════════════════════════════
-# SelfImprover
+# Pattern Recognition — heuristic analysis без LLM
 # ═══════════════════════════════════════════════════════════════
 
-class SelfImprover:
-    """Analyze agent trajectories and propose improvements.
+_PATTERNS = {
+    "repeated_error": {
+        "keywords": ["error", "fail", "traceback", "exception", "failed", "ошибка"],
+        "weight": -0.5,
+        "category": "code_restriction",
+        "rule_template": "Avoid: {context}",
+    },
+    "retry_loop": {
+        "keywords": ["retry", "try again", "attempt", "попытка", "повтор"],
+        "weight": -0.3,
+        "category": "custom",
+        "rule_template": "Cache result of: {context}",
+    },
+    "successful_pattern": {
+        "keywords": ["works", "success", "passed", "done", "работает", "готово"],
+        "weight": +0.4,
+        "category": "custom",
+        "rule_template": "Always: {context}",
+    },
+    "tool_choice": {
+        "keywords": ["terminal", "read_file", "write_file", "delegate", "web_search"],
+        "weight": +0.2,
+        "category": "delegate",
+        "rule_template": "Prefer: {context}",
+    },
+    "communication_issue": {
+        "keywords": ["misunderstood", "not what i meant", "wrong", "не то", "неправильно"],
+        "weight": -0.4,
+        "category": "language",
+        "rule_template": "Clarify: {context}",
+    },
+    "performance_issue": {
+        "keywords": ["slow", "timeout", "too long", "медленно", "долго"],
+        "weight": -0.3,
+        "category": "tool_restriction",
+        "rule_template": "Optimize: {context}",
+    },
+}
 
-    Parameters
-    ----------
-    project_id : str
-        The project to improve.
-    hermes_home : Path | None
-        Override Hermes home directory.
+
+def _extract_message_text(messages: list[dict]) -> list[str]:
+    """Extract clean text from conversation messages."""
+    texts = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    texts.append(block.get("text", ""))
+    return texts
+
+
+def _classify_improvement_type(insight_text: str) -> str:
+    """Quick heuristic: what kind of improvement does this insight suggest?"""
+    t = insight_text.lower()
+    if any(w in t for w in ["rule", "правило", "запрет", "restrict", "avoid", "never"]):
+        return "rule"
+    if any(w in t for w in ["prompt", "промпт", "system", "инструкция", "behave", "personality"]):
+        return "prompt"
+    if any(w in t for w in ["skill", "скилл", "workflow", "процедура", "how to", "recipe"]):
+        return "skill"
+    if any(w in t for w in ["tool", "инструмент", "terminal", "delegate", "search"]):
+        return "tool_preference"
+    return "general"
+
+
+def _extract_context_around_match(text: str, keyword: str, window: int = 80) -> str:
+    """Extract ±window chars around a keyword match for context."""
+    idx = text.lower().find(keyword.lower())
+    if idx == -1:
+        return text[:window * 2]
+    start = max(0, idx - window)
+    end = min(len(text), idx + len(keyword) + window)
+    return text[start:end].strip()
+
+
+# ═══════════════════════════════════════════════════════════════
+# ImprovementStore — persistent storage for improvements
+# ═══════════════════════════════════════════════════════════════
+
+class ImprovementStore:
+    """Хранилище улучшений с версионированием.
+
+    Directory layout::
+
+        state/improvements/
+        ├── index.json              # all improvements with metadata
+        ├── rules/
+        │   └── v0001_<hash>.json   # versioned rule sets
+        ├── prompts/
+        │   └── v0001_<hash>.json   # versioned system prompts
+        └── skills/
+            └── v0001_<hash>.md     # versioned skill docs
     """
 
-    def __init__(self, project_id: str, hermes_home: str | Path | None = None):
+    def __init__(self, project_id: str):
         self.project_id = project_id
-        self._home = Path(hermes_home) if hermes_home else self._resolve_home()
-        self._proj_dir = self._home / "projects" / project_id
-        self._improve_dir = self._proj_dir / "state" / "improvements"
-        self._improve_dir.mkdir(parents=True, exist_ok=True)
+        self.root = _improvements_dir(project_id)
+        self.root.mkdir(parents=True, exist_ok=True)
+        for sub in ["rules", "prompts", "skills"]:
+            (self.root / sub).mkdir(exist_ok=True)
+        self._index_path = self.root / "index.json"
+        self._index = self._load_index()
 
-    @staticmethod
-    def _resolve_home() -> Path:
-        try:
-            from hermes_constants import get_hermes_home
-            return get_hermes_home()
-        except ImportError:
-            import os
-            return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    def _load_index(self) -> dict:
+        if self._index_path.exists():
+            try:
+                return json.loads(self._index_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return {"version": 1, "items": [], "counters": {"rules": 0, "prompts": 0, "skills": 0}}
 
-    # ── Main analysis ─────────────────────────────────────
+    def _save_index(self) -> None:
+        self._index_path.parent.mkdir(parents=True, exist_ok=True)
+        self._index_path.write_text(
+            json.dumps(self._index, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
-    def analyze_trajectory(self, workflow_state: Any) -> ImprovementReport:
-        """Analyze a completed workflow and produce improvement proposals.
+    def add_improvement(
+        self,
+        imp_type: str,          # "rule" | "prompt" | "skill" | "general"
+        title: str,
+        content: str,
+        source: str = "auto",   # "auto" | "manual" | "workflow"
+        confidence: float = 0.5,
+    ) -> dict[str, Any]:
+        """Save a new improvement with version tracking."""
+        counter_key = f"{imp_type}s" if imp_type != "general" else "general"
+        self._index.setdefault("counters", {}).setdefault(imp_type, 0)
+        self._index["counters"][imp_type] += 1
+        version = self._index["counters"][imp_type]
+
+        now = datetime.now(timezone.utc).isoformat()
+        item_id = f"imp-{uuid.uuid4().hex[:8]}"
+
+        # Save versioned file
+        fname = f"v{version:04d}_{item_id}.json"
+        fpath = self.root / f"{imp_type}s" / fname
+        record = {
+            "id": item_id,
+            "type": imp_type,
+            "title": title,
+            "content": content,
+            "source": source,
+            "confidence": confidence,
+            "version": version,
+            "created_at": now,
+            "applied": False,
+            "applied_at": None,
+            "rolled_back": False,
+        }
+        fpath.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        # Update index
+        self._index["items"].append({
+            "id": item_id,
+            "type": imp_type,
+            "title": title,
+            "version": version,
+            "created_at": now,
+            "applied": False,
+        })
+        self._index["version"] += 1
+        self._save_index()
+
+        logger.info(f"Improvement saved: {imp_type}/{item_id} — {title}")
+        return record
+
+    def list_improvements(
+        self, imp_type: str | None = None, applied: bool | None = None,
+    ) -> list[dict]:
+        """List improvements, optionally filtered."""
+        items = self._index.get("items", [])
+        if imp_type:
+            items = [i for i in items if i["type"] == imp_type]
+        if applied is not None:
+            items = [i for i in items if i.get("applied") == applied]
+        return sorted(items, key=lambda i: i.get("created_at", ""), reverse=True)
+
+    def mark_applied(self, item_id: str) -> bool:
+        """Mark an improvement as applied."""
+        now = datetime.now(timezone.utc).isoformat()
+        for item in self._index.get("items", []):
+            if item["id"] == item_id:
+                item["applied"] = True
+                item["applied_at"] = now
+                self._save_index()
+                return True
+        return False
+
+    def rollback(self, item_id: str) -> dict | None:
+        """Roll back an applied improvement — mark as rolled back."""
+        for item in self._index.get("items", []):
+            if item["id"] == item_id:
+                item["rolled_back"] = True
+                item["rolled_back_at"] = datetime.now(timezone.utc).isoformat()
+                self._save_index()
+                return item
+        return None
+
+    def get_latest(self, imp_type: str, applied_only: bool = False) -> dict | None:
+        """Get the latest improvement of a given type."""
+        items = self.list_improvements(imp_type=imp_type, applied=applied_only if applied_only else None)
+        # Applied items first, then by version desc
+        if applied_only:
+            return items[0] if items else None
+        # Get latest applied
+        applied = [i for i in items if i.get("applied")]
+        return applied[0] if applied else (items[0] if items else None)
+
+    def get_stats(self) -> dict:
+        """Return improvement statistics for the project."""
+        items = self._index.get("items", [])
+        return {
+            "total": len(items),
+            "applied": sum(1 for i in items if i.get("applied")),
+            "rolled_back": sum(1 for i in items if i.get("rolled_back")),
+            "pending": sum(1 for i in items if not i.get("applied") and not i.get("rolled_back")),
+            "by_type": {
+                t: sum(1 for i in items if i["type"] == t)
+                for t in sorted(set(i["type"] for i in items))
+            },
+            "counters": self._index.get("counters", {}),
+        }
+
+
+# ═══════════════════════════════════════════════════════════════
+# TrajectoryAnalyzer — the core analysis engine
+# ═══════════════════════════════════════════════════════════════
+
+class TrajectoryAnalyzer:
+    """Анализирует trajectory агента и извлекает уроки.
+
+    Работает БЕЗ вызова LLM — чисто эвристический анализ на основе
+    паттернов в тексте сообщений.  Быстро, дёшево, детерминированно.
+
+    Для глубокого семантического анализа можно подключить ChromaDB
+    с эмбеддингами (опционально).
+    """
+
+    def __init__(self, project_id: str):
+        self.project_id = project_id
+        self.store = ImprovementStore(project_id)
+
+    def analyze_messages(
+        self,
+        messages: list[dict],
+        workflow_name: str = "unnamed",
+    ) -> dict[str, Any]:
+        """Analyze a conversation trajectory and return insights.
 
         Parameters
         ----------
-        workflow_state : WorkflowState
-            From ``CodeGenerationWorkflow.state`` after run() completes.
+        messages : list[dict]
+            Conversation messages with 'role' and 'content' keys.
+        workflow_name : str
+            Name of the workflow/research being analyzed.
+
+        Returns
+        -------
+        dict
+            ``insights`` — list of extracted insights
+            ``improvements`` — list of concrete improvement proposals
+            ``stats`` — trajectory statistics
         """
-        stages = getattr(workflow_state, "stages", [])
-        task = getattr(workflow_state, "task", "")
-        score = getattr(workflow_state, "best_score", 0.0)
+        texts = _extract_message_text(messages)
+        if not texts:
+            return {"insights": [], "improvements": [], "stats": {}}
 
-        report = ImprovementReport(project_id=self.project_id)
-        insights = _extract_insights(stages)
+        all_text = "\n".join(texts)
+        insights = []
+        improvements = []
 
-        # ── Generate proposals from insights ───────────────
-        proposals = self._generate_proposals(insights, task, score)
-        report.proposals = proposals
-        report.lessons_learned = [i.text for i in insights[:10]]
-        report.stats = {
-            "stages_analyzed": len(stages),
-            "insights_found": len(insights),
-            "proposals_generated": len(proposals),
-            "task_score": score,
-            "task": task[:80],
+        # ── Pattern matching ──────────────────────────────
+        for pattern_name, pattern in _PATTERNS.items():
+            for kw in pattern["keywords"]:
+                if kw in all_text.lower():
+                    ctx = _extract_context_around_match(all_text, kw)
+                    insight = {
+                        "pattern": pattern_name,
+                        "keyword": kw,
+                        "context": ctx[:200],
+                        "weight": pattern["weight"],
+                        "category": pattern["category"],
+                    }
+                    insights.append(insight)
+                    # Generate improvement proposal for strong signals
+                    if abs(pattern["weight"]) >= 0.3:
+                        rule_text = pattern["rule_template"].format(context=ctx[:100])
+                        improvements.append({
+                            "type": "rule",
+                            "title": f"Pattern: {pattern_name}",
+                            "content": rule_text,
+                            "confidence": abs(pattern["weight"]),
+                            "category": pattern["category"],
+                        })
+                    break  # One match per pattern is enough
+
+        # ── Statistics ────────────────────────────────────
+        tool_calls = sum(1 for t in texts if "Invoking:" in t or "tool_calls" in t.lower())
+        user_messages = sum(1 for m in messages if m.get("role") == "user")
+        assistant_messages = sum(1 for m in messages if m.get("role") == "assistant")
+        total_chars = sum(len(t) for t in texts)
+
+        stats = {
+            "message_count": len(messages),
+            "user_messages": user_messages,
+            "assistant_messages": assistant_messages,
+            "tool_calls_approx": tool_calls,
+            "total_chars": total_chars,
+            "patterns_found": len(insights),
+            "workflow_name": workflow_name,
+            "analyzed_at": datetime.now(timezone.utc).isoformat(),
         }
 
-        # Save report
-        self._save_report(report)
-        return report
+        return {
+            "insights": insights,
+            "improvements": improvements,
+            "stats": stats,
+        }
 
-    def _generate_proposals(
-        self, insights: list[TrajectoryInsight], task: str, score: float,
-    ) -> list[Proposal]:
-        """Convert raw insights into actionable proposals."""
-        proposals: list[Proposal] = []
+    def analyze_and_save(
+        self,
+        messages: list[dict],
+        workflow_name: str = "unnamed",
+        auto_apply: bool = False,
+    ) -> dict[str, Any]:
+        """Analyze trajectory and persist improvement proposals.
 
-        errors = [i for i in insights if i.category.startswith("error_")]
-        successes = [i for i in insights if i.category.startswith("success_")]
-        prompts = [i for i in insights if i.category.startswith("prompt_")]
+        Parameters
+        ----------
+        messages : list[dict]
+            Conversation messages.
+        workflow_name : str
+            Name for this analysis.
+        auto_apply : bool
+            If True, apply high-confidence (≥0.7) improvements automatically.
 
-        # Proposal 1: Add critical rule for repeated errors
-        if len(errors) >= 2:
-            error_texts = [e.text for e in errors[:3]]
-            proposals.append(Proposal(
-                id=_pid(), category="critical_rule",
-                title=f"Add rules for {len(errors)} detected error patterns",
-                description="Repeated errors suggest missing guardrails.",
-                after=f"CRITICAL: Avoid these patterns — {'; '.join(error_texts)}",
-                confidence=0.75,
-                evidence=error_texts[:2],
-            ))
+        Returns
+        -------
+        dict
+            Full analysis result with saved improvement IDs.
+        """
+        result = self.analyze_messages(messages, workflow_name)
 
-        # Proposal 2: Reward successful patterns
-        if successes and score >= 8:
-            proposals.append(Proposal(
-                id=_pid(), category="critical_rule",
-                title="Reinforce successful patterns",
-                description="The agent produced high-quality output using these approaches.",
-                after=f"PREFER: {successes[0].text}",
-                confidence=0.7,
-                evidence=[s.text for s in successes[:2]],
-            ))
+        saved_ids = []
+        for imp in result["improvements"]:
+            record = self.store.add_improvement(
+                imp_type=imp["type"],
+                title=imp["title"],
+                content=imp["content"],
+                source="auto",
+                confidence=imp["confidence"],
+            )
+            saved_ids.append(record["id"])
+            imp["saved_id"] = record["id"]
 
-        # Proposal 3: Prompt improvements if coder misunderstood
-        misunderstood = [p for p in prompts if "misunderstood" in p.category]
-        if misunderstood:
-            proposals.append(Proposal(
-                id=_pid(), category="system_prompt",
-                title="Improve coder prompt for better understanding",
-                description="Coder sometimes misunderstood the task. "
-                            "Adding clarification rules may help.",
-                after=(
-                    "When the task is ambiguous, ask ONE clarifying question "
-                    "before generating code. Do not assume."
-                ),
-                confidence=0.65,
-                evidence=[m.text for m in misunderstood[:2]],
-            ))
+            # Auto-apply high-confidence rules
+            if auto_apply and imp["confidence"] >= 0.7 and imp["type"] == "rule":
+                self.store.mark_applied(record["id"])
+                imp["auto_applied"] = True
 
-        # Proposal 4: Skill suggestion for repeated task types
-        if score >= 7 and "API" in task.upper():
-            proposals.append(Proposal(
-                id=_pid(), category="skill",
-                title="Create a reusable skill for API development",
-                description="High-scoring API tasks suggest this is a common pattern. "
-                            "Save as a skill for faster future iterations.",
-                after=f"Skill: api-development — covers {task[:60]}",
-                confidence=0.6,
-            ))
+        # ── Save summary to ChromaDB for semantic recall ──
+        self._save_to_chroma(result, workflow_name)
 
-        # Proposal 5: Tool usage suggestion based on task content
-        if re.search(r"(?i)(?:test|pytest|unittest|spec)", task):
-            proposals.append(Proposal(
-                id=_pid(), category="tool_usage",
-                title="Use test-driven workflow for test-heavy tasks",
-                description="Task mentions testing — TDD approach may yield better results.",
-                after="Run /orchestrate --team advanced for test-heavy tasks",
-                confidence=0.55,
-            ))
+        result["saved_improvement_ids"] = saved_ids
+        result["store_stats"] = self.store.get_stats()
+        return result
 
-        return proposals
+    def _save_to_chroma(self, result: dict, workflow_name: str) -> bool:
+        """Save analysis summary to ChromaDB for future semantic recall."""
+        if not HAS_CHROMA:
+            return False
+        try:
+            from projects.project_manager import ProjectManager
+            pm = ProjectManager()
+            chroma_dir = pm.subdir_memory(self.project_id)
+            client = chromadb.PersistentClient(
+                path=str(chroma_dir),
+                settings=ChromaSettings(anonymized_telemetry=False),
+            )
+            coll_name = f"project_{self.project_id}_improvements"
+            coll = client.get_or_create_collection(
+                name=coll_name,
+                metadata={"hnsw:space": "cosine"},
+            )
 
-    # ── Apply ─────────────────────────────────────────────
+            summary = json.dumps({
+                "workflow": workflow_name,
+                "patterns": [i["pattern"] for i in result["insights"]],
+                "improvement_count": len(result["improvements"]),
+                "stats": result["stats"],
+            }, ensure_ascii=False)
 
-    def apply(self, proposal: Proposal) -> bool:
-        """Apply an approved proposal. Versions the previous state."""
-        if proposal.applied:
+            doc_id = f"analysis-{int(time.time())}-{uuid.uuid4().hex[:6]}"
+            coll.add(
+                ids=[doc_id],
+                documents=[summary],
+                metadatas=[{
+                    "workflow": workflow_name,
+                    "timestamp": time.time(),
+                    "improvement_count": len(result["improvements"]),
+                }],
+            )
+            return True
+        except Exception as e:
+            logger.debug(f"ChromaDB save skipped: {e}")
             return False
 
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-        if proposal.category == "critical_rule":
-            self._version_and_apply("critical_rules", proposal.after, ts)
-        elif proposal.category == "system_prompt":
-            self._version_and_apply("system_prompt_additions", proposal.after, ts)
-        elif proposal.category == "skill":
-            self._save_skill_suggestion(proposal, ts)
-        elif proposal.category == "tool_usage":
-            self._save_tool_pattern(proposal, ts)
-
-        proposal.applied = True
-        proposal.applied_at = datetime.now(timezone.utc).isoformat()
-        return True
-
-    def _version_and_apply(self, key: str, value: str, ts: str) -> None:
-        """Save current version, then write new value."""
-        current_file = self._improve_dir / f"{key}.json"
-        versions_dir = self._improve_dir / "versions"
-        versions_dir.mkdir(exist_ok=True)
-
-        # Version the current state
-        if current_file.exists():
-            import shutil
-            shutil.copy2(current_file, versions_dir / f"{key}_{ts}.json")
-
-        # Write new
-        data = {"value": value, "updated_at": ts, "applied": True}
-        current_file.write_text(json.dumps(data, indent=2, ensure_ascii=False))
-
-    def _save_skill_suggestion(self, proposal: Proposal, ts: str) -> None:
-        skills_file = self._improve_dir / "suggested_skills.jsonl"
-        entry = {
-            "title": proposal.title,
-            "description": proposal.description,
-            "content": proposal.after,
-            "confidence": proposal.confidence,
-            "suggested_at": ts,
-        }
-        with open(skills_file, "a") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-
-    def _save_tool_pattern(self, proposal: Proposal, ts: str) -> None:
-        tools_file = self._improve_dir / "tool_patterns.jsonl"
-        entry = {
-            "pattern": proposal.after,
-            "description": proposal.description,
-            "confidence": proposal.confidence,
-            "suggested_at": ts,
-        }
-        with open(tools_file, "a") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-
-    # ── History ───────────────────────────────────────────
-
-    def list_improvements(self, limit: int = 10) -> list[dict]:
-        """List applied improvements."""
-        results = []
-        for f in sorted(self._improve_dir.glob("*.json"), reverse=True):
-            try:
-                data = json.loads(f.read_text())
-                data["source_file"] = f.name
-                results.append(data)
-            except Exception:
-                pass
-        return results[:limit]
-
-    def list_pending_proposals(self) -> list[Proposal]:
-        """List proposals from the most recent report that haven't been applied."""
-        reports = sorted(
-            self._improve_dir.glob("report_*.json"), reverse=True,
-        )
-        if not reports:
+    def recall_similar(self, query: str, n_results: int = 3) -> list[dict]:
+        """Semantic recall: find similar past improvements."""
+        if not HAS_CHROMA:
             return []
         try:
-            data = json.loads(reports[0].read_text())
-            return [
-                Proposal(**p) for p in data.get("proposals", [])
-                if not p.get("applied")
-            ]
-        except Exception:
+            from projects.project_manager import ProjectManager
+            pm = ProjectManager()
+            chroma_dir = pm.subdir_memory(self.project_id)
+            if not (chroma_dir / "chroma.sqlite3").exists():
+                return []
+
+            client = chromadb.PersistentClient(
+                path=str(chroma_dir),
+                settings=ChromaSettings(anonymized_telemetry=False),
+            )
+            coll_name = f"project_{self.project_id}_improvements"
+
+            try:
+                coll = client.get_collection(name=coll_name)
+            except Exception:
+                return []
+
+            results = coll.query(query_texts=[query], n_results=n_results)
+            if not results.get("ids") or not results["ids"][0]:
+                return []
+
+            items = []
+            for i, doc_id in enumerate(results["ids"][0]):
+                doc = results["documents"][0][i] if results.get("documents") else ""
+                meta = results["metadatas"][0][i] if results.get("metadatas") else {}
+                items.append({
+                    "id": doc_id,
+                    "text": (doc or "")[:300],
+                    "metadata": meta,
+                })
+            return items
+        except Exception as e:
+            logger.debug(f"Recall failed: {e}")
             return []
 
-    # ── Persistence ───────────────────────────────────────
+    def generate_improvement_report(self) -> str:
+        """Generate a human-readable improvement report for the project."""
+        stats = self.store.get_stats()
+        pending = self.store.list_improvements(applied=False)
 
-    def _save_report(self, report: ImprovementReport) -> None:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = self._improve_dir / f"report_{ts}.json"
-        data = {
-            "project_id": report.project_id,
-            "analyzed_at": report.analyzed_at,
-            "lessons_learned": report.lessons_learned,
-            "stats": report.stats,
-            "proposals": [
-                {
-                    "id": p.id, "category": p.category,
-                    "title": p.title, "description": p.description,
-                    "after": p.after, "confidence": p.confidence,
-                    "evidence": p.evidence, "applied": p.applied,
-                    "applied_at": p.applied_at,
-                }
-                for p in report.proposals
-            ],
-        }
-        path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
-        logger.info(f"Improvement report saved → {path}")
+        lines = [
+            "=" * 60,
+            f"Self-Improvement Report — {self.project_id}",
+            "=" * 60,
+            "",
+            f"Total improvements:  {stats['total']}",
+            f"  Applied:           {stats['applied']}",
+            f"  Rolled back:       {stats['rolled_back']}",
+            f"  Pending review:    {stats['pending']}",
+            "",
+        ]
 
+        if stats["by_type"]:
+            lines.append("By type:")
+            for t, count in stats["by_type"].items():
+                lines.append(f"  {t}: {count}")
+            lines.append("")
 
-# ── Helpers ────────────────────────────────────────────────
+        if pending:
+            lines.append(f"Pending improvements ({len(pending)}):")
+            lines.append("-" * 40)
+            for p in pending[:10]:
+                lines.append(f"  [{p['type']}] {p['title']}")
+                lines.append(f"    id: {p['id']}  v{p['version']}  {p['created_at'][:19]}")
+            lines.append("")
+            lines.append("  Use /improve apply <id> to activate.")
+            lines.append("  Use /improve rollback <id> to revert.")
 
-def _pid() -> str:
-    import uuid
-    return f"prop_{uuid.uuid4().hex[:8]}"
+        lines.append("")
+        lines.append("=" * 60)
+        return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════════
-# Module-level API
+# Module-level convenience
 # ═══════════════════════════════════════════════════════════════
 
-def analyze_and_propose(workflow_state: Any) -> ImprovementReport | None:
-    """Run self-improvement analysis on a completed workflow."""
-    try:
-        from projects.project_context import get_current_project_id
-        pid = get_current_project_id()
-        if not pid:
-            return None
-        si = SelfImprover(pid)
-        return si.analyze_trajectory(workflow_state)
-    except Exception as e:
-        logger.warning(f"Self-improvement analysis failed: {e}")
-        return None
+def analyze_project_trajectory(
+    project_id: str,
+    messages: list[dict],
+    workflow_name: str = "unnamed",
+    auto_apply: bool = False,
+) -> dict[str, Any]:
+    """One-shot: analyze trajectory for a project."""
+    analyzer = TrajectoryAnalyzer(project_id)
+    return analyzer.analyze_and_save(messages, workflow_name, auto_apply=auto_apply)
 
 
-def force_improve_analysis() -> ImprovementReport | None:
-    """Run improvement analysis on the current project (no workflow required).
-    Uses the most recent workflow data if available.
-    """
-    try:
-        from projects.project_context import get_current_project_id
-        pid = get_current_project_id()
-        if not pid:
-            return None
-        si = SelfImprover(pid)
+def get_improvement_report(project_id: str) -> str:
+    """Get a human-readable improvement report."""
+    analyzer = TrajectoryAnalyzer(project_id)
+    return analyzer.generate_improvement_report()
 
-        # Try to load most recent workflow state
-        latest = si._improve_dir.parent / "workflows" / "snapshot.json"
-        if latest.exists():
-            data = json.loads(latest.read_text())
-            from code_workflow import WorkflowState
-            wf = WorkflowState(
-                task_id=data.get("task_id", "unknown"),
-                task=data.get("task", "no task"),
-                status="completed",
-                best_score=data.get("best_score", 0),
-                stages=[],  # simplified
-            )
-            return si.analyze_trajectory(wf)
-        return None
-    except Exception as e:
-        logger.warning(f"Force improve failed: {e}")
-        return None
+
+def get_improvement_store(project_id: str) -> ImprovementStore:
+    """Get the improvement store for a project."""
+    return ImprovementStore(project_id)

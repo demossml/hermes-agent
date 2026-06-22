@@ -7932,7 +7932,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_workflow_action(cmd_original, "edit")
         elif canonical in ("insight", "insights"):
             self._handle_insights(cmd_original)
-        elif canonical == "improve":
+        elif canonical in ("improve", "impr"):
             self._handle_improve(cmd_original)
         elif canonical == "agent-off":
             self._handle_agent_off()
@@ -9512,83 +9512,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _cprint(f"\n  /insight add \"text\"  — добавить знание")
             _cprint(f"  /insights <query>    — поиск по инсайтам")
 
-    def _handle_improve(self, cmd: str):
-        """/improve [apply <id>|history] — self-improvement analysis."""
-        from projects.self_improve import (
-            SelfImprover, force_improve_analysis, analyze_and_propose,
-        )
-        from projects.project_context import get_current_project_id
-        from code_workflow import get_active_workflow
-
-        pid = get_current_project_id()
-        if not pid:
-            _cprint("  [red]No active project.[/]")
-            return
-
-        parts = cmd.split(None, 2)
-        action = parts[1] if len(parts) > 1 else "analyze"
-        si = SelfImprover(pid)
-
-        if action == "history":
-            items = si.list_improvements(limit=10)
-            if items:
-                _cprint(f"\n  [bold]📈 Improvement History[/]")
-                for item in items:
-                    src = item.get("source_file", "?")
-                    when = item.get("updated_at", "?")[:19]
-                    val = str(item.get("value", ""))[:80]
-                    _cprint(f"  [dim]{when}[/] {src}: {val}")
-            else:
-                _cprint("  [dim]No improvements applied yet.[/]")
-            return
-
-        if action == "apply":
-            prop_id = parts[2] if len(parts) > 2 else ""
-            pending = si.list_pending_proposals()
-            for p in pending:
-                if p.id == prop_id:
-                    si.apply(p)
-                    _cprint(f"\n  [bold green]✓ Applied:[/] {p.title}")
-                    return
-            _cprint(f"  [red]Proposal '{prop_id}' not found.[/]")
-            _cprint(f"  Use /improve to see pending proposals.")
-            return
-
-        # ── Run analysis ──────────────────────────────────
-        _cprint(f"\n  [bold]🔍 Self-Improvement Analysis[/]")
-        _cprint(f"  Project: {pid}")
-
-        # Try live workflow first
-        wf = get_active_workflow()
-        report = None
-        if wf and wf.state.status == "completed":
-            _cprint(f"  Source: completed workflow ({wf.state.best_score:.0f}/10)")
-            report = analyze_and_propose(wf.state)
-        else:
-            _cprint(f"  Source: historical data")
-            report = force_improve_analysis()
-
-        if not report or not report.proposals:
-            _cprint(f"\n  [dim]No improvement proposals found.[/]")
-            _cprint(f"  Complete a workflow first: /orchestrate \"task\"")
-            return
-
-        # Show proposals
-        _cprint(f"\n  [bold]💡 {len(report.proposals)} Proposal(s)[/]")
-        _cprint(f"  {'─' * 50}")
-        for i, p in enumerate(report.proposals):
-            _cprint(f"  {p.summary()}")
-            _cprint(f"    {p.description[:100]}")
-            if p.after:
-                _cprint(f"    → [bold]{p.after[:100]}[/]")
-            _cprint(f"    /improve apply {p.id}  — применить")
-            _cprint("")
-
-        if report.lessons_learned:
-            _cprint(f"  [bold]📝 Lessons learned ({len(report.lessons_learned)}):[/]")
-            for ll in report.lessons_learned[:5]:
-                _cprint(f"    • {ll[:100]}")
-
     def _handle_agent_off(self):
         """Return to main agent from sub-agent mode."""
         global _active_subagent
@@ -10407,6 +10330,166 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         """Handle /projects — list all projects (convenience alias)."""
         from projects.project_context import get_project_context
         self._project_list(get_project_context())
+
+    def _handle_improve(self, cmd: str):
+        """Handle /improve — self-improvement loop for the active project.
+
+        Subcommands:
+          /improve                  — analyze current conversation & show report
+          /improve report           — show improvement report for active project
+          /improve apply <id>       — apply a pending improvement
+          /improve rollback <id>    — roll back an applied improvement
+          /improve list [pending|applied|all]  — list improvements
+          /improve stats            — show improvement statistics
+        """
+        from projects.project_context import get_current_project_id, get_current_project_name
+        from projects.self_improve import TrajectoryAnalyzer, ImprovementStore
+
+        pid = get_current_project_id()
+        if not pid:
+            _cprint("\n  [red]No active project.[/] Use /project switch first.")
+            _cprint("  Self-improvement only works within a project context.")
+            return
+
+        parts = cmd.strip().split(None, 1)
+        args = parts[1].strip() if len(parts) > 1 else ""
+
+        if not args:
+            # Default: analyze current conversation
+            self._improve_analyze_current(pid)
+            return
+
+        argv = args.split(None, 1)
+        action = argv[0].lower()
+        rest = argv[1] if len(argv) > 1 else ""
+
+        store = ImprovementStore(pid)
+
+        if action in ("report", "rep"):
+            self._improve_report(pid)
+        elif action in ("apply", "app"):
+            self._improve_apply(store, rest)
+        elif action in ("rollback", "rb", "revert"):
+            self._improve_rollback(store, rest)
+        elif action in ("list", "ls"):
+            self._improve_list(store, rest)
+        elif action in ("stats", "stat"):
+            self._improve_stats(store)
+        elif action in ("analyze", "run"):
+            self._improve_analyze_current(pid)
+        else:
+            _cprint(f"\n  [red]Unknown subcommand:[/] {action}")
+            _cprint("  Usage: /improve [report|apply|rollback|list|stats|analyze]")
+
+    def _improve_analyze_current(self, pid: str):
+        """Analyze the current conversation trajectory."""
+        from projects.self_improve import TrajectoryAnalyzer
+
+        # Use self.conversation_history if available
+        messages = getattr(self, "conversation_history", None) or []
+        if len(messages) < 3:
+            _cprint("\n  [dim]Not enough conversation history to analyze (need ≥3 messages).[/]")
+            _cprint("  Keep working, then run /improve again.")
+            return
+
+        _cprint(f"\n  🔍 [bold]Analyzing trajectory[/] ({len(messages)} messages)...")
+        analyzer = TrajectoryAnalyzer(pid)
+        result = analyzer.analyze_and_save(messages, workflow_name="manual-analysis")
+
+        stats = result["stats"]
+        insights = result["insights"]
+        improvements = result["improvements"]
+
+        _cprint(f"  ✓ {stats['patterns_found']} patterns detected")
+        _cprint(f"  ✓ {len(improvements)} improvement proposals generated")
+        _cprint(f"  ✓ {len(result.get('saved_improvement_ids', []))} saved to store")
+
+        if insights:
+            _cprint(f"\n  [bold]Insights found:[/]")
+            for ins in insights[:5]:
+                icon = "✅" if ins["weight"] > 0 else "⚠️"
+                _cprint(f"  {icon} [{ins['pattern']}] {ins['context'][:100]}...")
+
+        if improvements:
+            _cprint(f"\n  [bold]Proposed improvements:[/]")
+            for imp in improvements[:5]:
+                applied = " [green]AUTO-APPLIED[/]" if imp.get("auto_applied") else ""
+                _cprint(f"  📌 [{imp['type']}] {imp['title']}{applied}")
+                _cprint(f"     {imp['content'][:120]}")
+
+        if not improvements:
+            _cprint(f"\n  [dim]No actionable improvements found. Agents are doing well![/]")
+        else:
+            _cprint(f"\n  Use [bold]/improve apply <id>[/] to activate an improvement.")
+            _cprint(f"  Use [bold]/improve report[/] for full overview.")
+
+    def _improve_report(self, pid: str):
+        """Show the improvement report."""
+        from projects.self_improve import get_improvement_report
+        report = get_improvement_report(pid)
+        _cprint(f"\n{report}")
+
+    def _improve_apply(self, store, item_id: str):
+        """Apply a pending improvement."""
+        item_id = item_id.strip()
+        if not item_id:
+            _cprint("  [red]Usage:[/] /improve apply <improvement_id>")
+            return
+        if store.mark_applied(item_id):
+            _cprint(f"  [bold green]✓ Applied:[/] {item_id}")
+        else:
+            _cprint(f"  [red]Not found:[/] {item_id}")
+
+    def _improve_rollback(self, store, item_id: str):
+        """Roll back an applied improvement."""
+        item_id = item_id.strip()
+        if not item_id:
+            _cprint("  [red]Usage:[/] /improve rollback <improvement_id>")
+            return
+        if store.rollback(item_id):
+            _cprint(f"  [bold yellow]↩ Rolled back:[/] {item_id}")
+        else:
+            _cprint(f"  [red]Not found:[/] {item_id}")
+
+    def _improve_list(self, store, filter_str: str):
+        """List improvements with optional filter."""
+        filters = {"pending": False, "applied": True, "all": None}
+        applied_filter = filters.get(filter_str.strip().lower(), None)
+        items = store.list_improvements(applied=applied_filter)
+
+        if not items:
+            _cprint(f"\n  [dim]No improvements yet.[/]")
+            _cprint("  Run /improve to analyze and generate proposals.")
+            return
+
+        label = f"Improvements ({len(items)})"
+        if filter_str:
+            label += f" [dim][{filter_str}][/]"
+        _cprint(f"\n  [bold]{label}:[/]")
+        _cprint("  " + "─" * 60)
+        for item in items:
+            status = "[green]✓ applied[/]" if item.get("applied") else (
+                "[yellow]↩ rolled back[/]" if item.get("rolled_back") else "[dim]pending[/]"
+            )
+            _cprint(
+                f"  [{item['type']:8s}] {item['title'][:40]:40s} "
+                f"v{item['version']}  {status}  {item.get('created_at', '')[:19]}"
+            )
+            _cprint(f"           id: {item['id']}")
+        _cprint("  " + "─" * 60)
+
+    def _improve_stats(self, store):
+        """Show improvement statistics."""
+        stats = store.get_stats()
+        _cprint(f"\n  [bold]Improvement Statistics:[/]")
+        _cprint(f"    Total:        {stats['total']}")
+        _cprint(f"    Applied:      {stats['applied']}")
+        _cprint(f"    Rolled back:  {stats['rolled_back']}")
+        _cprint(f"    Pending:      {stats['pending']}")
+        if stats["by_type"]:
+            _cprint(f"    By type:")
+            for t, c in stats["by_type"].items():
+                _cprint(f"      {t}: {c}")
 
     def _project_show_artifacts(self, ctx, rest: str):
         """/project show [recent_code] — show project artifacts."""
