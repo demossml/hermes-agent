@@ -427,6 +427,201 @@ class _PlaywrightManager:
             self._active_index = len(self._pages) - 1
         return {"closed": True, "remaining": len(self._pages), "active_tab": self._active_index}
 
+    # ── High-level testing commands ────────────────────────
+
+    def test_page(self, url: str, timeout_ms: int = PAGE_NAV_TIMEOUT_MS) -> dict:
+        """Open page + screenshot + console errors → comprehensive summary."""
+        result = self.open_page(url, timeout_ms=timeout_ms)
+        if result.get("navigation_errors"):
+            return result  # don't screenshot on nav failure
+
+        screenshot_path = ""
+        try:
+            screenshot_path = self.screenshot(full_page=True)
+        except Exception as e:
+            result.setdefault("navigation_errors", []).append(f"Screenshot error: {e}")
+
+        # Count errors by type
+        error_count = sum(1 for log in self._console_logs if log["type"] == "error")
+        warning_count = sum(1 for log in self._console_logs if log["type"] == "warning")
+
+        # Meta tags
+        meta_tags = {}
+        try:
+            page = self.page
+            if page:
+                metas = page.evaluate("""() => {
+                    const tags = {};
+                    document.querySelectorAll('meta').forEach(m => {
+                        const name = m.getAttribute('name') || m.getAttribute('property') || '';
+                        if (name) tags[name] = m.getAttribute('content') || '';
+                    });
+                    return tags;
+                }""")
+                meta_tags = metas or {}
+        except Exception:
+            pass
+
+        result["screenshot_path"] = screenshot_path
+        result["error_count"] = error_count
+        result["warning_count"] = warning_count
+        result["meta_tags"] = meta_tags
+        result["tested_at"] = time.time()
+        return result
+
+    def wait_for_selector(self, selector: str, timeout_sec: float = 10.0) -> dict:
+        """Wait for a CSS selector to appear on the page."""
+        self._check_crash()
+        page = self.page
+        if page is None:
+            return {"error": "No page open"}
+        self._last_activity = time.time()
+        timeout_ms = int(timeout_sec * 1000)
+        try:
+            page.wait_for_selector(selector, timeout=timeout_ms, state="visible")
+            return {"found": True, "selector": selector, "timeout_sec": timeout_sec}
+        except Exception as e:
+            return {"found": False, "selector": selector, "error": str(e)[:200]}
+
+    def click_and_wait(self, selector: str, timeout_sec: float = 10.0) -> dict:
+        """Click an element and wait for navigation/load."""
+        self._check_crash()
+        page = self.page
+        if page is None:
+            return {"error": "No page open"}
+        self._last_activity = time.time()
+        timeout_ms = int(timeout_sec * 1000)
+
+        try:
+            # Click with navigation detection
+            with page.expect_navigation(timeout=timeout_ms, wait_until="domcontentloaded"):
+                page.click(selector, timeout=timeout_ms)
+            title = page.title()
+            return {
+                "clicked": True,
+                "selector": selector,
+                "new_url": page.url,
+                "new_title": title,
+            }
+        except Exception as e:
+            # Try plain click (no navigation happened)
+            try:
+                page.click(selector, timeout=timeout_ms)
+                page.wait_for_timeout(500)
+                return {
+                    "clicked": True,
+                    "selector": selector,
+                    "url": page.url,
+                    "title": page.title(),
+                    "note": "No navigation detected",
+                }
+            except Exception as e2:
+                return {"clicked": False, "selector": selector, "error": str(e2)[:200]}
+
+    def fill_form(self, data: dict) -> dict:
+        """Fill form fields from a {selector: value} dict.
+
+        Example:
+            fill_form({"input[name='email']": "test@test.com", "#password": "secret"})
+        """
+        self._check_crash()
+        page = self.page
+        if page is None:
+            return {"error": "No page open"}
+        self._last_activity = time.time()
+
+        filled = {}
+        errors = {}
+        for selector, value in data.items():
+            try:
+                page.fill(selector, str(value), timeout=5000)
+                filled[selector] = True
+            except Exception as e:
+                filled[selector] = False
+                errors[selector] = str(e)[:100]
+
+        return {
+            "filled": len([v for v in filled.values() if v]),
+            "total": len(data),
+            "details": filled,
+            "errors": errors if errors else None,
+        }
+
+    def get_page_info(self) -> dict:
+        """Comprehensive page diagnostics: title, url, meta, console, performance."""
+        self._check_crash()
+        page = self.page
+        if page is None:
+            return {"error": "No page open"}
+        self._last_activity = time.time()
+
+        info: dict = {"url": page.url, "title": ""}
+        try:
+            info["title"] = page.title()
+        except Exception:
+            pass
+
+        # Meta tags
+        try:
+            info["meta"] = page.evaluate("""() => {
+                const tags = {};
+                document.querySelectorAll('meta').forEach(m => {
+                    const n = m.getAttribute('name') || m.getAttribute('property') || m.getAttribute('charset') || '';
+                    if (n) tags[n] = m.getAttribute('content') || m.getAttribute('charset') || '';
+                });
+                return tags;
+            }""")
+        except Exception:
+            info["meta"] = {}
+
+        # Content stats
+        try:
+            info["content_stats"] = page.evaluate("""() => ({
+                textLength: (document.body?.innerText || '').length,
+                links: document.querySelectorAll('a').length,
+                images: document.querySelectorAll('img').length,
+                scripts: document.querySelectorAll('script').length,
+                forms: document.querySelectorAll('form').length,
+            })""")
+        except Exception:
+            info["content_stats"] = {}
+
+        # Console summary
+        errors = [log for log in self._console_logs if log["type"] == "error"]
+        warnings = [log for log in self._console_logs if log["type"] == "warning"]
+        info["console_summary"] = {
+            "errors": len(errors),
+            "warnings": len(warnings),
+            "total_logs": len(self._console_logs),
+            "last_error": errors[-1]["text"][:200] if errors else None,
+        }
+
+        return info
+
+    def scroll_to_bottom(self) -> dict:
+        """Scroll to the bottom of the page (useful for lazy-loaded content)."""
+        self._check_crash()
+        page = self.page
+        if page is None:
+            return {"error": "No page open"}
+        self._last_activity = time.time()
+
+        prev_height = 0
+        scrolls = 0
+        try:
+            for _ in range(20):  # max 20 scrolls
+                height = page.evaluate("document.body.scrollHeight")
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(300)
+                scrolls += 1
+                if height == prev_height:
+                    break
+                prev_height = height
+        except Exception as e:
+            return {"scrolled": scrolls, "final_height": prev_height, "error": str(e)[:100]}
+
+        return {"scrolled": True, "scroll_steps": scrolls, "final_height_px": prev_height}
+
     # ── Idle watchdog ────────────────────────────────────
 
     def _start_watchdog(self) -> None:
@@ -586,6 +781,48 @@ def pw_browser_close(task_id: str = "") -> str:
         return json.dumps({"error": str(e)})
 
 
+# ── High-level testing commands ────────────────────────
+
+def browser_test_page(url: str, timeout: int = PAGE_NAV_TIMEOUT_MS, task_id: str = "") -> str:
+    """Open page + full screenshot + console errors → comprehensive test summary."""
+    mgr = _PlaywrightManager.get()
+    return _safe_call(mgr.test_page, url, timeout_ms=timeout)
+
+
+def browser_wait_for_selector(selector: str, timeout: int = 10, task_id: str = "") -> str:
+    """Wait for a CSS selector to become visible. Returns found/not-found."""
+    mgr = _PlaywrightManager.get()
+    return _safe_call(mgr.wait_for_selector, selector, timeout_sec=float(timeout))
+
+
+def browser_click_and_wait(selector: str, timeout: int = 10, task_id: str = "") -> str:
+    """Click element + wait for navigation/load. Returns new URL and title."""
+    mgr = _PlaywrightManager.get()
+    return _safe_call(mgr.click_and_wait, selector, timeout_sec=float(timeout))
+
+
+def browser_fill_form(data_json: str, task_id: str = "") -> str:
+    """Fill form fields from JSON: '{"selector": "value", ...}'."""
+    mgr = _PlaywrightManager.get()
+    try:
+        data = json.loads(data_json) if isinstance(data_json, str) else data_json
+    except json.JSONDecodeError:
+        return json.dumps({"error": "Invalid JSON: " + data_json[:100]})
+    return _safe_call(mgr.fill_form, data)
+
+
+def browser_get_page_info(task_id: str = "") -> str:
+    """Comprehensive page diagnostics: title, URL, meta tags, content stats, console summary."""
+    mgr = _PlaywrightManager.get()
+    return _safe_call(mgr.get_page_info)
+
+
+def browser_scroll_to_bottom(task_id: str = "") -> str:
+    """Scroll to page bottom (for lazy-loaded content). Returns scroll count + final height."""
+    mgr = _PlaywrightManager.get()
+    return _safe_call(mgr.scroll_to_bottom)
+
+
 # ═══════════════════════════════════════════════════════════════
 # Requirements
 # ═══════════════════════════════════════════════════════════════
@@ -725,6 +962,64 @@ _PW_SCHEMAS = {
         "description": "Close browser + all pages. Also registered as atexit handler.",
         "parameters": {"type": "object", "properties": {}},
     },
+    # ── High-level testing ────────────────────────────
+    "browser_test_page": {
+        "name": "browser_test_page",
+        "description": "Open page + full screenshot + console errors + meta tags. Returns comprehensive test summary with title, status, error_count, warning_count, screenshot_path, and meta_tags.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL to test"},
+                "timeout": {"type": "integer", "description": "Navigation timeout ms (default 30000)", "default": 30000},
+            },
+            "required": ["url"],
+        },
+    },
+    "browser_wait_for_selector": {
+        "name": "browser_wait_for_selector",
+        "description": "Wait for a CSS selector to become visible on the page. Use before interacting with dynamically loaded elements.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "selector": {"type": "string", "description": "CSS selector to wait for (e.g., '#results', '.loaded')"},
+                "timeout": {"type": "integer", "description": "Max wait in seconds (default 10)", "default": 10},
+            },
+            "required": ["selector"],
+        },
+    },
+    "browser_click_and_wait": {
+        "name": "browser_click_and_wait",
+        "description": "Click an element and intelligently wait for navigation or page load. Returns new URL and title after click.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "selector": {"type": "string", "description": "CSS selector to click (e.g., 'button[type=submit]')"},
+                "timeout": {"type": "integer", "description": "Max wait in seconds (default 10)", "default": 10},
+            },
+            "required": ["selector"],
+        },
+    },
+    "browser_fill_form": {
+        "name": "browser_fill_form",
+        "description": "Fill multiple form fields at once. Pass JSON: '{\"input[name=email]\": \"test@test.com\", \"#password\": \"secret\"}'. Returns filled/total count and per-field status.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "data_json": {"type": "string", "description": "JSON string mapping CSS selectors to values"},
+            },
+            "required": ["data_json"],
+        },
+    },
+    "browser_get_page_info": {
+        "name": "browser_get_page_info",
+        "description": "Comprehensive page diagnostics: title, URL, meta tags (description, keywords, og:*), content stats (links, images, scripts, forms count), and console error/warning summary.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    "browser_scroll_to_bottom": {
+        "name": "browser_scroll_to_bottom",
+        "description": "Scroll to the bottom of the page. Useful for triggering lazy-loaded content or infinite scroll. Returns scroll steps and final page height in pixels.",
+        "parameters": {"type": "object", "properties": {}},
+    },
 }
 
 _FN_MAP = {
@@ -739,6 +1034,13 @@ _FN_MAP = {
     "pw_browser_switch_tab": pw_browser_switch_tab,
     "pw_browser_close_tab": pw_browser_close_tab,
     "pw_browser_close": pw_browser_close,
+    # High-level testing
+    "browser_test_page": browser_test_page,
+    "browser_wait_for_selector": browser_wait_for_selector,
+    "browser_click_and_wait": browser_click_and_wait,
+    "browser_fill_form": browser_fill_form,
+    "browser_get_page_info": browser_get_page_info,
+    "browser_scroll_to_bottom": browser_scroll_to_bottom,
 }
 
 for _name, _fn in _FN_MAP.items():
