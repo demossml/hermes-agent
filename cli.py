@@ -9606,39 +9606,53 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
     def _handle_insights(self, cmd: str):
         """/insights — show project insights. /insight add <text> — add one."""
-        from projects.project_context import get_current_project_id
-        from projects.project_manager import ProjectManager
+        from projects.project_insights import (
+            get_project_insights, add_insight, search_insights,
+        )
 
-        pid = get_current_project_id()
-        if not pid:
-            _cprint("  [red]No active project.[/] Use /project switch first.")
-            return
-
-        pm = ProjectManager()
         parts = cmd.strip().split()
+        action = parts[1].lower() if len(parts) > 1 else "list"
 
-        if len(parts) >= 2 and parts[1] == "add":
-            text = " ".join(parts[2:])
-            if not text.strip():
+        if action == "add":
+            text = " ".join(parts[2:]).strip().strip('"').strip("'")
+            if not text:
                 _cprint("  [red]Usage: /insight add <text>[/]")
                 return
-            doc_id = pm.add_insight(pid, text, importance=0.7, source="manual")
-            if doc_id:
+            iid = add_insight(text, importance=7)
+            if iid:
                 _cprint(f"  ✅ Insight added: {text[:80]}...")
             else:
-                _cprint("  [red]Failed to add insight (ChromaDB may not be available)[/]")
-        elif len(parts) >= 2 and parts[1] == "clear":
-            _cprint("  [yellow]Use /project delete to remove a project.[/] "
-                      "Insights are scoped to the project.")
+                _cprint("  [red]Failed to add insight (no active project or ChromaDB unavailable)[/]")
+        elif action in ("search", "find"):
+            query = " ".join(parts[2:])
+            if not query.strip():
+                _cprint("  [red]Usage: /insight search <query>[/]")
+                return
+            results = search_insights(query, limit=8)
+            if results:
+                _cprint(f"\n  [bold]Search results for '{query}':[/]")
+                for i, ins in enumerate(results, 1):
+                    stars = "★" * min(ins.importance, 5) + "☆" * max(5 - ins.importance, 0)
+                    _cprint(f"  {i}. [{stars}] {ins.text[:100]}")
+            else:
+                _cprint(f"  [dim]No insights match '{query}'.[/]")
         else:
-            insights = pm.get_relevant_insights(pid, "lessons best practices", n_results=10)
+            pi = get_project_insights()
+            if not pi:
+                _cprint("  [red]No active project.[/] Switch to a project first.")
+                return
+            insights = pi.list_all(limit=20)
+            stats = pi.stats()
             if not insights:
                 _cprint("  [dim]No insights yet.[/] Use /insight add \"text\" to add one.")
             else:
-                _cprint(f"\\n  [bold]Project Insights: {pid}[/]")
-                for i, ins in enumerate(insights, 1):
-                    _cprint(f"  {i}. [dim]{ins['source']}[/] → {ins['text'][:120]}")
-                _cprint(f"\\n  /insight add <text>  — добавить вручную")
+                _cprint(f"\n  [bold]🧠 Project Insights ({stats['total']} total)[/]")
+                _cprint(f"  Avg importance: {stats.get('avg_importance', 0):.1f}/10")
+                for i, ins in enumerate(insights[:10], 1):
+                    src = f" [dim]({ins.source})[/]" if ins.source else ""
+                    _cprint(f"  {i}. {ins.text[:100]}{src}")
+            _cprint(f"\n  /insight add \"text\"    — добавить знание")
+            _cprint(f"  /insight search <q>    — поиск по инсайтам")
 
     def _handle_research(self, cmd: str):
         """/research <topic|status|stop> — deep research pipeline."""

@@ -339,6 +339,20 @@ def _top_tags(insights: list[Insight], n: int) -> list[tuple[str, int]]:
 # Module-level helpers
 # ═══════════════════════════════════════════════════════════════
 
+# ── Agents BLOCKED from insights (strict Tester isolation) ──
+_TESTER_AGENT_IDS = {"tester", "tester-6a6ba59f", "tester-abc", "reviewer"}
+
+
+def is_insight_blocked(agent_id: str) -> bool:
+    """Check if *agent_id* is blocked from receiving shared insights.
+
+    Tester and Reviewer agents MUST remain blind to project knowledge
+    to ensure objective, unbiased code evaluation.
+    """
+    aid = agent_id.lower().replace("_", "-")
+    return aid in _TESTER_AGENT_IDS or "tester" in aid
+
+
 def get_project_insights() -> ProjectInsights | None:
     """Get insights for the currently active project."""
     try:
@@ -351,11 +365,11 @@ def get_project_insights() -> ProjectInsights | None:
     return None
 
 
-def add_insight(text: str, importance: int = 5) -> str:
+def add_insight(text: str, importance: int = 5, source: str = "manual") -> str:
     """Add an insight to the current project. Returns ID."""
     pi = get_project_insights()
     if pi:
-        return pi.add(text, importance=importance)
+        return pi.add(text, importance=importance, source=source)
     return ""
 
 
@@ -367,9 +381,40 @@ def search_insights(query: str, limit: int = 5) -> list[Insight]:
     return []
 
 
-def get_insights_context(task: str) -> str:
-    """Get insight context for injection into agent prompts."""
+def get_insights_context(task: str, agent_id: str = "") -> str:
+    """Get insight context for injection into agent prompts.
+
+    If *agent_id* is a Tester/Reviewer, returns empty string
+    (strict isolation — Tester must never see project knowledge).
+
+    Args:
+        task: The task description (used for semantic search).
+        agent_id: The agent receiving the context. Blocked for testers.
+
+    Returns:
+        Insight block string, or empty string for blocked agents.
+    """
+    if agent_id and is_insight_blocked(agent_id):
+        return ""
+
     pi = get_project_insights()
     if pi:
         return pi.get_context_for_task(task)
     return ""
+
+
+def extract_workflow_insights(
+    task: str,
+    final_code: str,
+    tester_review: str,
+    score: float,
+) -> list[str]:
+    """Auto-extract insights after workflow completion.
+
+    Called by the orchestrator.  Insights are saved to the
+    active project's shared memory — Tester agents never see them.
+    """
+    pi = get_project_insights()
+    if pi:
+        return pi.extract_from_workflow(task, final_code, tester_review, score)
+    return []

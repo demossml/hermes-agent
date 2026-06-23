@@ -537,6 +537,21 @@ class CodeGenerationWorkflow:
         else:
             self.state.status = "completed"  # max iterations reached
 
+        # ── Extract shared insights (Tester-excluded!) ─────
+        if self.state.status == "completed" and self.state.best_code:
+            try:
+                from projects.project_insights import extract_workflow_insights
+                last_review = self.state.stages[-1].content if self.state.stages else ""
+                extract_workflow_insights(
+                    task=self.task,
+                    final_code=self.state.best_code,
+                    tester_review=last_review,
+                    score=self.state.best_score,
+                )
+                logger.info("Workflow insights extracted for project")
+            except Exception:
+                pass
+
         # Final save
         if self.state.best_code:
             final = self.save_dir / "final.py"
