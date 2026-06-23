@@ -14,6 +14,87 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════
+# Frontend detection — tells Tester when to use browser tools
+# ═══════════════════════════════════════════════════════════════
+
+_FRONTEND_KEYWORDS = [
+    # Languages / frameworks
+    "react", "vue", "svelte", "angular", "next.js", "nextjs", "nuxt",
+    "gatsby", "remix", "astro", "solid.js", "preact", "jquery",
+    # Markup / styling
+    "html", "css", "scss", "sass", "less", "tailwind", "bootstrap",
+    "material-ui", "mui", "chakra", "styled-components",
+    # DOM / browser APIs
+    "document.", "window.", "dom", "browser", "frontend",
+    "getelementbyid", "queryselector", "addeventlistener",
+    "localstorage", "sessionstorage", "fetch(", "xmlhttprequest",
+    # Rendering / components
+    "render", "component", "jsx", "tsx", "usestate", "useeffect",
+    "usememo", "usecallback", "props", "lifecycle", "virtual dom",
+    # Build / dev servers
+    "webpack", "vite", "parcel", "esbuild", "localhost:",
+    "npm run dev", "npm start", "yarn dev", "pnpm dev",
+]
+
+
+def detect_frontend_type(code: str) -> dict[str, Any]:
+    """Analyse code and return frontend metadata for the tester.
+
+    Returns a dict with:
+    - is_frontend: bool
+    - score: int (number of keyword matches)
+    - matched_keywords: list[str]
+    - frontend_type: str (react/vue/html/unknown)
+    - needs_browser_test: bool
+    - suggested_test_url: str (localhost URL if detected)
+    """
+    code_lower = code.lower()
+    matched = [kw for kw in _FRONTEND_KEYWORDS if kw in code_lower]
+    score = len(matched)
+
+    # Detect framework
+    fw_type = "unknown"
+    if any(w in code_lower for w in ["react", "jsx", "tsx", "usestate", "useeffect"]):
+        fw_type = "react"
+    elif "vue" in code_lower:
+        fw_type = "vue"
+    elif "svelte" in code_lower:
+        fw_type = "svelte"
+    elif any(w in code_lower for w in ["angular", "ngmodule", "ngcomponent"]):
+        fw_type = "angular"
+    elif any(w in code_lower for w in ["html", "css", "tailwind", "bootstrap"]):
+        fw_type = "html"
+
+    # Detect dev server port
+    test_url = ""
+    import re
+    port_match = re.search(r"localhost:(\d+)", code_lower)
+    if port_match:
+        test_url = f"http://localhost:{port_match.group(1)}"
+    elif fw_type == "react":
+        test_url = "http://localhost:3000"
+    elif fw_type == "vue":
+        test_url = "http://localhost:5173"
+    elif fw_type == "svelte":
+        test_url = "http://localhost:5173"
+
+    needs_browser = (
+        score >= 3  # strong signal
+        or fw_type != "unknown"  # known framework
+        or any(w in code_lower for w in ["html", "dom", "render", "browser", "frontend"])
+    )
+
+    return {
+        "is_frontend": needs_browser,
+        "score": score,
+        "matched_keywords": matched[:10],
+        "frontend_type": fw_type,
+        "needs_browser_test": needs_browser,
+        "suggested_test_url": test_url,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
 # Base
 # ═══════════════════════════════════════════════════════════════
 
@@ -179,7 +260,12 @@ class PromptEngineer(WorkflowAgent):
 
 
 class TesterAgent(WorkflowAgent):
-    """Senior code tester + security reviewer with sandboxed execution."""
+    """Senior code tester + security reviewer with sandboxed execution.
+
+    Automatically detects frontend code (React, Vue, HTML, etc.) and
+    uses Playwright Browser Tool to verify rendering, console errors,
+    and DOM behaviour — not just backend logic.
+    """
 
     agent_type = "tester"
 
@@ -191,10 +277,29 @@ class TesterAgent(WorkflowAgent):
     async def review_code(self, code: str, session_id: str = "") -> str:
         """Review code — run real tests first, then LLM review.
 
-        The LLM receives actual execution results (pytest, mypy,
-        security scan) alongside the code so it can make informed
-        judgments rather than speculating.
+        For frontend code: auto-detects frameworks and adds browser
+        testing instructions.  For backend code: uses sandbox execution.
         """
+        # ── Frontend detection ──────────────────────────────
+        frontend_info = detect_frontend_type(code)
+        browser_hint = ""
+        if frontend_info["needs_browser_test"]:
+            browser_hint = (
+                "\n\n🌐 FRONTEND CODE DETECTED\n"
+                f"Type: {frontend_info['frontend_type']}\n"
+                f"Keywords: {', '.join(frontend_info['matched_keywords'][:5])}\n"
+                f"Score: {frontend_info['score']}\n\n"
+                "BROWSER TESTING INSTRUCTIONS:\n"
+                "1. Use `browser_test_page(url)` to verify rendering\n"
+                f"   Suggested URL: {frontend_info['suggested_test_url'] or 'http://localhost:3000'}\n"
+                "2. Use `browser_get_page_info()` to check meta tags and content\n"
+                "3. Use `browser_console('error')` to collect JS errors\n"
+                "4. Use `pw_browser_evaluate(js)` to test DOM interactions\n"
+                "5. Check for: blank pages, console errors, missing elements,\n"
+                "   broken links, incorrect meta tags, CSP violations\n\n"
+                "Include a ## Browser Test Results section in your review.\n"
+            )
+
         # ── Real execution first ────────────────────────────
         exec_report = ""
         try:
@@ -206,22 +311,23 @@ class TesterAgent(WorkflowAgent):
             logger.debug("CodeRunner unavailable: %s", e)
 
         # ── Build review message ────────────────────────────
+        parts = []
         if exec_report:
-            msg = (
+            parts.append(
                 "FIRST — here are the ACTUAL test results from running "
                 "this code in a sandbox. Use these results in your review.\n\n"
-                f"```json\n{exec_report}\n```\n\n"
-                "Now review the code. You do NOT know the original user "
-                "task — judge the code on its own merits.\n\n"
-                f"```\n{code[:2500]}\n```"
+                f"```json\n{exec_report}\n```"
             )
-        else:
-            msg = (
-                "Review the following code. You do NOT know the original "
-                "user task — judge the code on its own merits.\n\n"
-                f"```\n{code[:3000]}\n```"
-            )
+        if browser_hint:
+            parts.append(browser_hint)
 
+        parts.append(
+            "Now review the code. You do NOT know the original user "
+            "task — judge the code on its own merits.\n\n"
+            f"```\n{code[:2500]}\n```"
+        )
+
+        msg = "\n\n".join(parts)
         return await self.send(msg, session_id)
 
     def generate_and_run_tests(
@@ -267,7 +373,9 @@ class TesterAgent(WorkflowAgent):
             "subtree_session_id": self.subtree_session_id,
             "description": f"Dynamic tester for task {self.task_id}",
             "max_iterations": 5,
-            "enabled_toolsets": [],   # ⛔ ZERO tools — cannot read coder memory
+            "enabled_toolsets": [
+                "browser",   # 🎭 Playwright browser for frontend testing
+            ],
             "critical_rules": [
                 "You do NOT know the original user request. "
                 "Judge ONLY the code provided to you.",
@@ -278,6 +386,14 @@ class TesterAgent(WorkflowAgent):
                 "performance, style.",
                 "Use the exact output format: Review Result, "
                 "sections, Summary.",
+                # ── Browser testing rules ──
+                "If the code contains HTML/CSS/JS/frontend "
+                "frameworks, ALWAYS use browser_test_page() "
+                "and browser_console() to check for rendering "
+                "errors, console errors, and broken elements.",
+                "When browser testing, include a ## Browser Test "
+                "Results section with: URL tested, status code, "
+                "console errors found, and rendering assessment.",
             ],
             "rule_reminder_every": 0,
         }
@@ -320,18 +436,29 @@ _TESTER_PROMPT = (
     "security scan) are in the message above the code. "
     "Use these REAL results — do NOT speculate about "
     "whether the code runs or not.\n\n"
+    "\U0001f310 FRONTEND CODE: If the message indicates frontend "
+    "code (HTML/CSS/React/Vue/etc.), you MUST use the "
+    "browser testing tools:\n"
+    "- `browser_test_page(url)` — open page + screenshot + console\n"
+    "- `browser_get_page_info()` — meta tags + content stats\n"
+    "- `browser_console('error')` — JS errors + uncaught exceptions\n"
+    "- `browser_wait_for_selector(sel)` — verify elements render\n"
+    "- `pw_browser_evaluate(js)` — test DOM interactions\n"
+    "Include a ## Browser Test Results section.\n\n"
     "YOUR MISSION:\n"
     "1. SYNTAX: Check the actual execution output. Did it "
     "compile? Any syntax errors?\n"
     "2. TESTS: Did pytest pass? How many passed/failed? "
     "Quote the actual test output.\n"
-    "3. EDGE CASES: What inputs would break this code? "
+    "3. BROWSER (if frontend): Did the page render? Any "
+    "console errors? Missing elements? Use real browser output.\n"
+    "4. EDGE CASES: What inputs would break this code? "
     "Empty lists? None? Negative numbers?\n"
-    "4. TYPES: Did mypy find type errors? Quote them.\n"
-    "5. SECURITY: Any dangerous patterns (eval, exec, "
+    "5. TYPES: Did mypy find type errors? Quote them.\n"
+    "6. SECURITY: Any dangerous patterns (eval, exec, "
     "subprocess, hardcoded secrets)?\n"
-    "6. PERFORMANCE: O(n\u00b2)? Unnecessary allocations?\n"
-    "7. STYLE: Naming, docstrings, type hints, PEP 8.\n\n"
+    "7. PERFORMANCE: O(n\u00b2)? Unnecessary allocations?\n"
+    "8. STYLE: Naming, docstrings, type hints, PEP 8.\n\n"
     "OUTPUT FORMAT:\n"
     "## Review Result: \u2705 PASS or \u274c FAIL\n\n"
     "### Execution Results\n"
@@ -339,6 +466,11 @@ _TESTER_PROMPT = (
     "- Tests: X passed, Y failed\n"
     "- Types: PASS/FAIL (with mypy output if any)\n"
     "- Security: X issues found\n\n"
+    "### Browser Test Results  ← ONLY if frontend code detected\n"
+    "- URL tested: ...\n"
+    "- Status code: ...\n"
+    "- Console errors: X found (list them)\n"
+    "- Rendering: PASS/FAIL (page loaded? elements visible?)\n\n"
     "### Security Issues\n"
     "- (specific issue)\n\n"
     "### Edge Case Issues\n"
