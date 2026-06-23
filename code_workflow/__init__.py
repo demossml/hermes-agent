@@ -55,6 +55,9 @@ class WorkflowState:
     max_iterations: int = 5
     created_at: str = ""
     updated_at: str = ""
+    # ── Metadata from Coder → Tester ────────────────────
+    coder_metadata: dict = field(default_factory=dict)
+    browser_test_performed: bool = False
 
     def __post_init__(self):
         if not self.created_at:
@@ -110,8 +113,19 @@ def _invoke_agent(agent_id: str, prompt: str, *, max_iterations: int = 5) -> Sta
         response = _run_agent_turn(agent_id, prompt, subtree_id=subtree,
                                    max_iterations=max_iterations)
         elapsed = (time.monotonic() - t0) * 1000
+
+        # Parse coder metadata if this is a coder response
+        result_metadata = {}
+        if agent_id == "coder":
+            try:
+                from code_workflow.agents import parse_coder_metadata
+                result_metadata = parse_coder_metadata(response)
+            except Exception:
+                pass
+
         return StageResult(stage=agent_id, success=True, content=response,
-                           iteration=0, duration_ms=elapsed)
+                           iteration=0, duration_ms=elapsed,
+                           metadata=result_metadata)
     except Exception as e:
         elapsed = (time.monotonic() - t0) * 1000
         logger.error(f"Agent '{agent_id}' failed: {e}")
@@ -190,8 +204,47 @@ def _build_coder_prompt(task: str) -> str:
     )
 
 
-def _build_tester_prompt(code: str, iteration: int) -> str:
-    """Tester receives ONLY the code — never the user's original request."""
+def _build_tester_prompt(code: str, iteration: int, coder_metadata: dict | None = None) -> str:
+    """Tester receives ONLY the code + metadata — never the user's original request.
+
+    If *coder_metadata* is provided, it includes precise testing instructions
+    from the coder (language, code_type, needs_browser_test, critical_checks, etc.).
+    """
+    meta_block = ""
+    if coder_metadata:
+        needs_browser = coder_metadata.get("needs_browser_test", False)
+        if isinstance(needs_browser, str):
+            needs_browser = needs_browser.lower() in ("true", "yes", "1")
+
+        meta_lines = [
+            "CODER METADATA (use this to choose your testing strategy):",
+            f"  language: {coder_metadata.get('language', 'unknown')}",
+            f"  code_type: {coder_metadata.get('code_type', 'unknown')}",
+            f"  needs_browser_test: {needs_browser}",
+        ]
+        if coder_metadata.get("test_url"):
+            meta_lines.append(f"  test_url: {coder_metadata['test_url']}")
+        if coder_metadata.get("expected_behavior"):
+            meta_lines.append(f"  expected_behavior: {coder_metadata['expected_behavior']}")
+        if coder_metadata.get("entry_point"):
+            meta_lines.append(f"  entry_point: {coder_metadata['entry_point']}")
+        checks = coder_metadata.get("critical_checks", [])
+        if checks:
+            meta_lines.append("  critical_checks:")
+            for c in checks:
+                meta_lines.append(f"    - {c}")
+
+        if needs_browser:
+            meta_lines.extend([
+                "",
+                "⚠️  BROWSER TESTING REQUIRED",
+                f"   Use browser_test_page('{coder_metadata.get('test_url', 'http://localhost:3000')}')",
+                "   Use browser_console('error') to check for JS errors",
+                "   Include ## Browser Test Results in your review",
+            ])
+
+        meta_block = "\n".join(meta_lines) + "\n\n"
+
     return (
         "You are a SENIOR CODE TESTER. Review this code for:\n"
         "- Bugs and logic errors\n"
@@ -199,6 +252,7 @@ def _build_tester_prompt(code: str, iteration: int) -> str:
         "- Edge cases (empty inputs, None, invalid types)\n"
         "- Missing docstrings or type hints\n"
         "- Code style violations\n\n"
+        f"{meta_block}"
         "Reply with:\n"
         "- Score: X/10\n"
         "- Issues found (if any)\n"
@@ -229,11 +283,12 @@ def _detect_tests_in_code(code: str) -> str:
     return test_match.group(0).strip() if test_match else ""
 
 
-def _parse_tester_score(review: str) -> tuple[float, bool, list[str]]:
-    """Extract score, approval flag, and issues from tester output."""
+def _parse_tester_score(review: str) -> tuple[float, bool, list[str], bool]:
+    """Extract score, approval flag, issues, and browser_test_performed from tester output."""
     score = 5.0
     approved = False
     issues = []
+    browser_tested = False
 
     # Score: X/10
     score_match = re.search(r"(?:Score|Оценка)[:\s]*(\d+)\s*/\s*10", review, re.I)
@@ -246,6 +301,10 @@ def _parse_tester_score(review: str) -> tuple[float, bool, list[str]]:
     if re.search(r"\bREVISE\b", review, re.I):
         approved = False
 
+    # Browser test performed?
+    if re.search(r"browser.?test|browser_test_page|Browser Test Results", review, re.I):
+        browser_tested = True
+
     # Extract issues (numbered or bullet)
     for line in review.split("\n"):
         line = line.strip()
@@ -253,7 +312,7 @@ def _parse_tester_score(review: str) -> tuple[float, bool, list[str]]:
         if re.match(r"^[\d\-•*]+[.)\s]+\s+", line) and len(line) > 10:
             issues.append(line)
 
-    return score, approved, issues
+    return score, approved, issues, browser_tested
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -397,6 +456,7 @@ class CodeGenerationWorkflow:
         # ── Stage 1-n: Coder → Tester → (Optimizer) loop ────
         current_code = ""
         current_prompt = engineered_prompt
+        self.state.coder_metadata = {}
 
         for i in range(1, self.max_iterations + 1):
             if self._stop_requested:
@@ -417,15 +477,30 @@ class CodeGenerationWorkflow:
             if not current_code:
                 continue
 
+            # ── Parse coder metadata ──────────────────────────
+            from code_workflow.agents import parse_coder_metadata
+            coder_meta = parse_coder_metadata(coder_result.content)
+            if coder_meta:
+                self.state.coder_metadata = coder_meta
+                coder_result.metadata = coder_meta
+
             # ── Tester (blind to user task!) ──────────────────
-            tester_prompt = _build_tester_prompt(current_code, i)
+            tester_prompt = _build_tester_prompt(
+                current_code, i, coder_metadata=coder_meta or None
+            )
             tester_result = _invoke_agent("tester", tester_prompt,
                                           max_iterations=5)
             self._emit(tester_result)
             if not tester_result.success:
                 continue
 
-            score, approved, issues = _parse_tester_score(tester_result.content)
+            score, approved, issues, browser_tested = _parse_tester_score(
+                tester_result.content
+            )
+
+            # Track browser testing
+            if browser_tested:
+                self.state.browser_test_performed = True
 
             # ── Save best ─────────────────────────────────────
             self._save_best(current_code, score)
