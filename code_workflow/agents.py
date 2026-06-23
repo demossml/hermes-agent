@@ -144,9 +144,25 @@ class WorkflowAgent:
 
 
 class CoderAgent(WorkflowAgent):
-    """Expert software engineer — writes production-quality code only."""
+    """Expert software engineer — writes production-quality code only.
+
+    Every response MUST include structured metadata so the Tester
+    knows exactly how to test the code (browser? unit tests? both?).
+    """
 
     agent_type = "coder"
+
+    # ── Metadata schema fields ──────────────────────────
+    METADATA_FIELDS = [
+        "language",           # python, javascript, typescript, html, ...
+        "code_type",          # frontend_react, backend_fastapi, script, library, cli, api, ...
+        "needs_browser_test", # true/false — should Tester use Playwright?
+        "test_url",           # http://localhost:3000 — dev server URL
+        "expected_behavior",  # "Renders a button that increments counter"
+        "critical_checks",    # ["check console errors", "verify button click works"]
+        "entry_point",        # "src/App.tsx" — which file to run/test
+        "dependencies",       # ["react", "react-dom"] — npm/pip packages needed
+    ]
 
     def __init__(
         self,
@@ -158,24 +174,68 @@ class CoderAgent(WorkflowAgent):
         super().__init__(agent_id, registry, task_id)
         self.language = language
         self.subtree_session_id = f"subtree-{agent_id}-{task_id}"
+        self.last_metadata: dict[str, Any] = {}
 
     async def write_code(self, task: str, session_id: str = "") -> str:
-        """Ask the coder to write code for a task."""
+        """Ask the coder to write code for a task.
+
+        Returns the code WITH metadata block appended.
+        """
         lang = f"\nLanguage: {self.language}" if self.language else ""
-        msg = f"Code task{lang}:\n\n{task}"
-        return await self.send(msg, session_id)
+        msg = (
+            f"Code task{lang}:\n\n{task}\n\n"
+            "IMPORTANT: After your code, append a METADATA block:\n"
+            "```metadata\n"
+            "language: <python|javascript|typescript|html|...>\n"
+            "code_type: <frontend_react|backend_fastapi|script|library|api|cli|...>\n"
+            "needs_browser_test: <true|false>\n"
+            "test_url: <http://localhost:PORT or empty>\n"
+            "expected_behavior: <one-line description>\n"
+            "critical_checks:\n"
+            "  - <check 1>\n"
+            "  - <check 2>\n"
+            "entry_point: <main file to run>\n"
+            "dependencies:\n"
+            "  - <package name>\n"
+            "```"
+        )
+        response = await self.send(msg, session_id)
+        self.last_metadata = parse_coder_metadata(response)
+        return response
 
     async def fix_code(
         self, code: str, review: str, task: str, session_id: str = "",
     ) -> str:
-        """Ask the coder to fix issues found in review."""
+        """Ask the coder to fix issues found in review.
+
+        Returns fixed code WITH updated metadata block.
+        """
         msg = (
             "Your code was reviewed. Fix ALL issues listed below.\n\n"
             f"Review feedback:\n{review}\n\n"
             f"Original task:\n{task}\n\n"
-            "Rewrite the code with all fixes applied. Output code only."
+            "Rewrite the code with all fixes applied.\n\n"
+            "IMPORTANT: After your code, append an UPDATED METADATA block:\n"
+            "```metadata\n"
+            "language: ...\n"
+            "code_type: ...\n"
+            "needs_browser_test: ...\n"
+            "test_url: ...\n"
+            "expected_behavior: ...\n"
+            "critical_checks:\n"
+            "  - ...\n"
+            "entry_point: ...\n"
+            "dependencies:\n"
+            "  - ...\n"
+            "```"
         )
-        return await self.send(msg, session_id)
+        response = await self.send(msg, session_id)
+        self.last_metadata = parse_coder_metadata(response)
+        return response
+
+    def get_metadata(self) -> dict[str, Any]:
+        """Return parsed metadata from the last coder response."""
+        return dict(self.last_metadata)
 
     def _build_config(self) -> dict:
         return {
@@ -185,13 +245,132 @@ class CoderAgent(WorkflowAgent):
             "description": f"Dynamic coder for task {self.task_id}",
             "max_iterations": 8,
             "critical_rules": [
-                "Output CODE ONLY — no explanations, no markdown.",
+                "Output code followed by a METADATA block "
+                "(```metadata ... ```).",
+                "The metadata block is REQUIRED — the Tester "
+                "needs it to know how to test your code.",
                 "Every function and class must have a docstring.",
                 "All function signatures must have type hints.",
                 "Handle edge cases: empty inputs, None, invalid types.",
+                "For frontend code: set needs_browser_test=true "
+                "and provide test_url.",
             ],
             "rule_reminder_every": 0,
         }
+
+
+# ═══════════════════════════════════════════════════════════════
+# Coder metadata parser
+# ═══════════════════════════════════════════════════════════════
+
+def parse_coder_metadata(response: str) -> dict[str, Any]:
+    """Extract structured metadata from a coder's response.
+
+    Parses the `` ```metadata ... ``` `` block from the response.
+    Returns a dict with all recognised fields, or empty dict if
+    no metadata block found.
+    """
+    import re
+
+    # Find metadata block
+    match = re.search(
+        r"```metadata\s*\n(.*?)```",
+        response,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if not match:
+        return {}
+
+    block = match.group(1).strip()
+    result: dict[str, Any] = {}
+
+    # Parse simple key: value lines
+    for line in block.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        # List continuation (indented with -)
+        if line.startswith("-"):
+            value = line.lstrip("- ").strip()
+            # Find the last list-type key and append
+            for key in reversed(list(result.keys())):
+                if isinstance(result[key], list):
+                    result[key].append(value)
+                    break
+            continue
+
+        # key: value
+        if ":" in line:
+            key, _, value = line.partition(":")
+            key = key.strip().lower().replace(" ", "_")
+            value = value.strip()
+
+            # Boolean parsing
+            if value.lower() in ("true", "yes"):
+                result[key] = True
+            elif value.lower() in ("false", "no"):
+                result[key] = False
+            elif key in ("critical_checks", "dependencies"):
+                # Start a list — values come on subsequent lines
+                result[key] = []
+                if value:
+                    result[key].append(value)
+            else:
+                result[key] = value
+
+    # Normalise keys
+    if "code_type" not in result and "type" in result:
+        result["code_type"] = result.pop("type")
+
+    return result
+
+
+def _metadata_to_frontend_info(meta: dict[str, Any]) -> dict[str, Any]:
+    """Convert coder metadata into frontend_info dict for TesterAgent.
+
+    When the coder provides explicit metadata, it takes priority
+    over heuristic detection — more precise, no guessing.
+    """
+    needs_browser = meta.get("needs_browser_test", False)
+    if isinstance(needs_browser, str):
+        needs_browser = needs_browser.lower() in ("true", "yes", "1")
+
+    code_type = meta.get("code_type", meta.get("type", "unknown"))
+    test_url = meta.get("test_url", "")
+
+    # Derive frontend_type from code_type
+    fw_type = "unknown"
+    ct_lower = str(code_type).lower()
+    if "react" in ct_lower:
+        fw_type = "react"
+    elif "vue" in ct_lower:
+        fw_type = "vue"
+    elif "svelte" in ct_lower:
+        fw_type = "svelte"
+    elif "angular" in ct_lower:
+        fw_type = "angular"
+    elif any(w in ct_lower for w in ("html", "css", "frontend")):
+        fw_type = "html"
+
+    if not test_url and fw_type == "react":
+        test_url = "http://localhost:3000"
+    elif not test_url and fw_type in ("vue", "svelte"):
+        test_url = "http://localhost:5173"
+
+    return {
+        "is_frontend": needs_browser or fw_type != "unknown",
+        "score": 99,  # coder metadata = highest confidence
+        "matched_keywords": [f"coder:{code_type}"],
+        "frontend_type": fw_type,
+        "needs_browser_test": needs_browser or fw_type != "unknown",
+        "suggested_test_url": test_url,
+        "_source": "coder_metadata",
+        "expected_behavior": meta.get("expected_behavior", ""),
+        "critical_checks": meta.get("critical_checks", []),
+        "entry_point": meta.get("entry_point", ""),
+        "language": meta.get("language", ""),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -274,14 +453,24 @@ class TesterAgent(WorkflowAgent):
         # STRICT isolation: tester MUST NOT share memory with coder or orchestrator
         self.subtree_session_id = f"tester-isolated-{task_id}"
 
-    async def review_code(self, code: str, session_id: str = "") -> str:
+    async def review_code(
+        self, code: str, session_id: str = "",
+        coder_metadata: dict[str, Any] | None = None,
+    ) -> str:
         """Review code — run real tests first, then LLM review.
 
         For frontend code: auto-detects frameworks and adds browser
         testing instructions.  For backend code: uses sandbox execution.
+
+        If *coder_metadata* is provided (from CoderAgent.get_metadata()),
+        it overrides the heuristic detection and provides precise
+        testing instructions.
         """
-        # ── Frontend detection ──────────────────────────────
-        frontend_info = detect_frontend_type(code)
+        # ── Metadata from coder (preferred) ─────────────────
+        if coder_metadata:
+            frontend_info = _metadata_to_frontend_info(coder_metadata)
+        else:
+            frontend_info = detect_frontend_type(code)
         browser_hint = ""
         if frontend_info["needs_browser_test"]:
             browser_hint = (
@@ -407,9 +596,21 @@ _CODER_PROMPT = (
     "You are an expert SOFTWARE ENGINEER. Your ONLY job is "
     "to write production-quality code.\n\n"
     "REQUIREMENTS:\n"
-    "- Output CODE ONLY. No explanations, no commentary, "
-    "no markdown headers unless the task explicitly asks "
-    "for documentation.\n"
+    "- Output code, then a METADATA block. The metadata block "
+    "is MANDATORY — format:\n"
+    "```metadata\n"
+    "language: python|javascript|typescript|html|...\n"
+    "code_type: frontend_react|backend_fastapi|script|library|api|cli\n"
+    "needs_browser_test: true|false\n"
+    "test_url: http://localhost:3000  (if needs_browser_test=true)\n"
+    "expected_behavior: Brief description of what the code should do\n"
+    "critical_checks:\n"
+    "  - What the tester MUST verify\n"
+    "  - E.g., 'check console errors', 'verify button click'\n"
+    "entry_point: main.py  (which file to run)\n"
+    "dependencies:\n"
+    "  - package-name\n"
+    "```\n"
     "- Every function and class MUST have a docstring "
     "describing parameters, return values, and behaviour.\n"
     "- Use type hints on ALL function signatures.\n"
@@ -422,8 +623,17 @@ _CODER_PROMPT = (
     "meaningful variable names.\n"
     "- Prefer standard library over external dependencies "
     "unless the task specifies otherwise.\n\n"
-    "A separate tester agent will review your code. "
-    "They will find bugs if you are sloppy — don't be."
+    "A separate tester agent will review your code and "
+    "use your metadata to run the RIGHT tests (browser, "
+    "unit tests, security scan). Good metadata = better testing.\n\n"
+    "For FRONTEND code (React, Vue, HTML, CSS):\n"
+    "- Set needs_browser_test: true\n"
+    "- Provide the dev server URL as test_url\n"
+    "- List specific DOM checks in critical_checks\n\n"
+    "For BACKEND code (API, CLI, library):\n"
+    "- Set needs_browser_test: false\n"
+    "- Provide expected_behavior as a clear description\n"
+    "- List edge cases to test in critical_checks"
 )
 
 _TESTER_PROMPT = (
