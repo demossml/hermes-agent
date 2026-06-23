@@ -7941,6 +7941,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_insights(cmd_original)
         elif canonical in ("improve", "impr"):
             self._handle_improve(cmd_original)
+        elif canonical == "guard":
+            self._handle_guard(cmd_original)
         elif canonical == "agent-off":
             self._handle_agent_off()
         elif canonical == "rules":
@@ -10450,6 +10452,62 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         """Handle /projects — list all projects (convenience alias)."""
         from projects.project_context import get_project_context
         self._project_list(get_project_context())
+
+    def _handle_guard(self, cmd: str):
+        """Handle /guard — Guard Agent control.
+
+        Subcommands:
+          /guard status   — show guard state + statistics
+          /guard on       — enable guard
+          /guard off      — disable guard (with confirmation)
+          /guard rules    — list all active guard rules
+        """
+        from core.guard_agent import GuardAgent, guard_stats, _GUARD_RULES
+
+        parts = cmd.strip().split()
+        action = parts[1].lower() if len(parts) > 1 else "status"
+
+        guard = GuardAgent.get()
+
+        if action == "off":
+            _cprint("\n  [bold red]⚠️  Disable Guard Agent?[/]")
+            _cprint("  This removes the safety layer for ALL critical operations.")
+            _cprint("  Type [bold]yes[/] to confirm:")
+            try:
+                from prompt_toolkit.shortcuts import prompt
+                answer = prompt("  > ").strip().lower()
+            except Exception:
+                answer = input("  > ").strip().lower()
+            if answer == "yes":
+                guard.disable()
+                _cprint("  [bold yellow]Guard Agent DISABLED[/] — critical operations unguarded.")
+            else:
+                _cprint("  Cancelled.")
+        elif action == "on":
+            guard.enable()
+            _cprint("  [bold green]Guard Agent ENABLED[/] ✓")
+        elif action in ("rules", "list"):
+            _cprint(f"\n  [bold]Guard Rules ({len(_GUARD_RULES)}):[/]")
+            _cprint("  " + "─" * 60)
+            for rule in _GUARD_RULES:
+                sev = {"critical": "[red]CRIT[/]", "high": "[yellow]HIGH[/]", "medium": "[dim]MED[/]"}.get(rule.severity, rule.severity)
+                blk = "[red]BLOCK[/]" if rule.block else "[yellow]WARN[/]"
+                _cprint(f"  {sev} {blk} [{rule.rule_id}] {rule.description}")
+                _cprint(f"         Tools: {', '.join(rule.tools)}")
+            _cprint("  " + "─" * 60)
+        else:  # status
+            stats = guard_stats()
+            status_icon = "[bold green]● ENABLED[/]" if stats["enabled"] else "[bold red]○ DISABLED[/]"
+            _cprint(f"\n  [bold]Guard Agent:[/] {status_icon}")
+            _cprint(f"    Rules:     {stats['rules']} active")
+            _cprint(f"    Blocks:    {stats['blocks']}")
+            _cprint(f"    Warnings:  {stats['warnings']}")
+            _cprint(f"    Passed:    {stats['passed']}")
+            _cprint(f"    Total:     {stats['total_checks']} checks")
+            if stats["recent_blocks"]:
+                _cprint(f"\n  [bold]Recent blocks:[/]")
+                for b in stats["recent_blocks"][-3:]:
+                    _cprint(f"    [{b['rule']}] {b['tool']}: {b['args_preview'][:80]}")
 
     def _handle_improve(self, cmd: str):
         """Handle /improve — self-improvement loop for the active project.

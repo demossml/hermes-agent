@@ -1128,6 +1128,25 @@ def handle_function_call(
                     )
             from hermes_cli.middleware import run_tool_execution_middleware
 
+            # ── Guard Agent check ─────────────────────────────
+            try:
+                from core.guard_agent import check_tool_call
+                guard_result = check_tool_call(
+                    function_name, function_args, task_id=task_id or "",
+                )
+                if not guard_result.allowed:
+                    logger.warning(
+                        "GUARD BLOCKED: %s → %s",
+                        function_name, guard_result.reason,
+                    )
+                    return json.dumps({
+                        "error": f"Guard Agent blocked: {guard_result.reason}",
+                        "rule": guard_result.rule_id,
+                        "severity": guard_result.severity,
+                    }, ensure_ascii=False)
+            except Exception:
+                pass  # guard failure must never block legitimate tools
+
             result = run_tool_execution_middleware(
                 function_name,
                 function_args,
