@@ -55,6 +55,49 @@ This branch extends Hermes Agent with **multi-agent orchestration**, DAG pipelin
 
 ---
 
+
+## 🧪 Hermes Multi-Agent — Professional Testing Suite
+
+The `multi-agent` branch adds a professional-grade testing infrastructure:
+
+### Tester Agent (16 tools)
+
+| Tool | Category | Description |
+|------|----------|-------------|
+| `tester_full_analysis` | 🎯 Main | Smart testing at quick/standard/full depth |
+| `tester_run_ruff` | Static | Fast Python linting |
+| `tester_run_mypy` | Static | Type checking |
+| `tester_run_pylint` | Static | Deep code quality analysis (score 0-10) |
+| `tester_run_bandit` | Security | Vulnerability scan (SQLi, XSS, secrets) |
+| `tester_check_documentation` | Quality | Docstring coverage % |
+| `tester_check_code_style` | Quality | PEP8, naming, line length |
+| `tester_run_pytest` | Tests | Unit tests with markers (-m, -k, coverage) |
+| `tester_run_coverage` | Coverage | Line/branch coverage via coverage.py |
+| `tester_run_playwright_tests` | E2E | Playwright/Vitest/Jest E2E auto-detection |
+| `tester_generate_tests` | Code Gen | Auto-generate test stubs from code |
+| `tester_test_api_endpoint` | API | REST endpoint validation |
+| `tester_run_performance_test` | Perf | File sizes, complexity, import times |
+| `tester_stress_test` | Perf | Function benchmarking + tracemalloc |
+| `tester_analyze_project` | Strategy | Auto-detect project type (5 types) |
+| `tester_full_report` | Report | Comprehensive report + Quality Score |
+
+**Unified Quality Score** (0-100) across 9 categories: Static Analysis, Security, Coverage, Test Confidence, Maintainability, Performance, Memory Safety, Browser Tests, API Tests.
+
+**Self-Healing**: Automatic fix suggestions for test failures, security issues, and memory leaks.
+
+### Playwright Browser PRO (8 tools)
+
+| Tool | Description |
+|------|-------------|
+| `browser_emulate_device` | 12 device presets (iPhone 15, Pixel 7, iPad Pro, Desktop) |
+| `browser_test_responsive` | Screenshots at mobile/tablet/desktop breakpoints |
+| `browser_full_test` | Full page test (screenshot, console, a11y, perf, HTML, meta) |
+| `browser_check_accessibility` | ARIA labels, heading hierarchy, contrast, tabindex |
+| `browser_validate_html` | lang, viewport, charset, unclosed tags, duplicate IDs |
+| `browser_snapshot_baseline` / `browser_compare_snapshot` | Visual regression with pixel-diff |
+| `browser_performance_metrics` | Core Web Vitals (LCP, FID, CLS, TBT) with ratings |
+
+All browser artifacts saved to `.browser_artifacts/` in the current project.
 ## Quick Start
 
 ### Fresh Install (upstream)
