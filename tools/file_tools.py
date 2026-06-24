@@ -16,6 +16,8 @@ from tools.file_operations import (
     normalize_search_pagination,
 )
 from tools import file_state
+
+from projects.path_guard import enforce as _proj_enforce
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
@@ -1615,7 +1617,10 @@ SEARCH_FILES_SCHEMA = {
 
 def _handle_read_file(args, **kw):
     tid = kw.get("task_id") or "default"
-    return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
+    _path = args.get("path", "")
+    if _err := _proj_enforce(_path, operation="read"):
+        return tool_error(_err)
+    return read_file_tool(path=_path, offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
 
 
 def _handle_write_file(args, **kw):
@@ -1638,6 +1643,8 @@ def _handle_write_file(args, **kw):
             f"write_file: 'content' must be a string, got "
             f"{type(args['content']).__name__}."
         )
+    if _err := _proj_enforce(args["path"], operation="write"):
+        return tool_error(_err)
     return write_file_tool(
         path=args["path"], content=args["content"], task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
@@ -1646,6 +1653,10 @@ def _handle_write_file(args, **kw):
 
 def _handle_patch(args, **kw):
     tid = kw.get("task_id") or "default"
+    _mode = args.get("mode", "replace")
+    if _mode == "replace" and (_p := args.get("path")):
+        if _err := _proj_enforce(_p, operation="edit"):
+            return tool_error(_err)
     return patch_tool(
         mode=args.get("mode", "replace"), path=args.get("path"),
         old_string=args.get("old_string"), new_string=args.get("new_string"),
@@ -1656,6 +1667,9 @@ def _handle_patch(args, **kw):
 
 def _handle_search_files(args, **kw):
     tid = kw.get("task_id") or "default"
+    _spath = args.get("path", ".")
+    if _err := _proj_enforce(_spath, operation="search"):
+        return tool_error(_err)
     target_map = {"grep": "content", "find": "files"}
     raw_target = args.get("target", "content")
     target = target_map.get(raw_target, raw_target)

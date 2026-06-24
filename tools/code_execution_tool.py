@@ -1119,6 +1119,32 @@ def execute_code(
             "duration_seconds": 0,
         }, ensure_ascii=False)
 
+    # ── Project file isolation: wrap code with chdir guard ──
+    try:
+        from projects.path_guard import get_current_project_root
+        proj_root = get_current_project_root()
+        if proj_root is not None:
+            proj_root_str = str(proj_root)
+            guard_preamble = (
+                f'import os as _os\n'
+                f'_proj_root = {proj_root_str!r}\n'
+                f'_orig_chdir = _os.chdir\n'
+                f'def _safe_chdir(path):\n'
+                f'    import os as _os2\n'
+                f'    from pathlib import Path as _Path\n'
+                f'    resolved = _Path(path).expanduser().resolve()\n'
+                f'    try: resolved.relative_to(_Path(_proj_root))\n'
+                f'    except ValueError: raise PermissionError('
+                f'        f"[PROJECT FILE ISOLATION] os.chdir({{path!r}}) blocked: '
+                f'        f"outside project {{_proj_root}}")\n'
+                f'    return _orig_chdir(str(resolved))\n'
+                f'_os.chdir = _safe_chdir\n'
+                f'del _os, _orig_chdir, _safe_chdir, _proj_root\n'
+            )
+            code = guard_preamble + code
+    except Exception:
+        pass  # Best-effort guard
+
     if env_type != "local":
         return _execute_remote(code, task_id, enabled_tools)
 

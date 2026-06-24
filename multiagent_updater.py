@@ -1095,6 +1095,7 @@ def format_full_report(
     upgrade_report: dict[str, Any] | None = None,
     strict_report: dict[str, Any] | None = None,
     platform_id_report: dict[str, Any] | None = None,
+    isolation_report: dict[str, Any] | None = None,
     dry_run: bool = False,
 ) -> str:
     """Сформировать красивый итоговый отчёт об обновлении."""
@@ -1214,6 +1215,21 @@ def format_full_report(
             strict_parts.append(f"{len(agent_migs)} агентов: CRITICAL GLOBAL RULE добавлен")
         if strict_parts:
             section_items.append(("🛡️", "Strict Compliance", "; ".join(strict_parts)))
+
+    # Project hard file isolation
+    if isolation_report:
+        scanned = isolation_report.get("scanned", 0)
+        applied = isolation_report.get("applied", 0)
+        ok = isolation_report.get("already_ok", 0)
+        errs = isolation_report.get("errors", 0)
+        parts = [f"{scanned} scanned"]
+        if applied:
+            parts.append(f"{applied} applied chmod 700 + lock")
+        if ok:
+            parts.append(f"{ok} already OK")
+        if errs:
+            parts.append(f"{errs} errors")
+        section_items.append(("🔐", "File Isolation v2", "; ".join(parts)))
 
     # platform_message_id backfill
     if platform_id_report:
@@ -1713,6 +1729,97 @@ def backfill_platform_message_ids(dry_run: bool = False) -> dict[str, Any]:
 # Entry Point
 # ═══════════════════════════════════════════════════════════════
 
+
+def migrate_project_isolation_v2(dry_run: bool = False) -> dict[str, Any]:
+    """Scan all projects and apply hard file isolation (chmod 700 + .project.lock).
+
+    Idempotent — safe to run repeatedly.  Only touches projects that:
+    - Have a valid metadata.json (are real projects)
+    - Are missing .project.lock OR have wrong permissions
+
+    Returns a detailed report::
+
+        {"scanned": 3, "applied": 2, "already_ok": 1, "errors": [], "details": [...]}
+    """
+    from pathlib import Path as _Path
+    from projects.path_guard import (
+        apply_project_permissions, create_project_lock, has_project_lock,
+    )
+
+    home = _Path.home() / ".hermes"
+    projects_dir = home / "projects"
+    report: dict[str, Any] = {
+        "scanned": 0, "applied": 0, "already_ok": 0,
+        "errors": 0, "details": [],
+    }
+
+    if not projects_dir.exists():
+        return report
+
+    for proj_dir in sorted(projects_dir.iterdir()):
+        if not proj_dir.is_dir() or proj_dir.name.startswith("."):
+            continue
+        if not (proj_dir / "metadata.json").exists():
+            continue
+
+        pid = proj_dir.name
+        report["scanned"] += 1
+        detail = {"project": pid, "actions": []}
+
+        try:
+            # Check if already isolated
+            already_locked = has_project_lock(proj_dir)
+            if already_locked and not dry_run:
+                report["already_ok"] += 1
+                detail["actions"].append("already isolated (lock exists)")
+                report["details"].append(detail)
+                continue
+
+            if dry_run:
+                detail["actions"].append("[DRY-RUN] would apply chmod 700 + .project.lock")
+                report["applied"] += 1
+                report["details"].append(detail)
+                continue
+
+            # Apply permissions
+            perms = apply_project_permissions(proj_dir)
+            if perms.get("chmod_ok"):
+                detail["actions"].append("chmod 700 applied")
+            if perms.get("acl_ok"):
+                detail["actions"].append("ACL applied (macOS)")
+            for err in perms.get("errors", []):
+                detail["actions"].append(f"WARNING: {err}")
+
+            # Create lock
+            lock_ok = create_project_lock(proj_dir)
+            if lock_ok:
+                detail["actions"].append(".project.lock created")
+            else:
+                report["errors"] += 1
+                detail["actions"].append("ERROR: failed to create .project.lock")
+
+            # Protect sensitive files (ensure they exist inside project)
+            for fname in ["AGENTS.md", "SOUL.md"]:
+                fpath = proj_dir / fname
+                if fpath.exists():
+                    try:
+                        fpath.chmod(0o600)
+                        detail["actions"].append(f"{fname}: chmod 600 applied")
+                    except OSError as e:
+                        detail["actions"].append(f"{fname}: chmod failed ({e})")
+
+            report["applied"] += 1
+        except Exception as e:
+            report["errors"] += 1
+            detail["actions"].append(f"ERROR: {e}")
+            logger.error(f"isolation migration failed for {pid}: {e}")
+
+        report["details"].append(detail)
+
+    return report
+
+
+
 def run_update(
     dry_run: bool = False,
     reset_llm: bool = False,
@@ -1793,6 +1900,13 @@ def run_update(
     if full:
         platform_id_report = backfill_platform_message_ids(dry_run=dry_run)
 
+    # ── Phase 13: Project hard file isolation ──────────────
+    isolation_report: dict[str, Any] = {}
+    if full:
+        isolation_report = migrate_project_isolation_v2(dry_run=dry_run)
+    else:
+        isolation_report = migrate_project_isolation_v2(dry_run=dry_run)
+
     # ── Format report ───────────────────────────────────────
     report = format_full_report(
         backup_path=backup_path,
@@ -1809,6 +1923,7 @@ def run_update(
         upgrade_report=upgrade_report,
         strict_report=strict_report,
         platform_id_report=platform_id_report,
+        isolation_report=isolation_report,
         dry_run=dry_run,
     )
 

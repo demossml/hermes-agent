@@ -83,6 +83,22 @@ class ProjectManager:
     def _metadata_path(self, project_id: str) -> Path:
         return self._project_dir(project_id) / "metadata.json"
 
+
+    def _apply_project_isolation(self, project_id: str) -> dict:
+        """Apply chmod 700 + .project.lock to a project directory.
+
+        Called from create_project() and ensure_project_structure().
+        Idempotent — safe to call multiple times.
+        """
+        from projects.path_guard import (
+            apply_project_permissions, create_project_lock,
+        )
+        proj_dir = self._project_dir(project_id)
+        perms = apply_project_permissions(proj_dir)
+        lock_ok = create_project_lock(proj_dir)
+        perms["lock_ok"] = lock_ok
+        return perms
+
     def _ensure_subdirs(self, project_id: str) -> None:
         root = self._project_dir(project_id)
         for sub in ["data", "memory/chroma", "state/workflows", "agents", "code"]:
@@ -151,6 +167,9 @@ class ProjectManager:
 
         with open(yaml_path, "w") as f:
             yaml.dump(config, f, allow_unicode=True, default_flow_style=False)
+
+        # ── Ensure hard isolation (idempotent) ────────────
+        _ = self._apply_project_isolation(project_id)
 
         logger.info(
             f"Project '{project_id}' structure ensured "
@@ -473,6 +492,11 @@ class ProjectManager:
                     logger.info(f"Created .hermes-project marker in {cwd}")
             except Exception:
                 pass  # best-effort
+
+        # ── Hard isolation: chmod 700 + .project.lock ──────
+        self._apply_project_isolation(project_id)
+        meta["isolation"] = "hard"
+        meta["lock_file"] = str(self._project_dir(project_id) / ".project.lock")
 
         logger.info(f"Project '{name}' created (id={project_id})")
         return dict(meta)
