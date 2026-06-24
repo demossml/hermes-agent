@@ -29,6 +29,8 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), [Open
 
 ## Multi-Agent Edition
 
+> **Branch status (June 2026):** Production-ready — hard file isolation, DAG orchestration, Shared Insights Layer, Advanced Tester (16 tools), Playwright Browser PRO, and defense-in-depth security.
+
 This branch extends Hermes Agent with **multi-agent orchestration**, DAG pipelines, isolated sub-agent memory, per-agent LLM configuration, and a **RuleEngine** for behaviour control. Built on [Hermes Agent by Nous Research](https://github.com/NousResearch/hermes-agent).
 
 **New capabilities in this branch:**
@@ -50,15 +52,24 @@ This branch extends Hermes Agent with **multi-agent orchestration**, DAG pipelin
 - **Activity Prefix** — `[Project: Name] • [Agent: coder] →` on every message (CLI + all gateways)
 - **Agent Monitoring** — `/watch <agent>` and `/status` — real-time activity tracking
 - **Shared Insights** — cross-agent knowledge exchange (auto-share discoveries)
+- **Hard File Isolation** — fail-closed filesystem boundaries with owner-only perms and .project.lock
+- **Advanced Tester Agent** — 16 professional tools: pytest, coverage, mypy, bandit, Playwright E2E, visual regression
+- **Playwright Browser PRO** — 8 browser tools: device emulation, responsive, a11y, performance
+- **Shared Insights Layer** — per-project collective memory with auto-extraction and semantic search
+- **Guard Agent** — three-layer runtime defense blocking dangerous operations
 - **Instant Project Switching** — prefix updates immediately on `/project switch` (no /reset needed)
 - **Auto-Upgrade** — `hermes update` automatically upgrades ALL agents with latest features
 
 ---
 
 
-## 🧪 Hermes Multi-Agent — Professional Testing Suite
+## 🧪 Professional Testing Suite
 
-The `multi-agent` branch adds a professional-grade testing infrastructure:
+Comprehensive testing with 16 tester tools and 8 browser tools:
+
+### Advanced Tester Agent (16 tools)
+
+Fully-isolated code reviewer with unified Quality Score (0-100). Runs with zero tools, strict memory isolation, no shared insights — ensuring unbiased evaluation.
 
 ### Tester Agent (16 tools)
 
@@ -87,6 +98,8 @@ The `multi-agent` branch adds a professional-grade testing infrastructure:
 
 ### Playwright Browser PRO (8 tools)
 
+Comprehensive frontend quality assessment:
+
 | Tool | Description |
 |------|-------------|
 | `browser_emulate_device` | 12 device presets (iPhone 15, Pixel 7, iPad Pro, Desktop) |
@@ -97,7 +110,9 @@ The `multi-agent` branch adds a professional-grade testing infrastructure:
 | `browser_snapshot_baseline` / `browser_compare_snapshot` | Visual regression with pixel-diff |
 | `browser_performance_metrics` | Core Web Vitals (LCP, FID, CLS, TBT) with ratings |
 
-All browser artifacts saved to `.browser_artifacts/` in the current project.
+All browser artifacts saved to .browser_artifacts/ in the current project.
+
+Key capabilities: 12 device presets (iPhone 15, Pixel 7, iPad Pro, Desktop 4K), responsive testing, accessibility audit (ARIA, headings, contrast), HTML validation, visual regression (pixel-diff), Core Web Vitals (LCP, FID, CLS, TBT with ratings).
 ## Quick Start
 
 ### Fresh Install (upstream)
@@ -233,6 +248,8 @@ Multi-agent: propagated ['delegation'] to 3 agent(s) (1 skipped)
 - **Tool control** — only the Orchestrator can change `enabled_toolsets` via `/subagents tools <id> set|add`
 - **Sandbox mode** — `enabled_toolsets: []` = agent with zero tools
 - **Creation permissions** — `level: 1` agents can only create `level: 2` children
+- **Hard file isolation** — fail-closed filesystem boundaries protect each project
+- **Shared Insights isolation** — Tester/Reviewer agents blocked from project knowledge
 
 ### Subtree Memory Architecture
 - **Memory branches** — `coder` and its children share one `subtree_session_id`
@@ -367,6 +384,41 @@ Toolsets:
 
 ---
 
+## Security & Isolation
+
+The multi-agent branch implements defense-in-depth across four layers:
+
+### Layer 1: Agent-Level
+
+| Mechanism | Description |
+|-----------|-------------|
+| Horizontal isolation | Agents cannot call siblings |
+| Subtree memory | Each agent branch has isolated history |
+| Tester blindness | Tester/Reviewer: zero tools, zero memory |
+| Sandbox mode | Agent with no tool access |
+
+### Layer 2: Project Hard File Isolation
+
+| Protection | Implementation |
+|------------|---------------|
+| Directory permissions | Owner-only |
+| Lock file | .project.lock enables hard isolation |
+| Path enforcement | path_guard.enforce() in all file tools |
+| Command inspection | Shell escapes (.., absolute paths, cd) blocked |
+| os.chdir() guard | execute_code sandbox restricts directories |
+| Sensitive files | AGENTS.md, SOUL.md, .env — extra protection |
+| Migration | hermes update --full applies to all projects |
+
+### Layer 3: Guard Agent (Runtime)
+
+Three-layer zero-token defense: pre-filter (gateway), hardened prompt, post-check (keyword matching).
+
+### Layer 4: Shared Insights Isolation
+
+Tester/Reviewer exclusion, cross-project blocking, per-project ChromaDB, graceful JSONL fallback.
+
+---
+
 ## Installation
 
 ### Fresh Install
@@ -411,6 +463,8 @@ After the update, all existing agents and projects are automatically upgraded:
 4. Ensures all projects have complete structure (`metadata.json` + `project.yaml`)
 5. Upgrades agent configs with latest migration (v20260617)
 6. Updates SOUL.md globally and per-project
+7. Applies hard file isolation (owner-only perms + .project.lock)
+8. Initializes Shared Insights collections
 
 ### Creating Projects
 
@@ -434,10 +488,23 @@ Each project automatically gets:
 ├── state/                 ← workflow results, reports, snapshots
 ├── agents/                ← project-bound sub-agent configs
 ├── data/                  ← DuckDB + observer_groups
-└── memory/chroma/         ← vector memory
+└── memory/                ← chroma/ (LTM) + insights/ (shared)
 ```
 
 All files are created automatically — no manual setup required.
+
+### Shared Insights Layer
+
+Every project has collective memory that agents contribute to and learn from:
+
+| Command | Description |
+|---------|-------------|
+| /insights [N] | Show N most important insights |
+| /insight add "text" | Manually add project insight |
+| /insight search query | Semantic search across insights |
+| /insight recent [N] | Last N insights added |
+
+Auto-extraction after workflow completion. Tester/Reviewer excluded. Insights in memory/insights/ protected by path_guard.
 
 ### Install @mention Hook (optional)
 
