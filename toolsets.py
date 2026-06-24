@@ -47,6 +47,23 @@ _HERMES_CORE_TOOLS = [
     "browser_type", "browser_scroll", "browser_back",
     "browser_press", "browser_get_images",
     "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
+    # Playwright Browser PRO — professional frontend testing
+    "browser_emulate_device", "browser_test_responsive",
+    "browser_full_test",
+    "browser_check_accessibility", "browser_validate_html",
+    "browser_snapshot_baseline", "browser_compare_snapshot",
+    "browser_performance_metrics",
+    # Tester tools — professional code testing
+    "tester_run_ruff", "tester_run_mypy",
+    "tester_run_pylint", "tester_run_bandit",
+    "tester_check_documentation", "tester_check_code_style",
+    "tester_test_api_endpoint", "tester_run_performance_test",
+    "tester_stress_test", "tester_analyze_project",
+    "tester_full_report",
+    "tester_run_pytest",
+    "tester_run_coverage",
+    "tester_run_playwright_tests", "tester_generate_tests",
+    "tester_full_analysis",
     # Text-to-speech
     "text_to_speech",
     # Planning & memory
