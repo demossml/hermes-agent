@@ -68,7 +68,6 @@ from tools.interrupt import is_interrupted, _interrupt_event  # noqa: F401 — r
 # Singularity helpers (scratch dir, SIF cache) now live in tools/environments/singularity.py
 from tools.environments.singularity import _get_scratch_dir
 from projects.path_guard import enforce_cwd as _proj_enforce_cwd
-from projects.path_guard import enforce as _proj_enforce_path
 from tools.tool_backend_helpers import (
     coerce_modal_mode,
     has_direct_modal_credentials,
@@ -1842,6 +1841,40 @@ def _resolve_command_cwd(
     return default_cwd
 
 
+def _check_command_path_escapes(command):
+    import shlex
+    try:
+        from projects.path_guard import enforce as _pe, get_current_project_root
+    except ImportError:
+        return None
+    root = get_current_project_root()
+    if root is None:
+        return None
+    root_str = str(root)
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    suspicious = []
+    for token in tokens:
+        if token.startswith('-'): continue
+        if token in {'|', '||', ';', '>', '>>', '<', '<<', '&'}:
+            continue
+        if token == '&&': continue
+        if '/' in token or token.startswith('~') or token == '..':
+            err = _pe(token, operation='ref', project_root=root)
+            if err: suspicious.append(token)
+    if suspicious:
+        return '[PROJECT FILE ISOLATION] Command references paths outside active project: ' + ', '.join(suspicious[:5])
+    if command.strip().startswith('cd '):
+        td = command.strip()[3:].strip().strip(chr(34)).strip("'")
+        if td:
+            err = _pe(td, operation='cd', project_root=root)
+            if err: return err
+    return None
+
+
+
 def terminal_tool(
     command: str,
     background: bool = False,
@@ -2098,66 +2131,7 @@ def terminal_tool(
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
 
-        
-
-# ── Project isolation: command path escape detection ────────────
-
-def _check_command_path_escapes(command: str) -> str | None:
-    """Check *command* for path escapes that try to leave the project.
-
-    Returns None if the command looks safe.
-    Returns an error string if path escapes are detected.
-    """
-    import shlex
-    from projects.path_guard import enforce as _pe, get_current_project_root
-
-    root = get_current_project_root()
-    if root is None:
-        return None  # No project active
-
-    root_str = str(root)
-
-    # Try to tokenize the command
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        tokens = command.split()
-
-    suspicious: list[str] = []
-
-    for token in tokens:
-        # Skip flags/options
-        if token.startswith('-'):
-            continue
-        # Skip shell operators
-        if token in {'|', '||', '&&', ';', '>', '>>', '<', '<<', '&'}:
-            continue
-
-        # Check for path-like tokens
-        if '/' in token or token.startswith('~') or token == '..':
-            # Resolve and check
-            err = _pe(token, operation=f"reference in command", project_root=root)
-            if err:
-                suspicious.append(token)
-
-    if suspicious:
-        return (
-            f"[PROJECT FILE ISOLATION] Command references paths outside "
-            f"the active project ({root_str}): {', '.join(suspicious[:5])}. "
-            f"All file paths in commands must be inside the project directory."
-        )
-
-    # Also check for cd commands that escape
-    if command.strip().startswith('cd '):
-        target_dir = command.strip()[3:].strip().strip('"').strip("'")
-        if target_dir:
-            err = _pe(target_dir, operation="cd", project_root=root)
-            if err:
-                return err
-
-    return None
-
-# Validate workdir against shell injection
+        # Validate workdir against shell injection
         if workdir:
             workdir_error = _validate_workdir(workdir)
             if workdir_error:
@@ -2170,33 +2144,15 @@ def _check_command_path_escapes(command: str) -> str | None:
                     "status": "blocked"
                 }, ensure_ascii=False)
 
-        # ── Project file isolation: check cwd ──────────────
-        effective_cwd_preview = _resolve_command_cwd(
-            workdir=workdir,
-            env=None,  # env not yet resolved at this point
-            default_cwd=cwd,
-        )
-        if effective_cwd_preview:
-            if _cwd_err := _proj_enforce_cwd(effective_cwd_preview):
-                logger.warning("Blocked terminal cwd outside project: %s",
-                               str(effective_cwd_preview)[:120])
-                return json.dumps({
-                    "output": "",
-                    "exit_code": -1,
-                    "error": _cwd_err,
-                    "status": "blocked"
-                }, ensure_ascii=False)
+        # Project isolation: check cwd
+        eff = _resolve_command_cwd(workdir=workdir, env=None, default_cwd=cwd)
+        if eff:
+            if _e := _proj_enforce_cwd(eff):
+                return json.dumps({'output':'','exit_code':-1,'error':_e,'status':'blocked'}, ensure_ascii=False)
 
-        # ── Project isolation: check command for path escapes ──
-        if _cmd_path_err := _check_command_path_escapes(command):
-            logger.warning("Blocked command with path escapes: %s",
-                           _safe_command_preview(command))
-            return json.dumps({
-                "output": "",
-                "exit_code": -1,
-                "error": _cmd_path_err,
-                "status": "blocked"
-            }, ensure_ascii=False)
+        # Project isolation: check command for path escapes
+        if _e := _check_command_path_escapes(command):
+            return json.dumps({'output':'','exit_code':-1,'error':_e,'status':'blocked'}, ensure_ascii=False)
 
         # Prepare command for execution
         pty_disabled_reason = None
