@@ -5463,6 +5463,91 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         killed = process_registry.kill_all()
         print(f"  ✅ Stopped {killed} process(es).")
 
+
+    def _handle_insights(self, cmd: str):
+        """Handle /insights [N] — show shared project insights."""
+        from projects.project_insights import get_project_insights
+        from hermes_cli.commands import _cprint
+
+        parts = cmd.strip().split()
+        n = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 10
+
+        pi = get_project_insights()
+        if not pi:
+            _cprint("  No active project. Use /project switch <name> first.")
+            return
+
+        insights_list = pi.list_all(limit=n)
+        if not insights_list:
+            _cprint("  No shared insights yet. They are auto-generated from completed tasks.")
+            return
+
+        stats = pi.stats()
+        _cprint(f"  Project Insights ({stats.get('total', 0)} total, "
+                f"avg importance: {stats.get('avg_importance', 0):.1f})")
+        _cprint("  " + "-" * 50)
+
+        for i, ins in enumerate(insights_list, 1):
+            tags_str = ", ".join(ins.tags[:3]) if ins.tags else "-"
+            _cprint(f"  {i}. [{ins.importance}/10] {ins.text[:120]}")
+            _cprint(f"     source={ins.source}, tags={tags_str}, "
+                    f"created={ins.created_at[:19] if ins.created_at else '?'}")
+
+        if stats.get("top_tags"):
+            _cprint(f"\n  Top tags: {', '.join(f'{t}({c})' for t,c in stats['top_tags'])}")
+
+    def _handle_insight_cmd(self, cmd: str):
+        """Handle /insight add|search|recent <args>."""
+        from projects.project_insights import (
+            get_project_insights, add_insight, search_insights,
+        )
+        from hermes_cli.commands import _cprint
+
+        parts = cmd.strip().split(None, 2)
+        sub = parts[1].lower() if len(parts) > 1 else ""
+
+        pi = get_project_insights()
+
+        if sub == "add" and len(parts) > 2:
+            text = parts[2].strip().strip('"').strip("'")
+            if not text:
+                _cprint("  Usage: /insight add \"your insight text\"")
+                return
+            iid = add_insight(text, importance=7, source="manual")
+            if iid:
+                _cprint(f"  Insight added: {iid}")
+            else:
+                _cprint("  Failed to add insight (no active project or ChromaDB unavailable).")
+
+        elif sub == "search" and len(parts) > 2:
+            query = parts[2].strip()
+            results = search_insights(query, limit=8)
+            if not results:
+                _cprint(f"  No insights found for: {query}")
+                return
+            _cprint(f"  Search results for: {query}")
+            for i, ins in enumerate(results, 1):
+                _cprint(f"  {i}. [{ins.importance}/10] {ins.text[:120]}")
+
+        elif sub == "recent":
+            n = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 5
+            if not pi:
+                _cprint("  No active project.")
+                return
+            recent = pi.list_all(limit=n, min_importance=0)
+            if not recent:
+                _cprint("  No insights yet.")
+                return
+            _cprint(f"  Recent {len(recent)} insights:")
+            for i, ins in enumerate(recent, 1):
+                _cprint(f"  {i}. [{ins.importance}/10] [{ins.source}] {ins.text[:120]}")
+
+        else:
+            _cprint("  /insight add \"text\" — add manual insight")
+            _cprint("  /insight search <query> — semantic search")
+            _cprint("  /insight recent [N] — last N insights")
+
+
     def _handle_agents_command(self):
         """Handle /agents — show background processes and multi-agent registry."""
         from tools.process_registry import format_uptime_short, process_registry
@@ -7727,6 +7812,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_blueprint_command(cmd_original)
         elif canonical == "curator":
             self._handle_curator_command(cmd_original)
+        elif canonical == "insights":
+            self._handle_insights(cmd_original)
+        elif canonical == "insight":
+            self._handle_insight_cmd(cmd_original)
         elif canonical == "kanban":
             self._handle_kanban_command(cmd_original)
         elif canonical == "skills":

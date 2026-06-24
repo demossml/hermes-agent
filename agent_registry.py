@@ -1483,15 +1483,18 @@ class AgentRegistry:
                     if ltm_context:
                         msg = ltm_context + "\n\n" + msg
 
-                    # ── Shared insights (cross-agent knowledge) ────
+                    # ── Shared project insights (cross-agent knowledge) ────
                     if cfg.get("shared_insights", True):
                         try:
-                            from core.shared_insights import get_insights
-                            insights_ctx = get_insights().get_context_for(
-                                agent_id, message, k=3,
+                            from projects.project_insights import (
+                                get_insights_context, is_insight_blocked,
                             )
-                            if insights_ctx:
-                                msg = insights_ctx + "\n\n" + msg
+                            if not is_insight_blocked(agent_id):
+                                insights_ctx = get_insights_context(
+                                    message, agent_id=agent_id,
+                                )
+                                if insights_ctx:
+                                    msg = insights_ctx + "\n\n" + msg
                         except Exception:
                             pass
 

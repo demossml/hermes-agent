@@ -263,7 +263,18 @@ class CodeWorkflowManager:
 
     def _format_display(self, status: str, reason: str) -> str:
         """Build a human-readable result summary."""
-        icon = "✅" if status == "passed" else "❌"
+        icon = "✅" if status == "passed"                        # ── Auto-save shared insights ──────────────────
+                        try:
+                            from projects.project_insights import extract_workflow_insights
+                            extract_workflow_insights(
+                                task=self.task,
+                                final_code=final_code,
+                                tester_review=final_review,
+                                score=final_score or 7.0,
+                            )
+                        except Exception:
+                            pass  # Best-effort
+ else "❌"
         iters = f"{self.iteration} iteration(s)"
         lines = [
             f"{icon} Code Workflow {'PASSED' if status == 'passed' else 'FAILED'} "

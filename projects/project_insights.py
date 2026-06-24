@@ -221,6 +221,79 @@ class ProjectInsights:
 
     # ── Auto-extract from workflow ────────────────────────
 
+
+    def extract_with_llm(
+        self,
+        task: str,
+        result_summary: str,
+        *,
+        max_insights: int = 5,
+    ) -> list[str]:
+        """Use an LLM to extract structured insights from a task result.
+
+        Returns list of insight texts (not yet saved).
+        Caller is responsible for adding them via ``add()``.
+        """
+        import re
+
+        texts: list[str] = []
+
+        # Pattern-based extraction (works without LLM)
+        # 1. Technology/library mentions
+        tech = re.findall(
+            r"(?:use|using|install|pip install|import)\s+([a-zA-Z][\w.\-]+)",
+            task + " " + result_summary, re.I)
+        for t in set(tech[:3]):
+            texts.append(f"Technology used in this project: {t}")
+
+        # 2. Performance notes
+        if re.search(r"(?:fast|slow|performance|optimiz|benchmark|throughput)", 
+                      result_summary, re.I):
+            perf_line = ""
+            for line in result_summary.split("\n"):
+                if re.search(r"(?:fast|slow|performance|optimiz|benchmark|throughput)", 
+                             line, re.I):
+                    perf_line = line.strip()[:200]
+                    break
+            if perf_line:
+                texts.append(f"Performance insight: {perf_line}")
+
+        # 3. Architectural decisions
+        arch = re.findall(
+            r"(?:architecture|pattern|design|structure|архитектур|паттерн)[:\s]+(.+?)(?:\.|\n|$)",
+            result_summary, re.I)
+        for a in arch[:2]:
+            a = a.strip()
+            if len(a) > 10:
+                texts.append(f"Architecture decision: {a}")
+
+        # 4. Errors/lessons learned
+        errors = re.findall(
+            r"(?:error|bug|issue|fix|ошибк|баг|исправл|урок)[:\s]+(.+?)(?:\.|\n|$)",
+            result_summary, re.I)
+        for e in errors[:2]:
+            e = e.strip()
+            if len(e) > 10:
+                texts.append(f"Lesson learned: {e}")
+
+        # 5. File/API patterns discovered
+        files = re.findall(
+            r"(?:created?|modified?|changed?|wrote?)\s+(?:file\s+)?([\w/.\-]+\.(?:py|ts|js|go|rs|yaml|json|toml))",
+            result_summary, re.I)
+        for f in set(files[:3]):
+            texts.append(f"Key file in this project: {f}")
+
+        # 6. Best practices mentioned
+        practices = re.findall(
+            r"(?:best practice|recommend|should|always|never|avoid|предпочита|рекоменду)[:\s]+(.+?)(?:\.|\n|$)",
+            result_summary, re.I)
+        for p in practices[:2]:
+            p = p.strip()
+            if len(p) > 10:
+                texts.append(f"Best practice: {p}")
+
+        return texts[:max_insights]
+
     def extract_from_workflow(
         self,
         task: str,
@@ -230,59 +303,41 @@ class ProjectInsights:
     ) -> list[str]:
         """Auto-extract key insights from a completed workflow.
 
-        Uses regex heuristics to find patterns worth remembering.
+        Uses enhanced pattern matching to find:
+        - Technologies used
+        - Performance insights
+        - Architecture decisions
+        - Lessons learned
+        - Key files created
+        - Best practices
+
         Returns list of added insight IDs.
         """
-        insights = []
-        text = f"{task}\n{tester_review}"
+        result_summary = f"{task}\n{tester_review}\nScore: {score}/10"
+        
+        # Use enhanced extraction
+        insight_texts = self.extract_with_llm(task, result_summary)
 
-        # Pattern 1: technology/library mentions
-        tech_matches = re.findall(
-            r"(?:use|using|install|pip install|import)\s+([a-zA-Z][\w.-]+)",
-            text, re.I,
-        )
-        for tech in set(tech_matches[:3]):
-            insights.append(
-                f"Technology used: {tech} — relevant for this project"
-            )
-
-        # Pattern 2: performance/scaling notes
-        if re.search(r"(?:fast|slow|performance|optimiz|benchmark)", text, re.I):
-            insights.append(
-                f"Performance note (score={score:.0f}/10): {tester_review[:150]}"
-            )
-
-        # Pattern 3: architectural decisions
-        arch_match = re.search(
-            r"(?:architecture|pattern|design|структур|архитектур)[:\s]+(.+?)(?:\.|$)",
-            text, re.I,
-        )
-        if arch_match:
-            insights.append(f"Architecture: {arch_match.group(1).strip()}")
-
-        # Pattern 4: error/lesson learned
-        error_match = re.search(
-            r"(?:error|bug|issue|fix|ошибк|баг|исправ)[:\s]+(.+?)(?:\.|$)",
-            text, re.I,
-        )
-        if error_match:
-            insights.append(f"Lesson learned: {error_match.group(1).strip()}")
-
-        # Pattern 5: high-score solutions
+        # Add high-score marker for excellent solutions
         if score >= 8 and final_code:
-            insights.append(
-                f"High-quality solution (score={score:.0f}/10): {task[:100]}"
+            insight_texts.append(
+                f"High-quality solution (score={score:.0f}/10): {task[:120]}"
             )
 
         added = []
-        for text in insights:
+        for i, text in enumerate(insight_texts):
+            importance = 8 if score >= 8 else 6
             iid = self.add(
-                text, importance=7, source="workflow",
-                tags=["auto", f"score_{int(score)}"],
+                text, importance=importance, source="workflow",
+                tags=["auto", f"score_{int(score)}", f"extract_v2"],
             )
             if iid:
                 added.append(iid)
 
+        logger.info(
+            f"Extracted {len(added)} insights from workflow "
+            f"(score={score:.0f}/10, task={task[:40]}...)"
+        )
         return added
 
     # ── Prompt injection ──────────────────────────────────
@@ -338,6 +393,52 @@ def _top_tags(insights: list[Insight], n: int) -> list[tuple[str, int]]:
 # ═══════════════════════════════════════════════════════════════
 # Module-level helpers
 # ═══════════════════════════════════════════════════════════════
+
+
+
+def auto_save_insight(
+    text: str,
+    *,
+    importance: int = 5,
+    source: str = "auto",
+    tags: list[str] | None = None,
+) -> str:
+    """Auto-save a single insight (one-liner for integration hooks).
+
+    Silently fails — never blocks the caller.
+    """
+    try:
+        pi = get_project_insights()
+        if pi:
+            return pi.add(text, importance=importance, source=source, tags=tags or ["auto"])
+    except Exception:
+        pass
+    return ""
+
+
+def auto_save_task_insights(
+    task: str,
+    result: str,
+    *,
+    source: str = "task",
+) -> list[str]:
+    """Auto-extract and save insights after any significant task completes.
+
+    Returns list of added insight IDs.
+    """
+    try:
+        pi = get_project_insights()
+        if not pi:
+            return []
+        texts = pi.extract_with_llm(task, result)
+        ids = []
+        for t in texts:
+            iid = pi.add(t, importance=5, source=source, tags=["auto", "task"])
+            if iid:
+                ids.append(iid)
+        return ids
+    except Exception:
+        return []
 
 # ── Agents BLOCKED from insights (strict Tester isolation) ──
 _TESTER_AGENT_IDS = {"tester", "tester-6a6ba59f", "tester-abc", "reviewer"}

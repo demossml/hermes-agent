@@ -24,6 +24,7 @@ PROJECT_LOCK_FILE = ".project.lock"
 
 _SENSITIVE_FILES = frozenset({
     "AGENTS.md", "SOUL.md", ".env", "project.yaml", "metadata.json",
+    ".project.lock", "insights.jsonl",
 })
 
 _ALWAYS_ALLOWED: tuple[str, ...] = ()
