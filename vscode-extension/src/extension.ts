@@ -22,9 +22,24 @@ let client: HermesClient;
 let inlineProvider: HermesInlineProvider;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-  client = new HermesClient();
-  try { await client.start(); } catch (err) {
-    vscode.window.showErrorMessage(`Hermes: failed to start. ${err}`);
+  const useTailscale = vscode.workspace.getConfiguration('hermes').get<boolean>('server.tailscale', false);
+  if (useTailscale) {
+    let host = vscode.workspace.getConfiguration('hermes').get<string>('server.host', '');
+    const port = vscode.workspace.getConfiguration('hermes').get<number>('server.port', 8787);
+    if (!host) {
+      const discovered = await discoverTailscaleServer();
+      if (discovered) host = discovered.host;
+    }
+    if (host) {
+      client = new (await import('./tailscaleClient')).TailscaleClient(host, port) as any;
+      vscode.window.showInformationMessage(`Hermes: Tailscale ${host}:${port}`);
+    }
+  }
+  if (!client) {
+    client = new HermesClient();
+    try { await (client as HermesClient).start(); } catch (err) {
+      vscode.window.showErrorMessage(`Hermes: ${err}`);
+    }
   }
 
   let projectName = '';

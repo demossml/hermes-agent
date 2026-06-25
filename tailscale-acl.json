@@ -1,0 +1,21 @@
+{
+  "groups": {
+    "group:hermes": ["user@example.com"]
+  },
+  "tagOwners": {
+    "tag:hermes-server": ["group:hermes"]
+  },
+  "acls": [
+    {
+      "action": "accept",
+      "src":    ["group:hermes"],
+      "dst":    ["tag:hermes-server:8787"],
+      "proto":  "tcp"
+    }
+  ],
+  "autoApprovers": {
+    "routes": {
+      "100.64.0.0/10": ["tag:hermes-server"]
+    }
+  }
+}
