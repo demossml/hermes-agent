@@ -32,7 +32,32 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
     if (host) {
       client = new (await import('./tailscaleClient')).TailscaleClient(host, port) as any;
-      vscode.window.showInformationMessage(`Hermes: Tailscale ${host}:${port}`);
+      // Sync manager
+  let syncManager: any = null;
+  context.subscriptions.push(
+    vscode.commands.registerCommand('hermes.syncStart', async () => {
+      const { SyncManager } = await import('./syncManager');
+      const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (!ws) { vscode.window.showErrorMessage('No workspace open'); return; }
+      syncManager = new SyncManager(ws, 'hermes-live');
+      await syncManager.start();
+    }),
+    vscode.commands.registerCommand('hermes.syncStop', () => {
+      syncManager?.stop(); syncManager = null;
+    }),
+    vscode.commands.registerCommand('hermes.syncStatus', () => {
+      if (syncManager) {
+        const s = syncManager.getStatus();
+        vscode.window.showInformationMessage(
+          `Sync: ${s.branch} | Pushed: ${s.pushedCommits} | Pulled: ${s.pulledUpdates}`
+        );
+      } else {
+        vscode.window.showInformationMessage('Sync not running. Use Hermes: Start Sync.');
+      }
+    })
+  );
+
+  vscode.window.showInformationMessage(`Hermes: Tailscale ${host}:${port}`);
     }
   }
   if (!client) {

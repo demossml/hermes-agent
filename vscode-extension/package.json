@@ -138,6 +138,20 @@
         "command": "hermes.inlineMakeFaster",
         "title": "Hermes: Inline Make Faster",
         "icon": "$(zap)"
+      },
+      {
+        "command": "hermes.syncStart",
+        "title": "Hermes: Start Live Sync",
+        "icon": ""
+      },
+      {
+        "command": "hermes.syncStop",
+        "title": "Hermes: Stop Live Sync",
+        "icon": ""
+      },
+      {
+        "command": "hermes.syncStatus",
+        "title": "Hermes: Sync Status"
       }
     ],
     "menus": {
