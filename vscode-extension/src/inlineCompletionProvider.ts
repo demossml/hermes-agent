@@ -9,7 +9,7 @@ import * as vscode from 'vscode';
 import { HermesClient } from './hermesClient';
 
 export class HermesInlineProvider implements vscode.InlineCompletionItemProvider {
-  constructor(private client: HermesClient) {}
+  constructor(private client: any) {}
 
   async provideInlineCompletionItems(
     document: vscode.TextDocument,
@@ -23,7 +23,7 @@ export class HermesInlineProvider implements vscode.InlineCompletionItemProvider
     }
 
     // Only trigger on explicit request or pause
-    if (context.triggerKind !== vscode.InlineCompletionTriggerKind.Explicit) {
+    if (context.triggerKind !== 1 as any) {
       return [];
     }
 

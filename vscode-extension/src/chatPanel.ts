@@ -10,7 +10,7 @@ export class ChatPanelProvider implements vscode.WebviewViewProvider {
   private _view?: vscode.WebviewView;
 
   constructor(
-    private readonly client: HermesClient,
+    private readonly client: any,
     private readonly _extensionUri: vscode.Uri,
     private projectName: string = ''
   ) {}

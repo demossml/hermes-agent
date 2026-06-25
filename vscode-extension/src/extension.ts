@@ -1,14 +1,3 @@
-/**
- * Hermes Agent - VS Code Extension v1.1
- *
- * New in v1.1:
- *   - React + Vite webview with dark theme, markdown, code highlighting
- *   - Copilot-style inline edits (InlineCompletionItemProvider)
- *   - Project card with Quality Score and isolation status
- *   - Quick action buttons (Tester, Browser, Insights, Improve)
- *   - Clickable status bar with rich tooltip
- */
-
 import * as vscode from 'vscode';
 import { HermesClient } from './hermesClient';
 import { ChatPanelProvider } from './chatPanel';
@@ -18,59 +7,37 @@ import { registerCommands } from './commands';
 import { createStatusBar, updateStatusBar } from './statusBar';
 import { detectProject } from './projectDetector';
 
-let client: HermesClient;
+let client: any;
 let inlineProvider: HermesInlineProvider;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  // Try Tailscale first, fall back to local
   const useTailscale = vscode.workspace.getConfiguration('hermes').get<boolean>('server.tailscale', false);
   if (useTailscale) {
     let host = vscode.workspace.getConfiguration('hermes').get<string>('server.host', '');
     const port = vscode.workspace.getConfiguration('hermes').get<number>('server.port', 8787);
     if (!host) {
+      const { discoverTailscaleServer } = await import('./tailscaleClient');
       const discovered = await discoverTailscaleServer();
       if (discovered) host = discovered.host;
     }
     if (host) {
-      client = new (await import('./tailscaleClient')).TailscaleClient(host, port) as any;
-      // Sync manager
-  let syncManager: any = null;
-  context.subscriptions.push(
-    vscode.commands.registerCommand('hermes.syncStart', async () => {
-      const { SyncManager } = await import('./syncManager');
-      const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-      if (!ws) { vscode.window.showErrorMessage('No workspace open'); return; }
-      syncManager = new SyncManager(ws, 'hermes-live');
-      await syncManager.start();
-    }),
-    vscode.commands.registerCommand('hermes.syncStop', () => {
-      syncManager?.stop(); syncManager = null;
-    }),
-    vscode.commands.registerCommand('hermes.syncStatus', () => {
-      if (syncManager) {
-        const s = syncManager.getStatus();
-        vscode.window.showInformationMessage(
-          `Sync: ${s.branch} | Pushed: ${s.pushedCommits} | Pulled: ${s.pulledUpdates}`
-        );
-      } else {
-        vscode.window.showInformationMessage('Sync not running. Use Hermes: Start Sync.');
-      }
-    })
-  );
-
-  vscode.window.showInformationMessage(`Hermes: Tailscale ${host}:${port}`);
+      const { TailscaleClient } = await import('./tailscaleClient');
+      client = new TailscaleClient(host, port);
+      vscode.window.showInformationMessage(`Hermes: Tailscale ${host}:${port}`);
     }
   }
   if (!client) {
     client = new HermesClient();
-    try { await (client as HermesClient).start(); } catch (err) {
+    try { await client.start(); } catch (err) {
       vscode.window.showErrorMessage(`Hermes: ${err}`);
     }
   }
 
   let projectName = '';
   if (vscode.workspace.getConfiguration('hermes').get<boolean>('autoDetectProject', true)) {
-    const detected = detectProject(vscode.workspace.workspaceFolders?.[0]);
-    if (detected) { projectName = detected; client.switchProject(detected).catch(() => {}); }
+    const d = detectProject(vscode.workspace.workspaceFolders?.[0]);
+    if (d) { projectName = d; client.switchProject(d).catch(() => {}); }
   }
 
   const chatProvider = new ChatPanelProvider(client, context.extensionUri, projectName);
@@ -96,10 +63,33 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand('hermes.inlineMakeFaster', () => ic.handleInlineCommand('faster'))
   );
 
+  // Sync manager
+  let syncManager: any = null;
+  context.subscriptions.push(
+    vscode.commands.registerCommand('hermes.syncStart', async () => {
+      const { SyncManager } = await import('./syncManager');
+      const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (!ws) { vscode.window.showErrorMessage('No workspace open'); return; }
+      syncManager = new SyncManager(ws, 'hermes-live');
+      await syncManager.start();
+    }),
+    vscode.commands.registerCommand('hermes.syncStop', () => {
+      syncManager?.stop(); syncManager = null;
+    }),
+    vscode.commands.registerCommand('hermes.syncStatus', () => {
+      if (syncManager) {
+        const s = syncManager.getStatus();
+        vscode.window.showInformationMessage(`Sync: ${s.branch} | Pushed: ${s.pushedCommits} | Pulled: ${s.pulledUpdates}`);
+      } else {
+        vscode.window.showInformationMessage('Sync not running. Use Hermes: Start Sync.');
+      }
+    })
+  );
+
   registerCommands(client, context);
   registerContextActions(client, context);
 
-  client.onProjectSwitch((name) => { chatProvider.updateProject(name); updateStatusBar(name); });
+  client.onProjectSwitch?.((name: string) => { chatProvider.updateProject(name); updateStatusBar(name); });
 
   vscode.workspace.onDidChangeWorkspaceFolders(() => {
     const d = detectProject(vscode.workspace.workspaceFolders?.[0]);
@@ -109,4 +99,4 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   vscode.window.showInformationMessage(`Hermes Agent v1.1${projectName ? ' - ' + projectName : ''}`);
 }
 
-export function deactivate(): void { client?.dispose(); }
+export function deactivate(): void { client?.dispose?.(); }

@@ -62,7 +62,7 @@ export class TailscaleClient {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ jsonrpc: '2.0', method, params, id: Date.now() }),
     });
-    const data = await resp.json();
+    const data: any = await resp.json();
     if (data.error) throw new Error(data.error.message);
     return data.result;
   }
