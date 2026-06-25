@@ -1,11 +1,6 @@
 /**
- * Hermes ACP Client — communicates with Hermes Agent via ACP JSON-RPC.
- *
- * Hermes ships with an ACP server (`hermes acp`) that speaks the
- * Agent Communication Protocol over stdio. This client spawns that
- * process and provides a typed API for the extension.
+ * Hermes ACP Client — JSON-RPC over stdio.
  */
-
 import * as cp from 'child_process';
 import * as vscode from 'vscode';
 
@@ -16,25 +11,6 @@ interface AcpMessage {
   params?: any;
   result?: any;
   error?: { code: number; message: string };
-}
-
-interface ChatRequest {
-  message: string;
-  context?: {
-    workspaceFolder: string;
-    openFiles: string[];
-    gitStatus: string;
-    selectedCode?: string;
-    currentFile?: string;
-  };
-}
-
-interface ChatResponse {
-  text: string;
-  projectName?: string;
-  qualityScore?: number;
-  activeWorkflows?: string[];
-  toolCalls?: string[];
 }
 
 export class HermesClient {
@@ -59,20 +35,19 @@ export class HermesClient {
     });
 
     this.process.stdout?.on('data', (chunk: Buffer) => this._onData(chunk.toString()));
-    this.process.stderr?.on('data', (d: Buffer) => console.error('[hermes stderr]', d.toString()));
-    this.process.on('exit', (code) => console.log(`[hermes] exited with code ${code}`));
+    this.process.stderr?.on('data', (d: Buffer) => console.error('[hermes]', d.toString()));
+    this.process.on('exit', (code) => console.log(`[hermes] exited ${code}`));
 
-    // Wait for initialisation
     await this._sendRequest('initialize', {
       client: 'vscode-extension',
-      version: '1.0.0',
+      version: '1.1.0',
       workspaceFolder,
     });
   }
 
-  async chat(request: ChatRequest): Promise<ChatResponse> {
-    const reply = await this._sendRequest('chat/send', request);
-    return reply as ChatResponse;
+  async chat(message: string, context?: any): Promise<string> {
+    const r = await this._sendRequest('chat/send', { message, context });
+    return (r as any)?.text ?? (r as any)?.reply ?? '';
   }
 
   async getStatus(): Promise<any> {
@@ -108,12 +83,25 @@ export class HermesClient {
     return (r as any)?.tests ?? '';
   }
 
+  async inlineComplete(
+    surroundingCode: string,
+    filePath: string,
+    line: number,
+    character: number
+  ): Promise<string> {
+    const r = await this._sendRequest('code/inlineComplete', {
+      code: surroundingCode,
+      file: filePath,
+      line,
+      character,
+    });
+    return (r as any)?.completion ?? '';
+  }
+
   dispose(): void {
     this.process?.kill();
     this.process = null;
   }
-
-  // ── private ──────────────────────────────────────────────
 
   private _onData(data: string): void {
     this.buffer += data;
@@ -127,25 +115,17 @@ export class HermesClient {
           this.pending.get(msg.id as number)!(msg);
           this.pending.delete(msg.id as number);
         }
-      } catch {
-        // skip malformed lines
-      }
+      } catch {}
     }
   }
 
   private _sendRequest(method: string, params: any): Promise<any> {
     return new Promise((resolve, reject) => {
       const id = ++this.requestId;
-      const msg: AcpMessage = { jsonrpc: '2.0', id, method, params };
       this.pending.set(id, (response) => {
-        if (response.error) {
-          reject(new Error(response.error.message));
-        } else {
-          resolve(response.result);
-        }
+        response.error ? reject(new Error(response.error.message)) : resolve(response.result);
       });
-      this.process?.stdin?.write(JSON.stringify(msg) + '\n');
-      // Timeout after 120s
+      this.process?.stdin?.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
       setTimeout(() => {
         if (this.pending.has(id)) {
           this.pending.delete(id);

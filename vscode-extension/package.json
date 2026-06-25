@@ -1,8 +1,8 @@
 {
   "name": "hermes-agent",
   "displayName": "Hermes Agent",
-  "description": "AI agent for coding, testing, and project management — sidebar chat, context actions, tester integration",
-  "version": "1.0.0",
+  "description": "AI agent for coding, testing, and project management — Copilot-style inline edits, sidebar chat, tester integration",
+  "version": "1.1.0",
   "publisher": "hermes-agent",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -21,13 +21,8 @@
     "Other"
   ],
   "keywords": [
-    "ai",
-    "agent",
-    "hermes",
-    "coding",
-    "testing",
-    "chat",
-    "multi-agent"
+    "ai", "agent", "hermes", "coding", "testing", "chat",
+    "multi-agent", "copilot", "inline", "completion"
   ],
   "activationEvents": [
     "onStartupFinished"
@@ -58,145 +53,76 @@
       ]
     },
     "commands": [
-      {
-        "command": "hermes.openChat",
-        "title": "Hermes: Open Chat",
-        "icon": "$(comment-discussion)"
-      },
-      {
-        "command": "hermes.switchProject",
-        "title": "Hermes: Switch Project"
-      },
-      {
-        "command": "hermes.showInsights",
-        "title": "Hermes: Show Insights"
-      },
-      {
-        "command": "hermes.runFullTest",
-        "title": "Hermes: Run Full Test"
-      },
-      {
-        "command": "hermes.openDashboard",
-        "title": "Hermes: Open Dashboard"
-      },
-      {
-        "command": "hermes.guardStatus",
-        "title": "Hermes: Guard Status"
-      },
-      {
-        "command": "hermes.askAboutCode",
-        "title": "Hermes: Ask About Selected Code"
-      },
-      {
-        "command": "hermes.improveCode",
-        "title": "Hermes: Improve This Code"
-      },
-      {
-        "command": "hermes.generateTests",
-        "title": "Hermes: Generate Tests"
-      },
-      {
-        "command": "hermes.analyzeWithBrowser",
-        "title": "Hermes: Analyze with Browser Tool"
-      },
-      {
-        "command": "hermes.runTesterOnFile",
-        "title": "Hermes: Run Tester on This File"
-      },
-      {
-        "command": "hermes.showStatus",
-        "title": "Hermes: Show Status"
-      },
-      {
-        "command": "hermes.currentProject",
-        "title": "Hermes: Show Current Project"
-      }
+      { "command": "hermes.openChat", "title": "Hermes: Open Chat", "icon": "$(comment-discussion)" },
+      { "command": "hermes.switchProject", "title": "Hermes: Switch Project" },
+      { "command": "hermes.showInsights", "title": "Hermes: Show Insights" },
+      { "command": "hermes.runFullTest", "title": "Hermes: Run Full Test" },
+      { "command": "hermes.openDashboard", "title": "Hermes: Open Dashboard" },
+      { "command": "hermes.guardStatus", "title": "Hermes: Guard Status" },
+      { "command": "hermes.askAboutCode", "title": "Hermes: Ask About Selected Code" },
+      { "command": "hermes.improveCode", "title": "Hermes: Improve This Code" },
+      { "command": "hermes.generateTests", "title": "Hermes: Generate Tests" },
+      { "command": "hermes.analyzeWithBrowser", "title": "Hermes: Analyze with Browser Tool" },
+      { "command": "hermes.runTesterOnFile", "title": "Hermes: Run Tester on This File" },
+      { "command": "hermes.showStatus", "title": "Hermes: Show Status" },
+      { "command": "hermes.currentProject", "title": "Hermes: Show Current Project" },
+      { "command": "hermes.inlineImprove", "title": "Hermes: Inline Improve", "icon": "$(sparkle)" },
+      { "command": "hermes.inlineFix", "title": "Hermes: Inline Fix", "icon": "$(debug)" },
+      { "command": "hermes.inlineAddTests", "title": "Hermes: Inline Add Tests", "icon": "$(beaker)" },
+      { "command": "hermes.inlineAddComments", "title": "Hermes: Inline Add Comments", "icon": "$(book)" },
+      { "command": "hermes.inlineMakeFaster", "title": "Hermes: Inline Make Faster", "icon": "$(zap)" }
     ],
     "menus": {
       "editor/context": [
-        {
-          "command": "hermes.askAboutCode",
-          "group": "hermes",
-          "when": "editorHasSelection"
-        },
-        {
-          "command": "hermes.improveCode",
-          "group": "hermes",
-          "when": "editorHasSelection"
-        },
-        {
-          "command": "hermes.generateTests",
-          "group": "hermes",
-          "when": "editorHasSelection"
-        },
-        {
-          "command": "hermes.analyzeWithBrowser",
-          "group": "hermes_web",
-          "when": "editorHasSelection"
-        },
-        {
-          "command": "hermes.runTesterOnFile",
-          "group": "hermes",
-          "when": "editorLangId == python || editorLangId == typescript || editorLangId == javascript"
-        }
+        { "command": "hermes.inlineImprove", "group": "hermes@1", "when": "editorHasSelection" },
+        { "command": "hermes.inlineFix", "group": "hermes@2", "when": "editorHasSelection" },
+        { "command": "hermes.inlineAddTests", "group": "hermes@3", "when": "editorHasSelection" },
+        { "command": "hermes.inlineAddComments", "group": "hermes@4", "when": "editorHasSelection" },
+        { "command": "hermes.inlineMakeFaster", "group": "hermes@5", "when": "editorHasSelection" },
+        { "command": "hermes.askAboutCode", "group": "hermes@6", "when": "editorHasSelection" },
+        { "command": "hermes.runTesterOnFile", "group": "hermes@7", "when": "editorLangId == python || editorLangId == typescript || editorLangId == javascript" }
       ],
       "view/title": [
-        {
-          "command": "hermes.switchProject",
-          "when": "view == hermes.chatView",
-          "group": "navigation"
-        }
+        { "command": "hermes.switchProject", "when": "view == hermes.chatView", "group": "navigation" }
       ]
     },
     "configuration": {
       "title": "Hermes Agent",
       "properties": {
-        "hermes.cliPath": {
-          "type": "string",
-          "default": "hermes",
-          "description": "Path to the Hermes CLI binary"
-        },
-        "hermes.autoDetectProject": {
-          "type": "boolean",
-          "default": true,
-          "description": "Auto-detect project from workspace folder"
-        },
-        "hermes.showStatusBar": {
-          "type": "boolean",
-          "default": true,
-          "description": "Show project name in the VS Code status bar"
-        },
-        "hermes.chatModel": {
-          "type": "string",
-          "default": "",
-          "description": "Override model for chat (empty = use Hermes default)"
-        },
-        "hermes.maxContextFiles": {
-          "type": "integer",
-          "default": 5,
-          "description": "Maximum number of open files to include in context"
-        }
+        "hermes.cliPath": { "type": "string", "default": "hermes", "description": "Path to the Hermes CLI" },
+        "hermes.autoDetectProject": { "type": "boolean", "default": true, "description": "Auto-detect project from workspace" },
+        "hermes.showStatusBar": { "type": "boolean", "default": true, "description": "Show project in status bar" },
+        "hermes.inlineEnabled": { "type": "boolean", "default": true, "description": "Enable Copilot-style inline edits" },
+        "hermes.inlineTriggerDelay": { "type": "integer", "default": 300, "description": "Delay (ms) before triggering inline completion" },
+        "hermes.chatModel": { "type": "string", "default": "", "description": "Override model for chat" },
+        "hermes.maxContextFiles": { "type": "integer", "default": 5, "description": "Max files in context" }
       }
     }
   },
   "scripts": {
     "vscode:prepublish": "npm run build",
-    "build": "webpack --mode production",
+    "build": "npm run build:ext && npm run build:webview",
+    "build:ext": "webpack --mode production --config webpack.ext.config.js",
+    "build:webview": "cd webview && npm run build",
     "watch": "webpack --mode development --watch",
+    "dev:webview": "cd webview && npm run dev",
     "lint": "eslint src --ext ts"
   },
   "devDependencies": {
-    "@types/vscode": "^1.85.0",
     "@types/node": "^20.0.0",
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "@types/vscode": "^1.85.0",
+    "css-loader": "^6.8.0",
+    "style-loader": "^3.3.0",
+    "ts-loader": "^9.5.0",
     "typescript": "^5.3.0",
     "webpack": "^5.89.0",
-    "webpack-cli": "^5.1.4",
-    "ts-loader": "^9.5.0",
-    "eslint": "^8.50.0",
-    "@typescript-eslint/eslint-plugin": "^6.0.0",
-    "@typescript-eslint/parser": "^6.0.0"
+    "webpack-cli": "^5.1.4"
   },
   "dependencies": {
+    "@vscode/webview-ui-toolkit": "^1.4.0",
+    "marked": "^11.0.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
   }

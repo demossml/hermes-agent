@@ -1,0 +1,56 @@
+:root {
+  --hermes-accent: #a78bfa;
+  --hermes-accent-dim: #7c3aed;
+  --hermes-green: #34d399;
+  --hermes-yellow: #fbbf24;
+  --hermes-red: #f87171;
+  --hermes-blue: #60a5fa;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, sans-serif);
+  font-size: var(--vscode-font-size, 13px);
+  color: var(--vscode-foreground);
+  background: var(--vscode-sideBar-background);
+  padding: 0;
+  height: 100vh;
+  overflow: hidden;
+}
+
+#root {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+a { color: var(--hermes-accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+code {
+  font-family: var(--vscode-editor-font-family, 'Fira Code', monospace);
+  font-size: 12px;
+  background: var(--vscode-textCodeBlock-background);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+pre {
+  background: var(--vscode-textCodeBlock-background);
+  border-radius: 6px;
+  padding: 12px;
+  overflow-x: auto;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+pre code {
+  background: none;
+  padding: 0;
+}
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--vscode-scrollbarSlider-hoverBackground); }

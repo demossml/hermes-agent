@@ -1,85 +1,72 @@
 /**
- * Hermes Agent — VS Code Extension
+ * Hermes Agent - VS Code Extension v1.1
  *
- * Entry point. Activates:
- *   - Hermes ACP client (spawns hermes acp)
- *   - Sidebar chat panel (webview)
- *   - Status bar with project info
- *   - Context menu actions
- *   - Command palette commands
+ * New in v1.1:
+ *   - React + Vite webview with dark theme, markdown, code highlighting
+ *   - Copilot-style inline edits (InlineCompletionItemProvider)
+ *   - Project card with Quality Score and isolation status
+ *   - Quick action buttons (Tester, Browser, Insights, Improve)
+ *   - Clickable status bar with rich tooltip
  */
 
 import * as vscode from 'vscode';
 import { HermesClient } from './hermesClient';
 import { ChatPanelProvider } from './chatPanel';
+import { HermesInlineProvider } from './inlineCompletionProvider';
 import { registerContextActions } from './contextActions';
 import { registerCommands } from './commands';
 import { createStatusBar, updateStatusBar } from './statusBar';
 import { detectProject } from './projectDetector';
 
 let client: HermesClient;
+let inlineProvider: HermesInlineProvider;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-  // ── 1. Start Hermes ACP client ──────────────────────────
   client = new HermesClient();
-  try {
-    await client.start();
-  } catch (err) {
-    vscode.window.showErrorMessage(
-      `Hermes Agent: failed to start. Is Hermes installed? Run 'hermes --help' in terminal.\n${err}`
-    );
+  try { await client.start(); } catch (err) {
+    vscode.window.showErrorMessage(`Hermes: failed to start. ${err}`);
   }
 
-  // ── 2. Detect project ───────────────────────────────────
-  const autoDetect = vscode.workspace.getConfiguration('hermes').get<boolean>('autoDetectProject', true);
   let projectName = '';
-  if (autoDetect) {
+  if (vscode.workspace.getConfiguration('hermes').get<boolean>('autoDetectProject', true)) {
     const detected = detectProject(vscode.workspace.workspaceFolders?.[0]);
-    if (detected) {
-      projectName = detected;
-      client.switchProject(detected).catch(() => {});
-    }
+    if (detected) { projectName = detected; client.switchProject(detected).catch(() => {}); }
   }
 
-  // ── 3. Sidebar chat panel ───────────────────────────────
   const chatProvider = new ChatPanelProvider(client, context.extensionUri, projectName);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(ChatPanelProvider.viewType, chatProvider)
   );
 
-  // ── 4. Status bar ───────────────────────────────────────
-  const showSb = vscode.workspace.getConfiguration('hermes').get<boolean>('showStatusBar', true);
-  if (showSb) {
-    createStatusBar();
-    updateStatusBar(projectName);
+  if (vscode.workspace.getConfiguration('hermes').get<boolean>('showStatusBar', true)) {
+    createStatusBar(); updateStatusBar(projectName);
   }
 
-  // ── 5. Register commands & context actions ──────────────
+  inlineProvider = new HermesInlineProvider(client);
+  context.subscriptions.push(
+    vscode.languages.registerInlineCompletionItemProvider({ pattern: '**' }, inlineProvider)
+  );
+
+  const ic = inlineProvider;
+  context.subscriptions.push(
+    vscode.commands.registerCommand('hermes.inlineImprove', () => ic.handleInlineCommand('improve')),
+    vscode.commands.registerCommand('hermes.inlineFix', () => ic.handleInlineCommand('fix')),
+    vscode.commands.registerCommand('hermes.inlineAddTests', () => ic.handleInlineCommand('tests')),
+    vscode.commands.registerCommand('hermes.inlineAddComments', () => ic.handleInlineCommand('comments')),
+    vscode.commands.registerCommand('hermes.inlineMakeFaster', () => ic.handleInlineCommand('faster'))
+  );
+
   registerCommands(client, context);
   registerContextActions(client, context);
 
-  // ── 6. React to project switches ────────────────────────
-  client.onProjectSwitch((name) => {
-    chatProvider.updateProject(name);
-    updateStatusBar(name);
-  });
+  client.onProjectSwitch((name) => { chatProvider.updateProject(name); updateStatusBar(name); });
 
-  // ── 7. Watch workspace folder changes ───────────────────
   vscode.workspace.onDidChangeWorkspaceFolders(() => {
-    const detected = detectProject(vscode.workspace.workspaceFolders?.[0]);
-    if (detected && detected !== projectName) {
-      projectName = detected;
-      client.switchProject(detected).catch(() => {});
-      chatProvider.updateProject(detected);
-      updateStatusBar(detected);
-    }
+    const d = detectProject(vscode.workspace.workspaceFolders?.[0]);
+    if (d && d !== projectName) { projectName = d; client.switchProject(d).catch(() => {}); chatProvider.updateProject(d); updateStatusBar(d); }
   });
 
-  vscode.window.showInformationMessage(
-    `Hermes Agent activated${projectName ? ` — Project: ${projectName}` : ''}`
-  );
+  vscode.window.showInformationMessage(`Hermes Agent v1.1${projectName ? ' - ' + projectName : ''}`);
 }
 
-export function deactivate(): void {
-  client?.dispose();
-}
+export function deactivate(): void { client?.dispose(); }
