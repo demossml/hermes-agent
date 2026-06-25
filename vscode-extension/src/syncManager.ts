@@ -1,11 +1,10 @@
 /**
- * Live Sync Manager — bidirectional code sync via git.
+ * Live Sync Manager v2 — Tailscale-only bidirectional code sync.
  *
- * Auto-commits on save, auto-pulls on focus, status bar indicator.
+ * Auto-commits on save, auto-pulls on focus. Shows Tailscale IP in status bar.
  */
 import * as vscode from 'vscode';
 import * as cp from 'child_process';
-import * as path from 'path';
 
 export class SyncManager {
   private _watcher: vscode.FileSystemWatcher | null = null;
@@ -14,106 +13,103 @@ export class SyncManager {
   private _running = false;
   private _pushedCommits = 0;
   private _pulledUpdates = 0;
+  private _tsIp = '';
 
-  constructor(private _workspaceDir: string, private _branch: string = 'hermes-live') {
+  constructor(private _workspaceDir: string, private _branch = 'hermes-live') {
     this._statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
     this._statusBar.command = 'hermes.syncStatus';
-    this._statusBar.tooltip = 'Hermes Live Sync';
+  }
+
+  private _exec(cmd: string): Promise<string> {
+    return new Promise((resolve) => {
+      cp.exec(cmd, { cwd: this._workspaceDir, timeout: 30000 }, (_, stdout) => resolve(stdout?.trim() ?? ''));
+    });
+  }
+
+  private async _git(args: string[]): Promise<string> {
+    return this._exec(`git ${args.join(' ')}`);
   }
 
   async start(): Promise<void> {
     if (this._running) return;
-    this._running = true;
 
-    // Ensure branch exists
-    await this._git(['checkout', '-b', this._branch], true);
+    // Detect Tailscale IP
+    try {
+      this._tsIp = await this._exec('tailscale ip -4');
+    } catch { this._tsIp = ''; }
 
-    // Initial sync
-    await this._pull();
-    if (await this._hasChanges()) {
-      await this._commitPush();
+    if (!this._tsIp || !this._tsIp.startsWith('100.')) {
+      const choice = await vscode.window.showErrorMessage(
+        'Hermes Live Sync requires Tailscale. Tailscale not detected.',
+        'Install Tailscale', 'Start anyway (unsafe)'
+      );
+      if (choice === 'Install Tailscale') {
+        vscode.env.openExternal(vscode.Uri.parse('https://tailscale.com/download'));
+      }
+      if (choice !== 'Start anyway (unsafe)') return;
     }
 
-    // Watch for file saves
+    this._running = true;
+    await this._git(['checkout', '-b', this._branch]);
+    await this._pull();
+    if (await this._hasChanges()) await this._commitPush();
+
     this._watcher = vscode.workspace.createFileSystemWatcher('**/*');
-    let debounceTimer: NodeJS.Timeout | null = null;
-
-    this._watcher.onDidChange(async (uri) => {
-      if (debounceTimer) clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(async () => {
+    let debounce: NodeJS.Timeout | null = null;
+    const onFsChange = () => {
+      if (debounce) clearTimeout(debounce);
+      debounce = setTimeout(async () => {
         if (await this._hasChanges()) {
           await this._commitPush();
-          this._updateStatus('$(cloud-upload)');
+          this._updateBar('$(cloud-upload)');
         }
       }, 2000);
-    });
+    };
+    this._watcher.onDidChange(onFsChange);
+    this._watcher.onDidCreate(onFsChange);
 
-    this._watcher.onDidCreate(async () => {
-      if (debounceTimer) clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(async () => {
-        if (await this._hasChanges()) {
-          await this._commitPush();
-          this._updateStatus('$(cloud-upload)');
-        }
-      }, 2000);
-    });
-
-    // Auto-pull every 5 seconds
     this._pullTimer = setInterval(async () => {
-      const pulled = await this._pull();
-      if (pulled) {
+      if (await this._pull()) {
         this._pulledUpdates++;
-        this._updateStatus('$(cloud-download)');
-        // Refresh open editors
-        await vscode.commands.executeCommand('workbench.action.files.revert');
+        this._updateBar('$(cloud-download)');
+        try { await vscode.commands.executeCommand('workbench.action.files.revert'); } catch {}
       }
     }, 5000);
 
-    // Auto-pull on window focus
     vscode.window.onDidChangeWindowState(async (e) => {
       if (e.focused) {
         await this._pull();
-        await vscode.commands.executeCommand('workbench.action.files.revert');
+        try { await vscode.commands.executeCommand('workbench.action.files.revert'); } catch {}
       }
     });
 
     this._statusBar.show();
-    this._updateStatus('$(sync~spin)');
-    vscode.window.showInformationMessage(`Hermes Live Sync: ${this._branch}`);
+    this._updateBar('$(sync~spin)');
+    vscode.window.showInformationMessage(
+      `Hermes Live Sync: ${this._branch} via Tailscale (${this._tsIp || 'local'})`
+    );
   }
 
   stop(): void {
     this._running = false;
-    this._watcher?.dispose();
-    this._watcher = null;
+    this._watcher?.dispose(); this._watcher = null;
     if (this._pullTimer) { clearInterval(this._pullTimer); this._pullTimer = null; }
     this._statusBar.hide();
     vscode.window.showInformationMessage('Hermes Live Sync stopped');
   }
 
-  getStatus(): { running: boolean; branch: string; pushedCommits: number; pulledUpdates: number } {
+  getStatus() {
     return {
-      running: this._running,
-      branch: this._branch,
-      pushedCommits: this._pushedCommits,
-      pulledUpdates: this._pulledUpdates,
+      running: this._running, branch: this._branch,
+      tailscaleIp: this._tsIp,
+      pushedCommits: this._pushedCommits, pulledUpdates: this._pulledUpdates,
     };
   }
 
-  private _updateStatus(icon: string): void {
-    this._statusBar.text = `$(git-branch) Sync: ${this._branch} ${icon}`;
-    this._statusBar.tooltip = `Hermes Live Sync [${this._branch}]\nPushed: ${this._pushedCommits}\nPulled: ${this._pulledUpdates}`;
-  }
-
-  private async _git(args: string[], ignoreError = false): Promise<string> {
-    return new Promise((resolve) => {
-      cp.exec(`git ${args.join(' ')}`, { cwd: this._workspaceDir, timeout: 30000 }, (err, stdout) => {
-        if (err && !ignoreError) {
-          console.error(`git ${args[0]} error:`, err.message);
-        }
-        resolve(stdout?.trim() ?? '');
-      });
-    });
+  private _updateBar(icon: string): void {
+    const ip = this._tsIp ? ` (${this._tsIp})` : '';
+    this._statusBar.text = `$(git-branch) Sync: ${this._branch}${ip} ${icon}`;
+    this._statusBar.tooltip = `Hermes Live Sync [${this._branch}]\nTailscale: ${this._tsIp || 'N/A'}\nPushed: ${this._pushedCommits}\nPulled: ${this._pulledUpdates}`;
   }
 
   private async _hasChanges(): Promise<boolean> {
@@ -135,8 +131,5 @@ export class SyncManager {
     return !out.includes('Already up to date');
   }
 
-  dispose(): void {
-    this.stop();
-    this._statusBar.dispose();
-  }
+  dispose(): void { this.stop(); this._statusBar.dispose(); }
 }

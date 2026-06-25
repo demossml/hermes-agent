@@ -3,19 +3,20 @@
     "group:hermes": ["user@example.com"]
   },
   "tagOwners": {
-    "tag:hermes-server": ["group:hermes"]
+    "tag:hermes-server": ["group:hermes"],
+    "tag:hermes-sync": ["group:hermes"]
   },
   "acls": [
     {
       "action": "accept",
       "src":    ["group:hermes"],
-      "dst":    ["tag:hermes-server:8787"],
+      "dst":    ["tag:hermes-server:8787", "tag:hermes-sync:*"],
       "proto":  "tcp"
     }
   ],
   "autoApprovers": {
     "routes": {
-      "100.64.0.0/10": ["tag:hermes-server"]
+      "100.64.0.0/10": ["tag:hermes-server", "tag:hermes-sync"]
     }
   }
 }

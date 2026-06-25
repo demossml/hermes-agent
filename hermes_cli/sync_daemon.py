@@ -1,244 +1,181 @@
+"""Hermes Live Sync Daemon v2 — Tailscale-only bidirectional code sync.
 
-"""
-Hermes Live Sync Daemon — bidirectional real-time code sync via git.
-
-Watches a project directory for file changes. On change:
-  1. git add -A
-  2. git commit -m "sync: auto-commit at {timestamp}"
-  3. git pull --rebase origin <branch>
-  4. git push origin <branch>
-
-Also runs a periodic pull (every 5s) to receive remote changes.
-
-Usage:
-    python3 -m hermes_cli.sync_daemon --dir ~/project --branch hermes-live
+REQUIRES Tailscale. On change: git add + commit + push.
+Periodic pull every 5s. Status includes Tailscale IP, hostname, latency.
 """
 from __future__ import annotations
-
-import logging, os, subprocess, sys, time
+import json, logging, os, subprocess, sys, time
 from datetime import datetime
-from pathlib import Path
 from threading import Thread, Event
 from typing import Optional
-
 logger = logging.getLogger(__name__)
 
-# ── Git helpers ──────────────────────────────────────────────
+# -- Tailscale --
+def _ts(cmd, timeout=5):
+    try:
+        r = subprocess.run(["tailscale"] + cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+    except: return -1, "", ""
+def _ts_ip():
+    rc, out, _ = _ts(["ip", "-4"])
+    return out if rc == 0 and out.startswith("100.") else None
+def _ts_hostname():
+    rc, out, _ = _ts(["status", "--json"])
+    if rc == 0:
+        try: return json.loads(out).get("Self", {}).get("HostName", "unknown")
+        except: pass
+    return os.uname().nodename if hasattr(os, "uname") else "unknown"
+def _ts_peers():
+    rc, out, _ = _ts(["status", "--json"])
+    if rc != 0: return []
+    try:
+        data = json.loads(out)
+        return [{"hostname": p.get("HostName", pid), "ip": (p.get("TailscaleIPs") or [None])[0], "online": p.get("Online", False)} for pid, p in data.get("Peer", {}).items()]
+    except: return []
+def _ts_must_be_connected():
+    if not _ts(["version"])[0] == 0:
+        return None, "Tailscale not installed. https://tailscale.com/download"
+    ip = _ts_ip()
+    if not ip: return None, "Tailscale not connected. Use: tailscale up"
+    return ip, None
+def _ts_latency_to(peer_ip):
+    try:
+        r = subprocess.run(["ping", "-c", "1", "-W", "2", peer_ip], capture_output=True, text=True, timeout=3)
+        import re
+        for line in r.stdout.split("\n"):
+            m = re.search(r"time=([0-9.]+)", line)
+            if m: return float(m.group(1))
+    except: pass
+    return -1.0
 
-def _git(cmd: list[str], cwd: str, timeout: int = 30) -> tuple[int, str, str]:
+# -- Git --
+def _git(cmd, cwd, timeout=30):
     try:
         r = subprocess.run(["git"] + cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
         return r.returncode, r.stdout.strip(), r.stderr.strip()
-    except subprocess.TimeoutExpired:
-        return -1, "", "timeout"
-    except Exception as e:
-        return -1, "", str(e)
-
-def _has_changes(cwd: str) -> bool:
+    except: return -1, "", ""
+def _has_changes(cwd):
     rc, out, _ = _git(["status", "--porcelain"], cwd)
     return rc == 0 and bool(out)
-
-def _commit(cwd: str, branch: str) -> bool:
-    if not _has_changes(cwd):
-        return False
+def _commit(cwd, branch):
+    if not _has_changes(cwd): return False
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    host = os.uname().nodename if hasattr(os, 'uname') else 'unknown'
+    host = _ts_hostname()
+    tip = _ts_ip() or "no-ts"
     _git(["add", "-A"], cwd)
-    rc, _, _ = _git(["commit", "-m", f"sync: {host} at {ts}"], cwd)
+    rc, _, _ = _git(["commit", "-m", f"sync: {host} ({tip}) at {ts}"], cwd)
     return rc == 0
-
-def _pull(cwd: str, branch: str) -> bool:
-    rc, out, err = _git(["pull", "--rebase", "origin", branch], cwd, timeout=60)
-    if rc != 0:
-        logger.warning("Pull failed: %s %s", out, err)
+def _pull(cwd, branch):
+    rc, _, _ = _git(["pull", "--rebase", "origin", branch], cwd, timeout=60)
     return rc == 0
-
-def _push(cwd: str, branch: str) -> bool:
-    rc, out, err = _git(["push", "origin", branch], cwd, timeout=30)
-    if rc != 0:
-        logger.warning("Push failed: %s %s", out, err)
+def _push(cwd, branch):
+    rc, _, _ = _git(["push", "origin", branch], cwd, timeout=30)
     return rc == 0
-
-def _ensure_branch(cwd: str, branch: str) -> bool:
+def _ensure_branch(cwd, branch):
     rc, _, _ = _git(["rev-parse", "--verify", branch], cwd)
     if rc != 0:
         rc2, _, _ = _git(["checkout", "-b", branch], cwd)
         return rc2 == 0
     return True
 
-# ── File watcher ─────────────────────────────────────────────
-
+# -- FileWatcher --
 class FileWatcher:
-    def __init__(self, directory: str, callback, debounce_s: float = 1.0):
-        self._dir = directory
-        self._callback = callback
-        self._debounce = debounce_s
-        self._stop = Event()
-        self._last_mtime: dict[str, float] = {}
-
+    def __init__(self, directory, callback, debounce_s=1.0):
+        self._dir, self._callback, self._debounce = directory, callback, debounce_s
+        self._stop, self._last_mtime = Event(), {}
     def start(self):
-        t = Thread(target=self._watch, daemon=True)
-        t.start()
-        return t
-
-    def stop(self):
-        self._stop.set()
-
+        t = Thread(target=self._watch, daemon=True); t.start(); return t
+    def stop(self): self._stop.set()
     def _watch(self):
-        last_scan = time.time()
         while not self._stop.is_set():
             time.sleep(self._debounce)
             changed = False
             try:
                 for root, dirs, files in os.walk(self._dir):
-                    if '.git' in dirs: dirs.remove('.git')
-                    if '__pycache__' in dirs: dirs.remove('__pycache__')
-                    if 'node_modules' in dirs: dirs.remove('node_modules')
+                    skip = {".git", "__pycache__", "node_modules", ".venv", "venv", "dist", ".next"}
+                    dirs[:] = [d for d in dirs if d not in skip]
                     for fn in files:
                         fp = os.path.join(root, fn)
-                        try:
-                            mtime = os.path.getmtime(fp)
-                        except OSError:
-                            continue
+                        try: mtime = os.path.getmtime(fp)
+                        except OSError: continue
                         prev = self._last_mtime.get(fp, 0)
-                        if mtime > prev + 0.1:
-                            self._last_mtime[fp] = mtime
-                            changed = True
-            except Exception:
-                pass
+                        if mtime > prev + 0.1: self._last_mtime[fp] = mtime; changed = True
+            except: pass
             if changed:
-                try:
-                    self._callback()
-                except Exception:
-                    pass
+                try: self._callback()
+                except: pass
 
-# ── Periodic pull ────────────────────────────────────────────
-
+# -- PeriodicPuller --
 class PeriodicPuller:
-    def __init__(self, cwd: str, branch: str, interval_s: float = 5.0):
-        self._cwd = cwd
-        self._branch = branch
-        self._interval = interval_s
-        self._stop = Event()
-        self._on_pull: Optional[callable] = None
-
-    def on_pull(self, callback):
-        self._on_pull = callback
-
+    def __init__(self, cwd, branch, interval_s=5.0):
+        self._cwd, self._branch, self._interval = cwd, branch, interval_s
+        self._stop, self._on_pull = Event(), None
+    def on_pull(self, cb): self._on_pull = cb
     def start(self):
-        t = Thread(target=self._run, daemon=True)
-        t.start()
-        return t
-
-    def stop(self):
-        self._stop.set()
-
+        t = Thread(target=self._run, daemon=True); t.start(); return t
+    def stop(self): self._stop.set()
     def _run(self):
         while not self._stop.is_set():
             self._stop.wait(self._interval)
-            if self._stop.is_set():
-                break
+            if self._stop.is_set(): break
             try:
-                had_changes = _has_changes(self._cwd)
-                pulled = _pull(self._cwd, self._branch)
-                if pulled:
-                    now_has = _has_changes(self._cwd)
-                    if now_has != had_changes and self._on_pull:
-                        self._on_pull()
-            except Exception:
-                pass
+                had = _has_changes(self._cwd)
+                if _pull(self._cwd, self._branch):
+                    if _has_changes(self._cwd) != had and self._on_pull: self._on_pull()
+            except: pass
 
-# ── Sync daemon ──────────────────────────────────────────────
-
+# -- SyncDaemon --
 class SyncDaemon:
-    def __init__(self, directory: str, branch: str = "hermes-live", debounce_s: float = 2.0):
+    def __init__(self, directory, branch="hermes-live", debounce_s=2.0):
         self._dir = os.path.abspath(os.path.expanduser(directory))
-        self._branch = branch
-        self._debounce = debounce_s
-        self._watcher: Optional[FileWatcher] = None
-        self._puller: Optional[PeriodicPuller] = None
-        self._pulled_files = 0
-        self._pushed_commits = 0
+        self._branch, self._debounce = branch, debounce_s
+        self._watcher = self._puller = None
+        self._pulled_files = self._pushed_commits = 0
+        self._ts_ip = self._ts_hostname = None
+        self._ts_peers = []
 
-    def start(self):
-        if not os.path.isdir(os.path.join(self._dir, '.git')):
-            raise RuntimeError(f"{self._dir} is not a git repository")
-
+    def start(self, require_tailscale=True):
+        self._ts_ip, err = _ts_must_be_connected()
+        if require_tailscale and err:
+            raise RuntimeError(f"Tailscale required for Live Sync.\n{err}")
+        if self._ts_ip:
+            self._ts_hostname = _ts_hostname()
+            self._ts_peers = _ts_peers()
+        if not os.path.isdir(os.path.join(self._dir, ".git")):
+            raise RuntimeError(f"{self._dir} is not a git repo")
         _ensure_branch(self._dir, self._branch)
-        logger.info("Sync daemon starting: %s on branch %s", self._dir, self._branch)
-
-        # Initial sync
         _pull(self._dir, self._branch)
-        if _has_changes(self._dir):
-            _commit(self._dir, self._branch)
-            _push(self._dir, self._branch)
-
-        # File watcher — local changes → commit + push
-        def on_local_change():
-            if _commit(self._dir, self._branch):
-                _push(self._dir, self._branch)
-                self._pushed_commits += 1
-                logger.info("Pushed commit #%d", self._pushed_commits)
-
-        self._watcher = FileWatcher(self._dir, on_local_change, self._debounce)
-        self._watcher_thread = self._watcher.start()
-
-        # Periodic pull — remote changes
-        def on_remote_change():
-            self._pulled_files += 1
-            logger.info("Pulled remote changes (#%d)", self._pulled_files)
-
-        self._puller = PeriodicPuller(self._dir, self._branch, interval_s=5.0)
-        self._puller.on_pull(on_remote_change)
-        self._puller_thread = self._puller.start()
-
-        logger.info("Sync daemon running (watch + pull every 5s)")
+        if _has_changes(self._dir): _commit(self._dir, self._branch); _push(self._dir, self._branch)
+        def on_change():
+            if _commit(self._dir, self._branch): _push(self._dir, self._branch); self._pushed_commits += 1
+        self._watcher = FileWatcher(self._dir, on_change, self._debounce)
+        self._watcher.start()
+        def on_remote(): self._pulled_files += 1
+        self._puller = PeriodicPuller(self._dir, self._branch, 5.0)
+        self._puller.on_pull(on_remote)
+        self._puller.start()
+        return self.status()
 
     def stop(self):
-        if self._watcher:
-            self._watcher.stop()
-        if self._puller:
-            self._puller.stop()
-        logger.info("Sync daemon stopped")
+        if self._watcher: self._watcher.stop()
+        if self._puller: self._puller.stop()
 
-    def status(self) -> dict:
-        return {
-            "directory": self._dir,
-            "branch": self._branch,
-            "running": self._watcher is not None and not self._watcher._stop.is_set(),
-            "pushed_commits": self._pushed_commits,
-            "pulled_updates": self._pulled_files,
+    def status(self):
+        running = self._watcher is not None and not self._watcher._stop.is_set()
+        online = [p for p in self._ts_peers if p.get("online") and p.get("ip")]
+        info = {
+            "running": running, "directory": self._dir, "branch": self._branch,
+            "tailscale": {"ip": self._ts_ip, "hostname": self._ts_hostname, "peers_online": len(online)},
+            "pushed_commits": self._pushed_commits, "pulled_updates": self._pulled_files,
             "has_uncommitted": _has_changes(self._dir) if os.path.isdir(self._dir) else False,
         }
+        if online:
+            lat = _ts_latency_to(online[0]["ip"])
+            info["tailscale"]["latency_ms"] = round(lat, 1) if lat > 0 else None
+        return info
 
-
-# ── CLI entry ────────────────────────────────────────────────
-
-def main():
-    import argparse
-    p = argparse.ArgumentParser(description="Hermes Live Sync Daemon")
-    p.add_argument("--dir", required=True, help="Project directory to sync")
-    p.add_argument("--branch", default="hermes-live", help="Git branch (default: hermes-live)")
-    p.add_argument("--once", action="store_true", help="Do one sync cycle and exit")
-    sp = p.add_subparsers(dest="cmd")
-    sp.add_parser("start")
-    sp.add_parser("stop")
-    sp.add_parser("status")
-
-    args = p.parse_args()
-
-    if args.once:
-        _pull(args.dir, args.branch)
-        if _has_changes(args.dir):
-            _commit(args.dir, args.branch)
-            _push(args.dir, args.branch)
-        print("Sync done.")
-        return
-
-    daemon = SyncDaemon(args.dir, args.branch)
-    try:
-        daemon.start()
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        daemon.stop()
+    def acl_hint(self):
+        if not self._ts_ip: return "N/A"
+        online = [p for p in self._ts_peers if p.get("online")]
+        lines = [f'  "{p["hostname"]} ({p["ip"]})"' for p in online[:8]]
+        return "ACL hints for trusted devices:\n" + "\n".join(lines)
