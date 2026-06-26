@@ -10038,28 +10038,37 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _cprint(f'    {name}: {msgs} msgs, saved {ts}')
 
     def _handle_neutral(self):
-        """Handle /neutral — exit project mode completely."""
-        from projects.project_context import _current_project_id, _current_project_name
+        """Handle /neutral — exit project mode completely. ALWAYS works."""
         import os
-        old_id = _current_project_id or 'global'
-        old_name = _current_project_name or _current_project_id or 'none'
-        # Save context before leaving
+        old_name = 'none'
+        # Try to get current project name before clearing
         try:
-            from hermes_cli.context_manager import switch_and_report
-            report = switch_and_report(old_id, 'global')
+            from projects.project_context import _current_project_id, _current_project_name
+            old_name = _current_project_name or _current_project_id or 'none'
+            old_id = _current_project_id or 'global'
+            # Save context
+            try:
+                from hermes_cli.context_manager import switch_and_report
+                report = switch_and_report(old_id, 'global')
+            except: report = ''
+            # Reset globals
+            _current_project_id = None
+            _current_project_name = None
         except: report = ''
-        # Clear env var
+        # Clear env
         os.environ.pop('HERMES_PROJECT_ROOT', None)
+        # Clear .current_project file
         try:
-            from hermes_constants import get_hermes_home
-            cf = get_hermes_home() / 'projects' / '.current_project'
+            from pathlib import Path
+            cf = Path.home() / '.hermes' / 'projects' / '.current_project'
             if cf.exists(): cf.write_text('')
         except: pass
-        _current_project_id = None
-        _current_project_name = None
-        from projects.project_context import notify_project_switched
-        notify_project_switched('')
-        _cprint(f'  Left project "{old_name}". Now in global mode.')
+        # Notify context rebuild
+        try:
+            from projects.project_context import notify_project_switched
+            notify_project_switched('')
+        except: pass
+        _cprint(f'  Global mode. Left project "{old_name}".')
         if report: _cprint(f'  {report}')
 
     def _handle_mode(self, cmd: str):

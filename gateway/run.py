@@ -7349,6 +7349,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _cmd_def = _resolve_cmd(command) if command else None
         canonical = _cmd_def.name if _cmd_def else command
 
+        # Intercept /project exit|quit|leave → redirect to /neutral
+        if command == 'project':
+            raw_args = (event.get_command_args() or '').strip().lower()
+            if raw_args in ('exit', 'quit', 'leave'):
+                event.text = '/neutral'
+                command = 'neutral'
+                canonical = 'neutral'
+                _cmd_def = _resolve_cmd(command)
+
         # Expand alias quick commands before built-in dispatch so targets like
         # /model openai/gpt-5.5 --provider openrouter reach the /model handler.
         # Preserve built-in precedence; aliases only need early handling when
