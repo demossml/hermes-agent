@@ -59,7 +59,10 @@ This branch extends Hermes Agent with **multi-agent orchestration**, DAG pipelin
 - **Guard Agent** — three-layer runtime defense blocking dangerous operations
 - **Instant Project Switching** — prefix updates immediately on `/project switch` (no /reset needed)
 - **Neutral Mode** — `/neutral` exits project isolation instantly. `/project exit` also works.
-- **Context Manager** — auto-saves/restores conversation context when switching projects. `/context status` to view.
+- **Context Manager** — auto-saves/restores conversation context when switching projects.
+  - `/context status` — overview: messages, insights, saved contexts
+  - `/neutral` or `/project exit` — instant global mode with context preservation
+  - Secure: path traversal blocked, access control per-project, fcntl.flock protection
 - **Auto-Upgrade** — `hermes update` automatically upgrades ALL agents with latest features
 
 ---
