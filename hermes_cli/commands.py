@@ -324,6 +324,14 @@ CommandDef("kanban", "Multi-profile collaboration board (tasks, links, comments)
         cli_only=True,
     ),
     CommandDef(
+        "context",
+        "Show saved conversation contexts: /context status",
+        "Agents",
+        aliases=("ctx",),
+        args_hint="status",
+    ),
+
+    CommandDef(
         "neutral",
         "Exit project mode — switch to neutral/global context",
         "Agents",

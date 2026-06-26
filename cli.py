@@ -10021,27 +10021,46 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if vc.adjudicator_note:
             _cprint(f"     Note: {vc.adjudicator_note}")
 
+    def _handle_context(self):
+        """Handle /context status — show saved contexts."""
+        from hermes_cli.context_manager import ContextManager
+        cm = ContextManager()
+        st = cm.status('' if not None else '')
+        ctxs = st.get('saved_contexts', [])
+        if not ctxs:
+            _cprint('  No saved contexts yet. Switch projects to auto-save.')
+            return
+        _cprint(f'  Saved contexts ({len(ctxs)}):')
+        for c in ctxs:
+            name = c.get('name', c.get('id', '?'))
+            msgs = c.get('message_count', 0)
+            ts = (c.get('saved_at', '')[:16] if c.get('saved_at') else '?')
+            _cprint(f'    {name}: {msgs} msgs, saved {ts}')
+
     def _handle_neutral(self):
         """Handle /neutral — exit project mode completely."""
         from projects.project_context import _current_project_id, _current_project_name
-        from projects.path_guard import get_current_project_root
         import os
+        old_id = _current_project_id or 'global'
         old_name = _current_project_name or _current_project_id or 'none'
+        # Save context before leaving
+        try:
+            from hermes_cli.context_manager import switch_and_report
+            report = switch_and_report(old_id, 'global')
+        except: report = ''
         # Clear env var
         os.environ.pop('HERMES_PROJECT_ROOT', None)
-        # Clear .current_project
         try:
             from hermes_constants import get_hermes_home
             cf = get_hermes_home() / 'projects' / '.current_project'
             if cf.exists(): cf.write_text('')
         except: pass
-        # Reset globals
         _current_project_id = None
         _current_project_name = None
         from projects.project_context import notify_project_switched
         notify_project_switched('')
-        _cprint(f'  Left project "{old_name}". Now in neutral mode.')
-        _cprint(f'  All tools have full access. No project isolation active.')
+        _cprint(f'  Left project "{old_name}". Now in global mode.')
+        if report: _cprint(f'  {report}')
 
     def _handle_mode(self, cmd: str):
         """Handle /mode neutral | /mode project <name>."""
