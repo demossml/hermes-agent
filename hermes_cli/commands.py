@@ -324,6 +324,21 @@ CommandDef("kanban", "Multi-profile collaboration board (tasks, links, comments)
         cli_only=True,
     ),
     CommandDef(
+        "neutral",
+        "Exit project mode — switch to neutral/global context",
+        "Agents",
+        aliases=("global", "exit-project", "noproject"),
+        args_hint="",
+    ),
+    CommandDef(
+        "mode",
+        "Switch mode: /mode neutral | /mode project <name>",
+        "Agents",
+        aliases=("context",),
+        args_hint="neutral|project <name>",
+    ),
+
+    CommandDef(
         "project",
         "Manage projects: /project [new|list|switch|current|rename|delete]",
         "Agents",
