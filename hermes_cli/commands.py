@@ -344,7 +344,7 @@ CommandDef("kanban", "Multi-profile collaboration board (tasks, links, comments)
         "Agents",
         aliases=("proj",),
         args_hint="[new|list|switch|current|rename|delete] [args...]",
-        subcommands=("new", "create", "list", "ls", "switch", "use", "activate",
+        subcommands=("new", "create", "list", "ls", "switch", "use", "activate", "exit", "quit", "leave",
                      "current", "rename", "delete", "remove", "rm",
                      "archive", "unarchive", "config"),
     ),
