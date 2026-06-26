@@ -58,6 +58,7 @@ This branch extends Hermes Agent with **multi-agent orchestration**, DAG pipelin
 - **Shared Insights Layer** — per-project collective memory with auto-extraction and semantic search
 - **Guard Agent** — three-layer runtime defense blocking dangerous operations
 - **Instant Project Switching** — prefix updates immediately on `/project switch` (no /reset needed)
+- **Neutral Mode** — `/neutral` exits project isolation, restores full access. `/mode neutral|project <name>`
 - **Auto-Upgrade** — `hermes update` automatically upgrades ALL agents with latest features
 
 ---
