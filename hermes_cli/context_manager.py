@@ -1,10 +1,8 @@
 """
-Context Manager — save/restore conversation context (secured).
+Context Manager v3 — save/restore conversation context across project switches.
 
-Security:
-  - context_id validated against [a-zA-Z0-9_-]+ (path traversal prevention)
-  - _slot() uses Path.resolve() and checks path is inside contexts root
-  - load_context() accepts caller_id for access control
+Security: path traversal prevention, access control, insights isolation.
+Session merge: append new messages, don't overwrite.
 """
 from __future__ import annotations
 
@@ -28,7 +26,6 @@ def _hermes_home() -> Path:
 
 
 def _validate_id(context_id: str) -> None:
-    """Raise ValueError if context_id is invalid (path traversal prevention)."""
     if not context_id or not _VALID_ID.match(context_id):
         raise ValueError(
             f"Invalid context_id: {context_id!r}. "
@@ -47,29 +44,29 @@ class ContextManager:
     def switch_context(
         self, from_id: str, to_id: str, caller_id: str = "orchestrator"
     ) -> dict:
-        """Save *from_id*, load *to_id*. Returns summary dict."""
         saved = self.save_context(from_id)
         loaded = self.load_context(to_id, caller_id=caller_id)
         return {"saved": saved, "loaded": loaded, "from": from_id, "to": to_id}
 
     def save_context(self, context_id: str) -> dict:
-        """Save current session context for *context_id*."""
+        """Save current session context. Merges with existing session (append)."""
         _validate_id(context_id)
         slot = self._slot(context_id)
         slot.mkdir(parents=True, exist_ok=True)
-
         now = datetime.now(timezone.utc).isoformat()
         result = {"id": context_id, "saved_at": now, "messages": 0}
 
-        # Messages
-        msgs = self._capture_messages()
-        if msgs:
+        # ── Messages: MERGE with existing, don't overwrite ──
+        existing_session = self._load_json(slot / "session.json")
+        new_msgs = self._capture_messages()
+        if new_msgs:
+            merged = self._merge_sessions(existing_session, new_msgs)
             (slot / "session.json").write_text(
-                json.dumps(msgs, ensure_ascii=False, indent=2), encoding="utf-8"
+                json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-            result["messages"] = len(msgs)
+            result["messages"] = len(merged)
 
-        # Workflow state
+        # ── Workflow state ──────────────────────────────────
         wf = self._capture_workflow_state()
         if wf:
             (slot / "state.json").write_text(
@@ -77,15 +74,15 @@ class ContextManager:
             )
             result["workflows"] = wf.get("active_count", 0)
 
-        # Insights
-        ins = self._capture_insights()
+        # ── Insights: project-scoped ────────────────────────
+        ins = self._capture_insights(context_id)
         if ins:
             (slot / "insights.json").write_text(
                 json.dumps(ins, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             result["insights"] = len(ins)
 
-        # Metadata
+        # ── Metadata ────────────────────────────────────────
         meta = {
             "id": context_id, "name": self._get_project_name(context_id),
             "saved_at": now, "message_count": result["messages"],
@@ -100,17 +97,21 @@ class ContextManager:
     def load_context(
         self, context_id: str, *, caller_id: str = "orchestrator"
     ) -> dict:
-        """Load saved context. Enforces access control."""
+        """Load saved context with access control.
+
+        Access rules:
+          - caller_id == "orchestrator" → always allowed
+          - caller_id == context_id → allowed (own context)
+          - everything else → DENIED
+        """
         _validate_id(context_id)
 
-        # Access control: caller must be orchestrator or own the context
+        # ── BUG-v2-01 FIX: Simple access control ────────────
         if caller_id != "orchestrator" and caller_id != context_id:
-            if not self._can_access(caller_id, context_id):
-                logger.warning(
-                    "Access denied: %s tried to load context %s",
-                    caller_id, context_id,
-                )
-                return {"id": context_id, "messages": 0, "access_denied": True}
+            logger.warning(
+                "Access denied: caller=%s tried context=%s", caller_id, context_id
+            )
+            return {"id": context_id, "messages": 0, "access_denied": True}
 
         slot = self._slot(context_id)
         result: dict = {"id": context_id, "messages": 0}
@@ -120,14 +121,11 @@ class ContextManager:
             ("state.json", "state"),
             ("insights.json", "insights"),
         ]:
-            fp = slot / fname
-            if fp.exists():
-                try:
-                    result[key] = json.loads(fp.read_text(encoding="utf-8"))
-                    if key == "session":
-                        result["messages"] = len(result[key])
-                except Exception:
-                    pass
+            data = self._load_json(slot / fname)
+            if data:
+                result[key] = data
+                if key == "session":
+                    result["messages"] = len(data)
 
         mf = slot / "meta.json"
         if mf.exists():
@@ -166,24 +164,35 @@ class ContextManager:
     # ── Private ─────────────────────────────────────────────
 
     def _slot(self, cid: str) -> Path:
-        """Return safe slot directory. Raises on path traversal attempt."""
         _validate_id(cid)
         slot = (self._root / cid).resolve()
-        root_resolved = self._root.resolve()
-        if not str(slot).startswith(str(root_resolved) + os.sep) and slot != root_resolved:
-            raise ValueError(
-                f"Path traversal blocked: {slot} is outside {root_resolved}"
-            )
+        root_r = self._root.resolve()
+        s, r = str(slot), str(root_r)
+        if not (s.startswith(r + os.sep) or s == r):
+            raise ValueError(f"Path traversal blocked: {slot}")
         return slot
 
-    def _can_access(self, caller_id: str, target_id: str) -> bool:
-        """Check if caller_id can access target_id's context."""
-        try:
-            from projects.project_isolation import check_project_access
-            return check_project_access(caller_id, target_id)
-        except Exception:
-            pass
-        return caller_id == target_id
+    @staticmethod
+    def _load_json(path: Path) -> Any:
+        if path.exists():
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return None
+
+    def _merge_sessions(self, existing: Any, new_msgs: list[dict]) -> list[dict]:
+        """Merge new messages into existing session, deduplicating by content."""
+        if not isinstance(existing, list):
+            return list(new_msgs)
+        existing_ids = {m.get("content", "")[:120] for m in existing}
+        merged = list(existing)
+        for m in new_msgs:
+            key = m.get("content", "")[:120]
+            if key and key not in existing_ids:
+                merged.append(m)
+                existing_ids.add(key)
+        return merged[-100:]  # Keep last 100 max
 
     def _get_project_name(self, cid: str) -> str:
         if cid == GLOBAL_KEY:
@@ -198,7 +207,6 @@ class ContextManager:
         return cid
 
     def _capture_messages(self) -> list[dict]:
-        """Capture recent session messages (last 30)."""
         try:
             from hermes_state import SessionDB
             sid = os.environ.get("HERMES_SESSION_ID", "")
@@ -215,10 +223,11 @@ class ContextManager:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-    def _capture_insights(self) -> list[dict]:
+    def _capture_insights(self, context_id: str) -> list[dict]:
+        """Capture insights scoped to *context_id* (BUG-v2-02 fix)."""
         try:
-            from projects.project_insights import get_project_insights
-            pi = get_project_insights()
+            from projects.project_insights import ProjectInsights
+            pi = ProjectInsights(context_id) if context_id != GLOBAL_KEY else None
             if pi:
                 return [
                     {"text": i.text, "importance": i.importance,

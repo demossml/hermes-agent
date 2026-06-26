@@ -10112,6 +10112,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         action = argv[0].lower()
         rest = argv[1] if len(argv) > 1 else ""
 
+        if action in ("exit", "quit", "leave", "neutral", "global"):
+            self._handle_neutral()
+            return
         if action in ("new", "create"):
             self._project_new(ctx, rest)
         elif action in ("list", "ls"):
