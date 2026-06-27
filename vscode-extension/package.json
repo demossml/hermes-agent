@@ -152,6 +152,18 @@
       {
         "command": "hermes.syncStatus",
         "title": "Hermes: Sync Status"
+      },
+      {
+        "command": "hermes.openSettings",
+        "title": "Hermes: Open Settings"
+      },
+      {
+        "command": "hermes.quickSetup",
+        "title": "Hermes: Quick Setup"
+      },
+      {
+        "command": "hermes.testConnection",
+        "title": "Hermes: Test Connection"
       }
     ],
     "menus": {
@@ -250,8 +262,13 @@
         },
         "hermes.server.port": {
           "type": "integer",
-          "default": 8787,
-          "description": "Hermes server port"
+          "default": 8790,
+          "description": "Hermes server port (default: 8790)"
+        },
+        "hermes.server.token": {
+          "type": "string",
+          "default": "",
+          "description": "Auth token for Hermes server (optional)"
         }
       }
     }

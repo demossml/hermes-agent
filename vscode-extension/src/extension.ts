@@ -1,3 +1,4 @@
+import { openSettings, quickSetup, testConnection } from './settingsProvider';
 import * as vscode from 'vscode';
 import { HermesClient } from './hermesClient';
 import { ChatPanelProvider } from './chatPanel';
@@ -11,6 +12,15 @@ let client: any;
 let inlineProvider: HermesInlineProvider;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  // First launch — offer quick setup
+  const firstHost = vscode.workspace.getConfiguration('hermes').get<string>('server.host', '');
+  if (!firstHost) {
+    const setup = await vscode.window.showInformationMessage(
+      'Hermes Agent needs configuration', 'Quick Setup', 'Open Settings', 'Later'
+    );
+    if (setup === 'Quick Setup') { await quickSetup(); return; }
+    if (setup === 'Open Settings') { openSettings(); }
+  }
   // Try Tailscale first, fall back to local
   const useTailscale = vscode.workspace.getConfiguration('hermes').get<boolean>('server.tailscale', false);
   if (useTailscale) {
@@ -87,6 +97,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   registerCommands(client, context);
+  context.subscriptions.push(
+    vscode.commands.registerCommand('hermes.openSettings', openSettings),
+    vscode.commands.registerCommand('hermes.quickSetup', quickSetup),
+    vscode.commands.registerCommand('hermes.testConnection', testConnection)
+  );
   registerContextActions(client, context);
 
   client.onProjectSwitch?.((name: string) => { chatProvider.updateProject(name); updateStatusBar(name); });
