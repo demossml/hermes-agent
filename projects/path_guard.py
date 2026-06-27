@@ -38,7 +38,11 @@ def get_current_project_root() -> Optional[Path]:
     env_root = os.environ.get("HERMES_PROJECT_ROOT", "").strip()
     if env_root:
         p = Path(env_root).expanduser().resolve()
-        if p.is_dir() and (p / PROJECT_LOCK_FILE).exists():
+        if p.is_dir():
+            # Auto-create .project.lock if missing
+            lock = p / PROJECT_LOCK_FILE
+            if not lock.exists():
+                lock.touch()
             return p
 
     try:
@@ -46,9 +50,14 @@ def get_current_project_root() -> Optional[Path]:
         if marker.exists():
             pid = marker.read_text(encoding="utf-8").strip()
             if pid:
+                # Support external paths (absolute or ~/ paths)
+                if pid.startswith('/') or pid.startswith('~'):
+                    p = Path(pid).expanduser().resolve()
+                    if p.is_dir() and (p / PROJECT_LOCK_FILE).exists():
+                        return p
+                # Fallback: hermes-managed project slug
                 from projects.project_manager import ProjectManager
-                pm = ProjectManager()
-                proj_dir = pm._project_dir(pid)
+                proj_dir = ProjectManager()._project_dir(pid)
                 if proj_dir.is_dir() and (proj_dir / PROJECT_LOCK_FILE).exists():
                     return proj_dir.resolve()
     except Exception:
@@ -58,9 +67,13 @@ def get_current_project_root() -> Optional[Path]:
         from projects.project_context import get_current_project_id
         pid = get_current_project_id()
         if pid:
+            # Support external paths through HERMES_PROJECT_ROOT
+            ext = os.environ.get('HERMES_PROJECT_ROOT', '').strip()
+            if ext:
+                p = Path(ext).expanduser().resolve()
+                if p.is_dir(): return p
             from projects.project_manager import ProjectManager
-            pm = ProjectManager()
-            proj_dir = pm._project_dir(pid)
+            proj_dir = ProjectManager()._project_dir(pid)
             if proj_dir.is_dir() and (proj_dir / PROJECT_LOCK_FILE).exists():
                 return proj_dir.resolve()
     except Exception:
