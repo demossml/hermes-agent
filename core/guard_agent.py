@@ -246,6 +246,22 @@ class GuardAgent:
 
             for pat in regexes:
                 if pat.search(args_str):
+                    # Exempt .env inside current project root
+                    if rule.rule_id == 'no_hermes_config_overwrite' and pat.pattern == r'\.env$':
+                        try:
+                            from projects.path_guard import get_current_project_root
+                            root = get_current_project_root()
+                            if root:
+                                # Extract path from tool args
+                                path = tool_args.get('path', '')
+                                if path:
+                                    from pathlib import Path
+                                    resolved = Path(path).expanduser().resolve()
+                                    root_r = Path(str(root)).resolve()
+                                    if str(resolved).startswith(str(root_r)):
+                                        continue  # inside project — skip
+                        except Exception:
+                            pass
                     elapsed_us = (time.perf_counter_ns() - t0) / 1000
 
                     if rule.block:
