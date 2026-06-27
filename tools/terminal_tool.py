@@ -1842,7 +1842,7 @@ def _resolve_command_cwd(
 
 
 def _check_command_path_escapes(command):
-    import shlex
+    import re, shlex, os
     try:
         from projects.path_guard import enforce as _pe, get_current_project_root
     except ImportError:
@@ -1850,30 +1850,42 @@ def _check_command_path_escapes(command):
     root = get_current_project_root()
     if root is None:
         return None
-    root_str = str(root)
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        tokens = command.split()
-    suspicious = []
-    for token in tokens:
-        if token.startswith('-'): continue
-        if token in {'|', '||', ';', '>', '>>', '<', '<<', '&'}:
+
+    # Extract ALL path-like tokens (including after >, >>, <)
+    potential_paths = []
+    for part in re.split(r'\s+', command.strip()):
+        if part in {'|', '||', ';', '&&', '&'}:
             continue
-        if token == '&&': continue
-        if '/' in token or token.startswith('~') or token == '..':
-            err = _pe(token, operation='ref', project_root=root)
-            if err: suspicious.append(token)
-    if suspicious:
-        return '[PROJECT FILE ISOLATION] Command references paths outside active project: ' + ', '.join(suspicious[:5])
+        for op in ['>>', '>', '<<', '<', '2>', '1>', '&>', '2>>', '&>>']:
+            if part == op:
+                part = ''
+                break
+        if not part:
+            continue
+        if part.startswith('~'):
+            part = os.path.expanduser(part)
+        part = part.strip('"\'')
+        if not part:
+            continue
+        if '/' in part or part == '..' or part.startswith('.'):
+            err = _pe(part, operation='ref', project_root=root)
+            if err:
+                return err
+
     if command.strip().startswith('cd '):
-        td = command.strip()[3:].strip().strip(chr(34)).strip("'")
+        td = command.strip()[3:].strip().strip('"').strip("'")
         if td:
             err = _pe(td, operation='cd', project_root=root)
             if err: return err
+
+    src_match = re.match(r'(?:source|\.)\s+(\S+)', command.strip())
+    if src_match:
+        sp = src_match.group(1).strip('"\'')
+        if sp:
+            err = _pe(sp, operation='ref', project_root=root)
+            if err: return err
+
     return None
-
-
 
 def terminal_tool(
     command: str,

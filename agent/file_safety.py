@@ -281,6 +281,16 @@ def get_read_block_error(path: str) -> Optional[str]:
     # terminal tool can still ``cat .env``; this is defense-in-depth, not a
     # boundary (see module docstring).
     if resolved.name in _BLOCKED_PROJECT_ENV_BASENAMES:
+        # Allow .env files inside the current project root
+        try:
+            from projects.path_guard import get_current_project_root
+            root = get_current_project_root()
+            if root is not None:
+                root_r = str(root.resolve())
+                if str(resolved).startswith(root_r):
+                    return None  # Inside project — allowed
+        except Exception:
+            pass
         return (
             f"Access denied: {path} is a secret-bearing environment file "
             "and cannot be read to prevent credential leakage. "
