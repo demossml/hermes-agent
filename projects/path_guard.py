@@ -73,7 +73,9 @@ def get_current_project_root() -> Optional[Path]:
                 p = Path(ext).expanduser().resolve()
                 if p.is_dir(): return p
             from projects.project_manager import ProjectManager
-            proj_dir = ProjectManager()._project_dir(pid)
+            pm = ProjectManager()
+            # Use get_project_root which respects repo_path in project.yaml
+            proj_dir = pm.get_project_root(pid)
             if proj_dir.is_dir() and (proj_dir / PROJECT_LOCK_FILE).exists():
                 return proj_dir.resolve()
     except Exception:

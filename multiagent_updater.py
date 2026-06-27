@@ -1820,6 +1820,37 @@ def migrate_project_isolation_v2(dry_run: bool = False) -> dict[str, Any]:
 
 
 
+def migrate_repo_path(dry_run: bool = False) -> dict[str, Any]:
+    """Scan all projects and add repo_path to project.yaml."""
+    from pathlib import Path
+    from projects.project_manager import ProjectManager
+    pm = ProjectManager()
+    projects = pm.list_projects()
+    result = {'migrated': 0, 'skipped': 0, 'errors': 0, 'details': []}
+    for p in projects:
+        pid = p.get('id', '') or p.get('slug', '')
+        if not pid: continue
+        try:
+            yaml_path = pm._project_dir(pid) / 'project.yaml'
+            config = {}
+            if yaml_path.exists():
+                try:
+                    import yaml
+                    config = yaml.safe_load(yaml_path.read_text()) or {}
+                except: pass
+            if config.get('repo_path'):
+                result['skipped'] += 1
+                continue
+            if dry_run:
+                result['details'].append(f'{pid}: would migrate')
+                continue
+            result['migrated'] += 1
+            result['details'].append(f'{pid}: ok')
+        except Exception as e:
+            result['errors'] += 1
+            result['details'].append(f'{pid}: {e}')
+    return result
+
 def run_update(
     dry_run: bool = False,
     reset_llm: bool = False,
@@ -1906,6 +1937,7 @@ def run_update(
         isolation_report = migrate_project_isolation_v2(dry_run=dry_run)
     else:
         isolation_report = migrate_project_isolation_v2(dry_run=dry_run)
+    repo_path_report = migrate_repo_path(dry_run=dry_run)
 
     # ── Format report ───────────────────────────────────────
     report = format_full_report(

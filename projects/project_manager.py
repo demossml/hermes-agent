@@ -80,6 +80,38 @@ class ProjectManager:
     def _project_dir(self, project_id: str) -> Path:
         return self._projects_dir / project_id
 
+    def get_project_root(self, project_id: str) -> Path:
+        """Return the effective project root - repo_path if set, else hermes dir."""
+        yaml_path = self._project_dir(project_id) / 'project.yaml'
+        if yaml_path.exists():
+            try:
+                import yaml
+                config = yaml.safe_load(yaml_path.read_text()) or {}
+                rp = config.get('repo_path', '').strip()
+                if rp:
+                    p = Path(rp).expanduser().resolve()
+                    if p.is_dir():
+                        return p
+            except Exception:
+                pass
+        return self._project_dir(project_id)
+
+    def set_repo_path(self, project_id: str, repo_path: str) -> None:
+        """Set or update repo_path in project.yaml."""
+        import yaml
+        yaml_path = self._project_dir(project_id) / 'project.yaml'
+        config = {}
+        if yaml_path.exists():
+            try:
+                config = yaml.safe_load(yaml_path.read_text()) or {}
+            except: pass
+        config['repo_path'] = repo_path
+        yaml_path.write_text(yaml.dump(config, allow_unicode=True, default_flow_style=False))
+        # Ensure .project.lock exists in the external repo
+        ext = Path(repo_path).expanduser().resolve()
+        if ext.is_dir():
+            (ext / '.project.lock').touch()
+
     def _metadata_path(self, project_id: str) -> Path:
         return self._project_dir(project_id) / "metadata.json"
 
