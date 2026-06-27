@@ -27,7 +27,7 @@ _SENSITIVE_FILES = frozenset({
     ".project.lock", "insights.jsonl",
 })
 # .env files are project-scoped and explicitly allowed inside project root
-_PROJECT_ENV_FILES = ("".env"", "".env.local"", "".env.development"", "".env.production"", "".env.test"")
+_PROJECT_ENV_FILES = (".env", ".env.local", ".env.development", ".env.production", ".env.test")
 
 _ALWAYS_ALLOWED: tuple[str, ...] = ()
 _ALWAYS_ALLOWED_CACHED: bool = False
@@ -113,8 +113,6 @@ def enforce(
     if resolved_str == root_str or resolved_str.startswith(root_str + sep):
         # .env files are explicitly allowed inside project root
         fname = os.path.basename(resolved_str)
-        if fname.startswith(''.env''):
-            return None
         return None
 
     fname = os.path.basename(target_str)
