@@ -389,6 +389,18 @@ Toolsets:
 
 ---
 
+## Project Isolation
+
+Hard file-system isolation — each project locked to its directory.
+
+- **repo_path in project.yaml** — projects can point to any directory on disk,
+  not just ~/.hermes/projects/. Example:
+  
+- .env files inside project are readable/writable.
+- Cross-project access blocked (path guard + file safety).
+- /neutral or /project exit — leave project isolation instantly.
+
+
 ## Security & Isolation
 
 The multi-agent branch implements defense-in-depth across four layers:
