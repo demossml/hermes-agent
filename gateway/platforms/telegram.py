@@ -5922,6 +5922,25 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
+                # Archive-only: persist to message_archive without running the agent.
+                # require_mention already blocked dispatch; we still want SQLite rows.
+                try:
+                    from gateway.archive_bridge import archive_enabled, build_hook_context, archive_message_context
+                    if archive_enabled():
+                        chat = getattr(msg, "chat", None)
+                        chat_id = str(getattr(chat, "id", "") or "")
+                        text = (getattr(msg, "text", None) or getattr(msg, "caption", None) or "")
+                        ctx = build_hook_context(
+                            platform="telegram",
+                            user_id=str(getattr(getattr(msg, "from_user", None), "id", "") or ""),
+                            chat_id=chat_id,
+                            thread_id=str(getattr(msg, "message_thread_id", "") or ""),
+                            chat_type="group", message=text, full_message=text,
+                            message_id=str(getattr(msg, "message_id", "") or ""),
+                        )
+                        import asyncio
+                        asyncio.create_task(archive_message_context(ctx))
+                except Exception: pass
             return
         await self._ensure_forum_commands(update.message)
 
@@ -6016,6 +6035,25 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.LOCATION, update_id=update.update_id)
+                # Archive-only: persist to message_archive without running the agent.
+                # require_mention already blocked dispatch; we still want SQLite rows.
+                try:
+                    from gateway.archive_bridge import archive_enabled, build_hook_context, archive_message_context
+                    if archive_enabled():
+                        chat = getattr(msg, "chat", None)
+                        chat_id = str(getattr(chat, "id", "") or "")
+                        text = (getattr(msg, "text", None) or getattr(msg, "caption", None) or "")
+                        ctx = build_hook_context(
+                            platform="telegram",
+                            user_id=str(getattr(getattr(msg, "from_user", None), "id", "") or ""),
+                            chat_id=chat_id,
+                            thread_id=str(getattr(msg, "message_thread_id", "") or ""),
+                            chat_type="group", message=text, full_message=text,
+                            message_id=str(getattr(msg, "message_id", "") or ""),
+                        )
+                        import asyncio
+                        asyncio.create_task(archive_message_context(ctx))
+                except Exception: pass
             return
 
         venue = getattr(msg, "venue", None)
@@ -6207,6 +6245,27 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._observe_unmentioned_group_message(
                     _m, _event.message_type, update_id=update.update_id, event=_event
                 )
+                # Archive-only: persist to message_archive without running the agent.
+                # require_mention already blocked dispatch; we still want SQLite rows.
+                try:
+                    from gateway.archive_bridge import archive_enabled, build_hook_context, archive_message_context
+                    if archive_enabled():
+                        chat = getattr(_m, "chat", None)
+                        chat_id = str(getattr(chat, "id", "") or "")
+                        text = (getattr(_m, "text", None) or getattr(_m, "caption", None) or "")
+                        ctx = build_hook_context(
+                            platform="telegram",
+                            user_id=str(getattr(getattr(_m, "from_user", None), "id", "") or ""),
+                            chat_id=chat_id,
+                            thread_id=str(getattr(_m, "message_thread_id", "") or ""),
+                            chat_type="group", message=text, full_message=text,
+                            message_id=str(getattr(_m, "message_id", "") or ""),
+                            media_urls=list(getattr(_event, "media_urls", None) or []),
+                            media_types=list(getattr(_event, "media_types", None) or []),
+                        )
+                        import asyncio
+                        asyncio.create_task(archive_message_context(ctx))
+                except Exception: pass
             return
 
         msg = update.message
