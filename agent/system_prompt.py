@@ -295,6 +295,30 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             # Coding-context probing must never block prompt build.
             pass
 
+    # ── Mode Router guidance ──────────────────────────────────────
+    # Inject DEV_GUIDANCE or SECRETARY_GUIDANCE into the stable tier
+    # when the agent was constructed with a mode parameter.
+    _agent_mode = getattr(agent, "mode", None)
+    if not _agent_mode:
+        # Try environment fallback for sub-agents that don't receive mode
+        try:
+            from modes.router import get_effective_mode as _get_mode
+            _agent_mode = _get_mode(
+                getattr(agent, "platform", "cli") or "cli",
+                getattr(agent, "chat_id", "") or "",
+                getattr(agent, "user_id", None),
+            )
+        except Exception:
+            pass
+    if _agent_mode:
+        try:
+            from modes.policy import get_guidance as _get_mode_guidance
+            _mode_block = _get_mode_guidance(_agent_mode)
+            if _mode_block:
+                stable_parts.append(_mode_block)
+        except Exception:
+            pass
+
     # Local Python toolchain probe — names python/pip/uv/PEP-668 state when
     # something is non-default so the model can pick the right install
     # strategy without discovering by failure.  Emits a single line; emits

@@ -207,6 +207,7 @@ def init_agent(
     chat_id: str = None,
     chat_name: str = None,
     chat_type: str = None,
+    mode: str = None,
     thread_id: str = None,
     gateway_session_key: str = None,
     skip_context_files: bool = False,
@@ -291,6 +292,7 @@ def init_agent(
     agent._user_id_alt = user_id_alt  # Optional stable alternate platform identifier
     agent._user_name = user_name
     agent._chat_id = chat_id
+    agent.mode = mode
     agent._chat_name = chat_name
     agent._chat_type = chat_type
     agent._thread_id = thread_id

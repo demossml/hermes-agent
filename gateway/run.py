@@ -7335,6 +7335,71 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _reply is not None:
                 return _reply
 
+        # ── Mode Router intercept ──────────────────────────────────────────
+        # Detect mode-switch / status intents BEFORE slash-command dispatch.
+        # NL triggers ("режим секретаря") and /mode slash both handled here.
+        try:
+            from modes.detect import detect_mode_intent
+            from modes.router import get_effective_mode, apply_mode_change
+
+            _plat = source.platform.value if source.platform else "cli"
+            _chat = source.chat_id or ""
+            _uid = source.user_id or None
+
+            _raw_text = (event.text or "").strip()
+            _intent = detect_mode_intent(_raw_text) if _raw_text else None
+
+            if _intent is not None:
+                if _intent.mode == "status":
+                    from modes.router import format_status_reply
+                    return format_status_reply(_plat, _chat, _uid, _raw_text)
+
+                if _intent.mode in ("dev", "secretary"):
+                    _current = get_effective_mode(_plat, _chat, _uid)
+                    if _intent.mode != _current:
+                        _reply = apply_mode_change(_plat, _chat, _intent.mode, _uid, user_text=_raw_text)
+                        # Split payload: "режим секретаря, отчёт за вчера"
+                        import re as _mode_re
+                        if _intent.is_slash:
+                            _payload = (event.get_command_args() or "").strip()
+                            # Strip mode name from payload
+                            _mode_name = _intent.mode
+                            _payload = _mode_re.sub(
+                                r"^\s*" + _mode_re.escape(_mode_name) + r"\s*",
+                                "", _payload, count=1,
+                            ).strip()
+                        else:
+                            # For NL, extract the remainder after the matched pattern
+                            _payload = _mode_re.sub(
+                                r"^(?:/mode\s+\w+|"
+                                r"перейди\s+(?:в\s+)?режим\s+\w+|"
+                                r"переключись?\s+(?:в\s+)?режим\s+\w+|"
+                                r"смени\s+режим\s+(?:на\s+)?\w+|"
+                                r"режим\s+\w+|"
+                                r"вернись\s+в\s+(?:режим\s+)?\w+|"
+                                r"стань\s+\w+|будь\s+\w+|работай\s+как\s+\w+|"
+                                r"откройся\s+как\s+\w+|"
+                                r"switch\s+to\s+(?:the\s+)?\w+\s*mode|"
+                                r"go\s+back\s+to\s+(?:the\s+)?\w+\s*mode|"
+                                r"mode\s+\w+)",
+                                "", _raw_text, count=1, flags=_mode_re.IGNORECASE,
+                            ).strip().lstrip(",.;: ").strip()
+                        if _payload:
+                            event.text = _payload
+                            logger.info(
+                                "Mode switched to %s for %s/%s, processing payload: %r",
+                                _intent.mode, _plat, _chat, _payload[:80],
+                            )
+                            # Fall through to process payload with agent
+                        else:
+                            return _reply
+                    else:
+                        # Already in requested mode — just confirm
+                        from modes.router import format_already_reply
+                        return format_already_reply(_intent.mode, _raw_text)
+        except Exception as _mode_err:
+            logger.debug("Mode router intercept failed (non-fatal): %s", _mode_err)
+
         # Check for commands
         command = event.get_command()
 
@@ -8891,6 +8956,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "chat_type": getattr(source, "chat_type", "") or "",
                 "session_id": session_entry.session_id,
                 "message": message_text[:500],
+                "full_message": message_text,
+                "media_urls": list(getattr(event, "media_urls", None) or []),
+                "media_types": list(getattr(event, "media_types", None) or []),
+                "message_id": str(getattr(event, "message_id", "") or ""),
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
@@ -10545,6 +10614,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     provider_data_collection=pr.get("data_collection"),
                     session_id=task_id,
                     platform=platform_key,
+                    mode=_active_mode,
                     user_id=source.user_id,
                     user_id_alt=source.user_id_alt,
                     user_name=source.user_name,
@@ -13646,6 +13716,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+
+        # ── Mode Router: filter toolsets by active mode ─────────────────
+        _plat_val = source.platform.value if source.platform else "cli"
+        _chat_val = source.chat_id or ""
+        _uid_val = source.user_id or None
+        _active_mode = None
+        try:
+            from modes.router import get_effective_mode
+            _active_mode = get_effective_mode(_plat_val, _chat_val, _uid_val)
+        except Exception:
+            pass
+        if _active_mode:
+            try:
+                from modes.policy import filter_tools as _filter_tools
+                _before = set(enabled_toolsets)
+                enabled_toolsets = sorted(
+                    _filter_tools(_active_mode, frozenset(enabled_toolsets))
+                )
+                _after = set(enabled_toolsets)
+                logger.info(
+                    "Mode filter [%s]: toolsets before=%d after=%d removed=%s",
+                    _active_mode, len(_before), len(_after),
+                    sorted(_before - _after),
+                )
+            except Exception:
+                pass
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
@@ -14662,6 +14758,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _cache[session_key] = (agent, _sig, _current_msg_count)
                         self._enforce_agent_cache_cap()
                 logger.debug("Created new agent for session %s (sig=%s)", session_key, _sig)
+
+            # ── Mode Router: remove blocked individual tools ───────────
+            if _active_mode:
+                try:
+                    from modes.policy import filter_individual_tools as _fit
+                    _before_names = set(agent.valid_tool_names)
+                    agent.valid_tool_names = _fit(
+                        _active_mode, frozenset(agent.valid_tool_names)
+                    )
+                    _removed = _before_names - set(agent.valid_tool_names)
+                    if _removed:
+                        logger.info(
+                            "Mode filter [%s]: blocked individual tools: %s",
+                            _active_mode, sorted(_removed),
+                        )
+                except Exception:
+                    pass
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.

@@ -211,6 +211,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "archive": {
+        "description": "Message archive: query archived messages by keyword, type, date range, chat_id.",
+        "tools": ["archive_query"],
+        "includes": []
+    },
+
     
     "file": {
         "description": "File manipulation tools: read, write, patch (with fuzzy matching), and search (content + files)",

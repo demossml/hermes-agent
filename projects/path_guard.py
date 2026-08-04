@@ -107,6 +107,21 @@ def enforce(
     project_root: Optional[str | Path] = None,
 ) -> Optional[str]:
     """FAIL-CLOSED: None=allowed, str=blocked."""
+    # ── Archive whitelist for secretary mode ─────────────────
+    # Secretary reads/writes to ~/.hermes/archive/ are always
+    # allowed regardless of active project context.
+    target_str = str(target)
+    try:
+        from hermes_constants import get_hermes_home
+        archive_root = str(get_hermes_home() / "archive")
+        if target_str.startswith(archive_root):
+            return None  # allowed
+        state_root = str(get_hermes_home() / "state")
+        if target_str.startswith(state_root):
+            return None  # allowed
+    except Exception:
+        pass
+
     root = (Path(project_root) if project_root
             else get_current_project_root())
     if root is None:
