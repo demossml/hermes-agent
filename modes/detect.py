@@ -19,16 +19,22 @@ _VALID_MODES = frozenset({"dev", "secretary"})
 class ModeIntent:
     """Detected intent to switch or query mode."""
 
-    mode: str           # "dev" | "secretary" | "status"
+    mode: str           # "dev" | "secretary" | "status" | "picker"
     confidence: float   # 0.0–1.0
     raw: str            # original user text
     is_slash: bool = False
 
 
-# ── Slash command ─────────────────────────────────────────────
+# ── Slash commands ────────────────────────────────────────────
 
 _SLASH_RE = re.compile(
     r"^/mode\s+(dev|secretary|status)\s*$",
+    re.IGNORECASE,
+)
+
+# /mode without args, /modes — show picker
+_PICKER_SLASH_RE = re.compile(
+    r"^/(?:mode|modes)\s*$",
     re.IGNORECASE,
 )
 
@@ -69,6 +75,19 @@ _NL_PATTERNS: list[tuple[re.Pattern, str, float]] = [
     # Alias-based: single word match + context
     (re.compile(r"^(?:хочу\s+)?(?:в\s+)?режим\s+(разработчик[а]?)", re.IGNORECASE), "dev", 0.85),
     (re.compile(r"^(?:хочу\s+)?(?:в\s+)?режим\s+(секретар[яь]|менеджер[а]?)", re.IGNORECASE), "secretary", 0.85),
+]
+
+# ── Picker triggers — show keyboard, don't apply mode ─────────
+
+_PICKER_PATTERNS: list[tuple[re.Pattern, float]] = [
+    (re.compile(r"переключи\s+режим\s*$", re.IGNORECASE), 0.95),
+    (re.compile(r"переключись\s+между\s+режим(?:ом|ами)\s+(?:секретар[яь]|разработчик[а]?)", re.IGNORECASE), 0.92),
+    (re.compile(r"переключи\s+режим\s+(?:секретар[яь]|разработчик[а]?|работ[ыу])", re.IGNORECASE), 0.93),
+    (re.compile(r"выбери\s+режим\s*$", re.IGNORECASE), 0.95),
+    (re.compile(r"какие\s+режимы", re.IGNORECASE), 0.90),
+    (re.compile(r"список\s+режимов", re.IGNORECASE), 0.90),
+    (re.compile(r"^(?:show|list)\s+modes?", re.IGNORECASE), 0.95),
+    (re.compile(r"^(?:switch|change)\s+mode$", re.IGNORECASE), 0.90),
 ]
 
 # Status check patterns
@@ -120,6 +139,10 @@ def detect_mode_intent(text: str) -> Optional[ModeIntent]:
         if mode in _VALID_MODES:
             return ModeIntent(mode=mode, confidence=1.0, raw=raw, is_slash=True)
 
+    # 1b. Picker slash — /mode or /modes without args
+    if _PICKER_SLASH_RE.match(normalized):
+        return ModeIntent(mode="picker", confidence=1.0, raw=raw, is_slash=True)
+
     # 2. Status check (no slash)
     for pattern, conf in _STATUS_PATTERNS:
         if pattern.search(normalized):
@@ -129,6 +152,11 @@ def detect_mode_intent(text: str) -> Optional[ModeIntent]:
     for pattern in _ANTI_PATTERNS:
         if pattern.search(normalized):
             return None
+
+    # 3b. Picker NL triggers — BEFORE switch patterns (higher specificity)
+    for pattern, conf in _PICKER_PATTERNS:
+        if pattern.search(normalized):
+            return ModeIntent(mode="picker", confidence=conf, raw=raw)
 
     # 4. NL switch patterns — first match wins (ordered by specificity)
     for pattern, mode, conf in _NL_PATTERNS:

@@ -334,6 +334,90 @@ def _wrap_markdown_tables(text: str) -> str:
     return '\n'.join(out)
 
 
+# ── Secretary picker NL trigger detection ─────────────────────
+
+_SECRETARY_PICKER_RE = re.compile(
+    r"^(?:секретар[ия]|список\s+секретарей|какие\s+секретар[ия]|"
+    r"list\s+secretar(?:y|ies)|show\s+secretar(?:y|ies)|"
+    r"переключись?\s+(?:между\s+)?секретар(?:ями|[яь]ми?))$",
+    re.IGNORECASE,
+)
+
+_SECRETARY_PICKER_SUBSTRING_TRIGGERS = [
+    "секретар",  # catches "секретари", "секретаря", etc.
+]
+
+
+def _is_secretary_picker_trigger(text: str) -> bool:
+    """Check if text is a request to show the secretary profile picker."""
+    normalized = text.strip().casefold()
+    if not normalized:
+        return False
+
+    if _SECRETARY_PICKER_RE.match(normalized):
+        return True
+
+    # Substring triggers — single word with no other significant content
+    # Must be a short message (≤ 30 chars) to avoid false positives
+    if len(normalized) <= 30:
+        for trigger in _SECRETARY_PICKER_SUBSTRING_TRIGGERS:
+            if normalized == trigger or normalized == trigger + "s":
+                return True
+            # "мои секретари", "все секретари"
+            if normalized.endswith(" " + trigger) and len(normalized.split()) <= 3:
+                return True
+
+    return False
+
+
+# ── Project picker NL trigger detection ───────────────────────
+
+_PROJECT_PICKER_RE = re.compile(
+    r"^(?:проекты|список\s+проектов|какие\s+проекты|"
+    r"переключись?\s+(?:между\s+)?проект(?:ами|ом)?|"
+    r"переключи\s+проект|выбери\s+проект|"
+    r"list\s+projects?|show\s+projects?|switch\s+project)$",
+    re.IGNORECASE,
+)
+
+
+def _is_project_picker_trigger(text: str) -> bool:
+    """Check if text is a request to show the project picker."""
+    normalized = text.strip().casefold()
+    if not normalized:
+        return False
+    if _PROJECT_PICKER_RE.match(normalized):
+        return True
+    # Short messages: "проекты", "projects"
+    if len(normalized) <= 20 and normalized in ("проекты", "projects"):
+        return True
+    return False
+
+
+# ── /who NL trigger detection ─────────────────────────────────
+
+_WHO_RE = re.compile(
+    r"^(?:кто\s+(?:я|ты)|где\s+(?:я|ты)|"
+    r"какой\s+(?:сейчас\s+)?(?:секретарь|проект|режим)|"
+    r"что\s+(?:сейчас\s+)?активно|"
+    r"who\s+am\s+i|what.?\s+(?:is\s+)?(?:my\s+)?(?:current\s+)?(?:secretary|project|mode|status))",
+    re.IGNORECASE,
+)
+
+
+def _is_who_trigger(text: str) -> bool:
+    """Check if text is a request to show current context (/who)."""
+    normalized = text.strip().casefold()
+    if not normalized:
+        return False
+    if _WHO_RE.match(normalized):
+        return True
+    # Short: "кто я", "где я"
+    if len(normalized) <= 10 and normalized in ("кто я", "где я", "who am i", "кто ты"):
+        return True
+    return False
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """
     Telegram bot adapter.
@@ -3996,6 +4080,21 @@ class TelegramAdapter(BasePlatformAdapter):
                     logger.error("[%s] slash-confirm callback failed: %s", self.name, exc, exc_info=True)
             return
 
+        # --- Mode picker callbacks (mode:dev | mode:secretary) ---
+        if data.startswith("mode:"):
+            await self._handle_mode_callback(query, data, query_chat_id, query_thread_id, query_user_name)
+            return
+
+        # --- Secretary picker callbacks (sec:<profile_name>) ---
+        if data.startswith("sec:"):
+            await self._handle_sec_callback(query, data, query_chat_id, query_thread_id, query_user_name)
+            return
+
+        # --- Project picker callbacks (proj:<id> | proj:__neutral__) ---
+        if data.startswith("proj:"):
+            await self._handle_proj_callback(query, data, query_chat_id, query_thread_id, query_user_name)
+            return
+
         # --- Clarify callbacks (cl:clarify_id:idx | cl:clarify_id:other) ---
         if data.startswith("cl:"):
             parts = data.split(":", 2)
@@ -5944,6 +6043,32 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         await self._ensure_forum_commands(update.message)
 
+        # ── NL mode picker triggers — handle locally, no LLM ──
+        text = (msg.text or "").strip()
+        try:
+            from modes.detect import detect_mode_intent
+            intent = detect_mode_intent(text)
+            if intent is not None and intent.mode == "picker":
+                await self._handle_mode_picker_locally(msg)
+                return
+        except Exception:
+            pass
+
+        # ── NL secretary picker triggers — handle locally, no LLM ──
+        if text and _is_secretary_picker_trigger(text):
+            await self._handle_secretary_picker_locally(msg)
+            return
+
+        # ── NL project picker triggers — handle locally, no LLM ──
+        if text and _is_project_picker_trigger(text):
+            await self._handle_project_picker_locally(msg)
+            return
+
+        # ── NL /who triggers — handle locally, no LLM ──
+        if text and _is_who_trigger(text):
+            await self._handle_who_locally(msg)
+            return
+
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
@@ -5961,6 +6086,26 @@ class TelegramAdapter(BasePlatformAdapter):
         text = (msg.text or "").strip()
         if text.startswith("/rule ") or text == "/rule":
             await self._handle_rule_command_locally(msg, text)
+            return
+
+        # ── /mode (no args) and /modes — show picker keyboard ──
+        if text == "/mode" or text == "/modes":
+            await self._handle_mode_picker_locally(msg)
+            return
+
+        # ── /secretaries — show secretary profile picker ──
+        if text == "/secretaries":
+            await self._handle_secretary_picker_locally(msg)
+            return
+
+        # ── /projects — show project picker ──
+        if text == "/projects" or text == "/project list":
+            await self._handle_project_picker_locally(msg)
+            return
+
+        # ── /who — show current state (secretary + project + mode) ──
+        if text == "/who" or text == "/where":
+            await self._handle_who_locally(msg)
             return
 
         if not self._should_process_message(msg, is_command=True):
@@ -6026,6 +6171,390 @@ class TelegramAdapter(BasePlatformAdapter):
             )
         except Exception as e:
             logger.warning(f"Failed to send /rule reply: {e}")
+
+    async def _handle_mode_picker_locally(self, msg) -> None:
+        """Send mode picker InlineKeyboard — zero LLM cost."""
+        from modes.router import get_effective_mode
+
+        chat_id = str(msg.chat.id)
+        user_id = str(getattr(msg.from_user, "id", ""))
+        platform = "telegram"
+
+        current_mode = get_effective_mode(platform, chat_id, user_id)
+        mode_labels = {"dev": "🛠 Dev", "secretary": "📋 Secretary"}
+        current_label = mode_labels.get(current_mode, current_mode)
+
+        keyboard = []
+        for mode_key, label in mode_labels.items():
+            btn_text = f"{label} ✓" if mode_key == current_mode else label
+            keyboard.append([InlineKeyboardButton(
+                btn_text, callback_data=f"mode:{mode_key}"
+            )])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        text = f"Выберите режим. Сейчас: {current_label}"
+
+        try:
+            await self._bot.send_message(
+                chat_id=int(chat_id),
+                text=text,
+                reply_markup=reply_markup,
+                reply_to_message_id=msg.message_id,
+            )
+        except Exception as e:
+            logger.warning("Failed to send mode picker: %s", e)
+
+    async def _handle_mode_callback(
+        self, query, data: str, chat_id, thread_id, user_name
+    ) -> None:
+        """Handle mode:dev / mode:secretary callback."""
+        mode = data.split(":", 1)[1] if ":" in data else ""
+        if mode not in ("dev", "secretary"):
+            await query.answer(text="Unknown mode.")
+            return
+
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=chat_id,
+            chat_type=str(getattr(getattr(query.message, "chat", None), "type", "")),
+            thread_id=str(thread_id) if thread_id is not None else None,
+            user_name=user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to switch modes.")
+            return
+
+        from modes.router import apply_mode_change
+
+        platform = "telegram"
+        cid = str(chat_id) if chat_id else ""
+        uid = caller_id
+
+        reply = apply_mode_change(platform, cid, mode, uid, user_text="")
+
+        await query.answer(text=f"✅ {mode}")
+
+        # Edit the picker message to reflect new active mode
+        try:
+            mode_labels = {"dev": "🛠 Dev", "secretary": "📋 Secretary"}
+            current_label = mode_labels.get(mode, mode)
+
+            keyboard = []
+            for mode_key, label in mode_labels.items():
+                btn_text = f"{label} ✓" if mode_key == mode else label
+                keyboard.append([InlineKeyboardButton(
+                    btn_text, callback_data=f"mode:{mode_key}"
+                )])
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                text=f"Выберите режим. Сейчас: {current_label}",
+                reply_markup=reply_markup,
+            )
+        except Exception as e:
+            logger.debug("Failed to edit mode picker message: %s", e)
+
+        # Send confirmation as a new message
+        try:
+            await self._bot.send_message(
+                chat_id=int(chat_id),
+                text=f"✅ Режим: {mode}",
+                **(self._thread_kwargs_for_send(
+                    str(chat_id), str(thread_id), {"thread_id": str(thread_id)},
+                    reply_to_mode=self._reply_to_mode,
+                ) if thread_id is not None else {}),
+            )
+        except Exception as e:
+            logger.warning("Failed to send mode confirmation: %s", e)
+
+    async def _handle_secretary_picker_locally(self, msg) -> None:
+        """Send secretary profile picker InlineKeyboard — zero LLM cost."""
+        from gateway.secretary_router import list_secretaries, get_active
+
+        chat_id = str(msg.chat.id)
+        user_id = str(getattr(msg.from_user, "id", ""))
+        active = get_active(user_id)
+
+        secretaries = list_secretaries()
+        if not secretaries:
+            try:
+                await self._bot.send_message(
+                    chat_id=int(chat_id),
+                    text="Нет профилей secretary-*. Создайте через `hermes profile create secretary-<name>`.",
+                    reply_to_message_id=msg.message_id,
+                )
+            except Exception as e:
+                logger.warning("Failed to send empty secretary list: %s", e)
+            return
+
+        keyboard = []
+        for name in secretaries:
+            label = f"{name} ✓" if name == active else name
+            # Truncate to fit callback_data (64 bytes max)
+            cb_data = f"sec:{name}"[:64]
+            keyboard.append([InlineKeyboardButton(label, callback_data=cb_data)])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        text = f"Выберите секретаря. Сейчас: {active}"
+
+        try:
+            await self._bot.send_message(
+                chat_id=int(chat_id),
+                text=text,
+                reply_markup=reply_markup,
+                reply_to_message_id=msg.message_id,
+            )
+        except Exception as e:
+            logger.warning("Failed to send secretary picker: %s", e)
+
+    async def _handle_sec_callback(
+        self, query, data: str, chat_id, thread_id, user_name
+    ) -> None:
+        """Handle sec:<profile_name> callback — switch active secretary."""
+        name = data.split(":", 1)[1] if ":" in data else ""
+        if not name:
+            await query.answer(text="Invalid secretary name.")
+            return
+
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=chat_id,
+            chat_type=str(getattr(getattr(query.message, "chat", None), "type", "")),
+            thread_id=str(thread_id) if thread_id is not None else None,
+            user_name=user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to switch secretaries.")
+            return
+
+        from gateway.secretary_router import validate_profile, set_active, get_active
+
+        if not validate_profile(name):
+            await query.answer(text=f"Неизвестный секретарь: {name}")
+            return
+
+        current = get_active(caller_id)
+        if name == current:
+            await query.answer(text=f"Уже выбран: {name}")
+            return
+
+        try:
+            set_active(caller_id, name)
+        except ValueError as e:
+            await query.answer(text=str(e))
+            return
+
+        await query.answer(text=f"✅ {name}")
+
+        # Rebuild keyboard with new active
+        from gateway.secretary_router import list_secretaries
+        secretaries = list_secretaries()
+        keyboard = []
+        for sname in secretaries:
+            label = f"{sname} ✓" if sname == name else sname
+            cb_data = f"sec:{sname}"[:64]
+            keyboard.append([InlineKeyboardButton(label, callback_data=cb_data)])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        try:
+            await query.edit_message_text(
+                text=f"Выберите секретаря. Сейчас: {name}",
+                reply_markup=reply_markup,
+            )
+        except Exception as e:
+            logger.debug("Failed to edit secretary picker: %s", e)
+
+        # Confirm in chat
+        try:
+            await self._bot.send_message(
+                chat_id=int(chat_id),
+                text=f"✅ Активный секретарь: {name}",
+                **(self._thread_kwargs_for_send(
+                    str(chat_id), str(thread_id), {"thread_id": str(thread_id)},
+                    reply_to_mode=self._reply_to_mode,
+                ) if thread_id is not None else {}),
+            )
+        except Exception as e:
+            logger.warning("Failed to send secretary confirmation: %s", e)
+
+    async def _handle_project_picker_locally(self, msg) -> None:
+        """Send project picker InlineKeyboard — zero LLM cost."""
+        chat_id = str(msg.chat.id)
+
+        try:
+            from projects.project_context import list_projects, get_current_project_id
+            projects = list_projects()
+            current_id = get_current_project_id()
+        except Exception as e:
+            logger.warning("Failed to list projects: %s", e)
+            try:
+                await self._bot.send_message(
+                    chat_id=int(chat_id),
+                    text="Не удалось получить список проектов.",
+                    reply_to_message_id=msg.message_id,
+                )
+            except Exception:
+                pass
+            return
+
+        if not projects:
+            try:
+                await self._bot.send_message(
+                    chat_id=int(chat_id),
+                    text="Нет проектов. Создайте через /project new <имя>.",
+                    reply_to_message_id=msg.message_id,
+                )
+            except Exception as e:
+                logger.warning("Failed to send empty project list: %s", e)
+            return
+
+        keyboard = []
+        # Neutral/exit button
+        neutral_label = "🚫 Neutral ✓" if current_id is None else "🚫 Neutral"
+        keyboard.append([InlineKeyboardButton(neutral_label, callback_data="proj:__neutral__")])
+
+        for proj in projects:
+            pid = proj.get("id", "") or proj.get("slug", "")
+            pname = proj.get("name", "") or pid
+            label = f"{pname} ✓" if pid == current_id else pname
+            cb_data = f"proj:{pid}"[:64]
+            keyboard.append([InlineKeyboardButton(label, callback_data=cb_data)])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        current_name = "neutral" if current_id is None else current_id
+        text = f"Проекты. Сейчас: {current_name}"
+
+        try:
+            await self._bot.send_message(
+                chat_id=int(chat_id),
+                text=text,
+                reply_markup=reply_markup,
+                reply_to_message_id=msg.message_id,
+            )
+        except Exception as e:
+            logger.warning("Failed to send project picker: %s", e)
+
+    async def _handle_who_locally(self, msg) -> None:
+        """Send /who status — secretary + project + mode — zero LLM cost."""
+        chat_id = str(msg.chat.id)
+        user_id = str(getattr(msg.from_user, "id", ""))
+
+        # Secretary
+        try:
+            from gateway.secretary_router import get_active
+            secretary = get_active(user_id)
+        except Exception:
+            secretary = "default"
+
+        # Project
+        try:
+            from projects.project_context import get_current_project_name
+            project = get_current_project_name() or "—"
+        except Exception:
+            project = "—"
+
+        # Mode
+        try:
+            from modes.router import get_effective_mode
+            mode = get_effective_mode("telegram", chat_id, user_id)
+            mode_label = {"dev": "🛠 разработка", "secretary": "📋 секретарь"}.get(mode, mode)
+        except Exception:
+            mode_label = "—"
+
+        text = (
+            f"Секретарь: {secretary}\n"
+            f"Проект: {project}\n"
+            f"Режим: {mode_label}"
+        )
+
+        try:
+            await self._bot.send_message(
+                chat_id=int(chat_id),
+                text=text,
+                reply_to_message_id=msg.message_id,
+            )
+        except Exception as e:
+            logger.warning("Failed to send /who reply: %s", e)
+
+    async def _handle_proj_callback(
+        self, query, data: str, chat_id, thread_id, user_name
+    ) -> None:
+        """Handle proj:<id> / proj:__neutral__ callback — switch project."""
+        pid = data.split(":", 1)[1] if ":" in data else ""
+        if not pid:
+            await query.answer(text="Invalid project id.")
+            return
+
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=chat_id,
+            chat_type=str(getattr(getattr(query.message, "chat", None), "type", "")),
+            thread_id=str(thread_id) if thread_id is not None else None,
+            user_name=user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to switch projects.")
+            return
+
+        try:
+            if pid == "__neutral__":
+                # Exit project — clear module-level state
+                import projects.project_context as ppc
+                ppc._current_project_id = None
+                ppc._current_project_name = None
+                display_name = "neutral"
+            else:
+                from projects.project_context import switch_project, list_projects, get_current_project_id
+                result = switch_project(pid)
+                if "error" in result:
+                    await query.answer(text=result["error"])
+                    return
+                display_name = pid
+
+            await query.answer(text=f"✅ {display_name}")
+
+            # Rebuild keyboard
+            from projects.project_context import list_projects, get_current_project_id
+            projects = list_projects()
+            current_id = get_current_project_id()
+
+            keyboard = []
+            neutral_label = "🚫 Neutral ✓" if current_id is None else "🚫 Neutral"
+            keyboard.append([InlineKeyboardButton(neutral_label, callback_data="proj:__neutral__")])
+
+            for proj in projects:
+                p = proj.get("id", "") or proj.get("slug", "")
+                pname = proj.get("name", "") or p
+                label = f"{pname} ✓" if p == current_id else pname
+                cb = f"proj:{p}"[:64]
+                keyboard.append([InlineKeyboardButton(label, callback_data=cb)])
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            current_name = "neutral" if current_id is None else current_id
+            try:
+                await query.edit_message_text(
+                    text=f"Проекты. Сейчас: {current_name}",
+                    reply_markup=reply_markup,
+                )
+            except Exception as e:
+                logger.debug("Failed to edit project picker: %s", e)
+
+            # Confirm
+            try:
+                await self._bot.send_message(
+                    chat_id=int(chat_id),
+                    text=f"✅ Проект: {display_name}",
+                    **(self._thread_kwargs_for_send(
+                        str(chat_id), str(thread_id), {"thread_id": str(thread_id)},
+                        reply_to_mode=self._reply_to_mode,
+                    ) if thread_id is not None else {}),
+                )
+            except Exception as e:
+                logger.warning("Failed to send project confirmation: %s", e)
+
+        except Exception as e:
+            logger.error("Project switch failed: %s", e)
+            await query.answer(text=f"Ошибка: {e}")
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""

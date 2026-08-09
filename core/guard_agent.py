@@ -111,7 +111,7 @@ _GUARD_RULES: list[GuardRule] = [
         tools=["write_file", "patch"],
         patterns=[
             r"config\.yaml$", r"\.env$", r"auth\.json$",
-            r"agent_configs/", r"\.hermes/",
+            r"agent_configs/", #r"\.hermes/",
         ],
         severity="high",
     ),

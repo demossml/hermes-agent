@@ -7350,6 +7350,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _intent = detect_mode_intent(_raw_text) if _raw_text else None
 
             if _intent is not None:
+                if _intent.mode == "picker":
+                    # NL picker trigger reached run.py — platform didn't intercept.
+                    # Return a hint (Telegram handles this locally).
+                    return (
+                        "Чтобы переключить режим, используйте:\n"
+                        "• /mode — показать клавиатуру выбора\n"
+                        "• /mode dev — режим разработки\n"
+                        "• /mode secretary — режим секретаря\n"
+                        "• /modes — показать клавиатуру выбора"
+                    )
                 if _intent.mode == "status":
                     from modes.router import format_status_reply
                     return format_status_reply(_plat, _chat, _uid, _raw_text)
@@ -7399,6 +7409,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         return format_already_reply(_intent.mode, _raw_text)
         except Exception as _mode_err:
             logger.debug("Mode router intercept failed (non-fatal): %s", _mode_err)
+
+        # ── Secretary Router intercept ──────────────────────────────────────
+        # Resolve active secretary profile for Telegram users BEFORE
+        # the agent turn. Sets event._active_secretary for use by
+        # system prompt builder and session routing.
+        #
+        # Model: lightweight — sets context, does NOT switch HERMES_HOME.
+        # Full profile isolation (R1) requires per-profile gateway processes.
+        try:
+            _plat = source.platform.value if source.platform else "cli"
+            _uid = source.user_id or None
+            _chat = source.chat_id or ""
+            if _plat == "telegram" and _uid:
+                from gateway.secretary_router import get_active, get_profile_path
+                _secretary = get_active(str(_uid))
+                event._active_secretary = _secretary  # type: ignore[attr-defined]
+                event._active_secretary_path = str(get_profile_path(_secretary))  # type: ignore[attr-defined]
+                os.environ["HERMES_ACTIVE_SECRETARY"] = _secretary
+                os.environ["HERMES_ACTIVE_SECRETARY_PATH"] = event._active_secretary_path  # type: ignore[attr-defined]
+                logger.info(
+                    "Secretary router: user=%s chat=%s active_secretary=%s path=%s",
+                    _uid, _chat, _secretary, event._active_secretary_path,  # type: ignore[attr-defined]
+                )
+            else:
+                event._active_secretary = None  # type: ignore[attr-defined]
+                event._active_secretary_path = None  # type: ignore[attr-defined]
+        except Exception as _sec_err:
+            logger.debug("Secretary router intercept failed (non-fatal): %s", _sec_err)
+            event._active_secretary = None  # type: ignore[attr-defined]
+            event._active_secretary_path = None  # type: ignore[attr-defined]
 
         # Check for commands
         command = event.get_command()
