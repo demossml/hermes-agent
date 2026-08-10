@@ -1,8 +1,8 @@
 {
   "name": "hermes-agent",
-  "displayName": "Hermes Agent",
-  "description": "AI agent for coding, testing, and project management \u2014 Copilot-style inline edits, sidebar chat, tester integration",
-  "version": "1.1.0",
+  "displayName": "Hermes Agent — Local AI Copilot",
+  "description": "Copilot-like AI coding assistant powered by your local Hermes LLM. Inline completions, chat, context-aware suggestions — all fully local via OpenAI-compatible API.",
+  "version": "2.0.0",
   "publisher": "hermes-agent",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -17,20 +17,11 @@
     "Chat",
     "Machine Learning",
     "Programming Languages",
-    "Testing",
     "Other"
   ],
   "keywords": [
-    "ai",
-    "agent",
-    "hermes",
-    "coding",
-    "testing",
-    "chat",
-    "multi-agent",
-    "copilot",
-    "inline",
-    "completion"
+    "ai", "agent", "hermes", "copilot", "local", "llm", "coding",
+    "inline", "completion", "chat", "openai", "api"
   ],
   "activationEvents": [
     "onStartupFinished"
@@ -52,252 +43,154 @@
           "id": "hermes.chatView",
           "name": "Chat",
           "type": "webview"
-        },
-        {
-          "id": "hermes.insightsView",
-          "name": "Insights",
-          "type": "tree"
         }
       ]
     },
-    "commands": [
+    "chatParticipants": [
       {
-        "command": "hermes.openChat",
-        "title": "Hermes: Open Chat",
-        "icon": "$(comment-discussion)"
-      },
-      {
-        "command": "hermes.switchProject",
-        "title": "Hermes: Switch Project"
-      },
-      {
-        "command": "hermes.showInsights",
-        "title": "Hermes: Show Insights"
-      },
-      {
-        "command": "hermes.runFullTest",
-        "title": "Hermes: Run Full Test"
-      },
-      {
-        "command": "hermes.openDashboard",
-        "title": "Hermes: Open Dashboard"
-      },
-      {
-        "command": "hermes.guardStatus",
-        "title": "Hermes: Guard Status"
-      },
-      {
-        "command": "hermes.askAboutCode",
-        "title": "Hermes: Ask About Selected Code"
-      },
-      {
-        "command": "hermes.improveCode",
-        "title": "Hermes: Improve This Code"
-      },
-      {
-        "command": "hermes.generateTests",
-        "title": "Hermes: Generate Tests"
-      },
-      {
-        "command": "hermes.analyzeWithBrowser",
-        "title": "Hermes: Analyze with Browser Tool"
-      },
-      {
-        "command": "hermes.runTesterOnFile",
-        "title": "Hermes: Run Tester on This File"
-      },
-      {
-        "command": "hermes.showStatus",
-        "title": "Hermes: Show Status"
-      },
-      {
-        "command": "hermes.currentProject",
-        "title": "Hermes: Show Current Project"
-      },
-      {
-        "command": "hermes.inlineImprove",
-        "title": "Hermes: Inline Improve",
-        "icon": "$(sparkle)"
-      },
-      {
-        "command": "hermes.inlineFix",
-        "title": "Hermes: Inline Fix",
-        "icon": "$(debug)"
-      },
-      {
-        "command": "hermes.inlineAddTests",
-        "title": "Hermes: Inline Add Tests",
-        "icon": "$(beaker)"
-      },
-      {
-        "command": "hermes.inlineAddComments",
-        "title": "Hermes: Inline Add Comments",
-        "icon": "$(book)"
-      },
-      {
-        "command": "hermes.inlineMakeFaster",
-        "title": "Hermes: Inline Make Faster",
-        "icon": "$(zap)"
-      },
-      {
-        "command": "hermes.syncStart",
-        "title": "Hermes: Start Live Sync",
-        "icon": ""
-      },
-      {
-        "command": "hermes.syncStop",
-        "title": "Hermes: Stop Live Sync",
-        "icon": ""
-      },
-      {
-        "command": "hermes.syncStatus",
-        "title": "Hermes: Sync Status"
-      },
-      {
-        "command": "hermes.openSettings",
-        "title": "Hermes: Open Settings"
-      },
-      {
-        "command": "hermes.quickSetup",
-        "title": "Hermes: Quick Setup"
-      },
-      {
-        "command": "hermes.testConnection",
-        "title": "Hermes: Test Connection"
+        "id": "hermes-agent.hermes",
+        "fullName": "Hermes Agent",
+        "description": "Your local AI coding assistant — explain, refactor, test, and more",
+        "isSticky": true,
+        "commands": [
+          { "name": "explain", "description": "Explain what the selected code does" },
+          { "name": "fix", "description": "Find and fix bugs in the selected code" },
+          { "name": "tests", "description": "Generate unit tests for the selected code" },
+          { "name": "refactor", "description": "Refactor for readability and maintainability" },
+          { "name": "docs", "description": "Add docstrings and comments" },
+          { "name": "optimize", "description": "Optimize for performance" }
+        ]
       }
+    ],
+    "commands": [
+      { "command": "hermes.explainCode", "title": "Hermes: Explain This Code" },
+      { "command": "hermes.refactorCode", "title": "Hermes: Refactor This Code" },
+      { "command": "hermes.generateTests", "title": "Hermes: Generate Tests" },
+      { "command": "hermes.generateDocs", "title": "Hermes: Generate Docstrings" },
+      { "command": "hermes.findBugs", "title": "Hermes: Find Bugs" },
+      { "command": "hermes.optimizeCode", "title": "Hermes: Optimize Performance" },
+      { "command": "hermes.toggleInline", "title": "Hermes: Toggle Inline Completions" },
+      { "command": "hermes.nextSuggestion", "title": "Hermes: Show Next Inline Suggestion" },
+      { "command": "hermes.checkConnection", "title": "Hermes: Check Connection" },
+      { "command": "hermes.openSettings", "title": "Hermes: Open Settings" },
+      { "command": "hermes.quickSetup", "title": "Hermes: Quick Setup" },
+      { "command": "hermes.openChat", "title": "Hermes: Open Chat", "icon": "$(comment-discussion)" }
     ],
     "menus": {
       "editor/context": [
-        {
-          "command": "hermes.inlineImprove",
-          "group": "hermes@1",
-          "when": "editorHasSelection"
-        },
-        {
-          "command": "hermes.inlineFix",
-          "group": "hermes@2",
-          "when": "editorHasSelection"
-        },
-        {
-          "command": "hermes.inlineAddTests",
-          "group": "hermes@3",
-          "when": "editorHasSelection"
-        },
-        {
-          "command": "hermes.inlineAddComments",
-          "group": "hermes@4",
-          "when": "editorHasSelection"
-        },
-        {
-          "command": "hermes.inlineMakeFaster",
-          "group": "hermes@5",
-          "when": "editorHasSelection"
-        },
-        {
-          "command": "hermes.askAboutCode",
-          "group": "hermes@6",
-          "when": "editorHasSelection"
-        },
-        {
-          "command": "hermes.runTesterOnFile",
-          "group": "hermes@7",
-          "when": "editorLangId == python || editorLangId == typescript || editorLangId == javascript"
-        }
+        { "command": "hermes.explainCode", "group": "hermes@1", "when": "editorHasSelection" },
+        { "command": "hermes.refactorCode", "group": "hermes@2", "when": "editorHasSelection" },
+        { "command": "hermes.generateTests", "group": "hermes@3" },
+        { "command": "hermes.findBugs", "group": "hermes@4" },
+        { "command": "hermes.generateDocs", "group": "hermes@5" },
+        { "command": "hermes.optimizeCode", "group": "hermes@6" }
       ],
       "view/title": [
-        {
-          "command": "hermes.switchProject",
-          "when": "view == hermes.chatView",
-          "group": "navigation"
-        }
+        { "command": "hermes.openChat", "when": "view == hermes.chatView", "group": "navigation" }
       ]
     },
+    "keybindings": [
+      { "command": "hermes.nextSuggestion", "key": "ctrl+]", "when": "editorTextFocus && inlineSuggestionVisible" },
+      { "command": "editor.action.inlineSuggest.trigger", "key": "alt+\\", "when": "editorTextFocus && !inlineSuggestionVisible" }
+    ],
     "configuration": {
       "title": "Hermes Agent",
       "properties": {
-        "hermes.cliPath": {
+        "hermes.endpoint": {
           "type": "string",
-          "default": "hermes",
-          "description": "Path to the Hermes CLI"
+          "default": "http://localhost:8642",
+          "description": "OpenAI-compatible API endpoint (default: http://localhost:8642)"
         },
-        "hermes.autoDetectProject": {
-          "type": "boolean",
-          "default": true,
-          "description": "Auto-detect project from workspace"
+        "hermes.model": {
+          "type": "string",
+          "default": "",
+          "description": "Model name (empty = auto-detect from /v1/models)"
         },
-        "hermes.showStatusBar": {
-          "type": "boolean",
-          "default": true,
-          "description": "Show project in status bar"
+        "hermes.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key if your server requires authentication"
         },
         "hermes.inlineEnabled": {
           "type": "boolean",
           "default": true,
-          "description": "Enable Copilot-style inline edits"
+          "description": "Enable ghost-text inline completions (Tab to accept)"
         },
-        "hermes.inlineTriggerDelay": {
+        "hermes.inlineDebounceMs": {
           "type": "integer",
-          "default": 300,
-          "description": "Delay (ms) before triggering inline completion"
+          "default": 150,
+          "minimum": 50,
+          "maximum": 1000,
+          "description": "Debounce delay (ms) before inline completion after typing stops"
         },
-        "hermes.chatModel": {
+        "hermes.inlineMaxTokens": {
+          "type": "integer",
+          "default": 256,
+          "minimum": 16,
+          "maximum": 1024,
+          "description": "Maximum tokens for inline completions"
+        },
+        "hermes.inlineTemperature": {
+          "type": "number",
+          "default": 0.1,
+          "minimum": 0,
+          "maximum": 2,
+          "description": "Temperature for inline completions (lower = more predictable)"
+        },
+        "hermes.contextMode": {
           "type": "string",
-          "default": "",
-          "description": "Override model for chat"
+          "default": "auto",
+          "enum": ["auto", "openTabs", "workspace", "minimal"],
+          "description": "Context gathering: auto, openTabs, workspace, minimal"
         },
         "hermes.maxContextFiles": {
           "type": "integer",
-          "default": 5,
-          "description": "Max files in context"
+          "default": 8,
+          "minimum": 1,
+          "maximum": 30,
+          "description": "Maximum additional files to include in context"
         },
-        "hermes.server.tailscale": {
-          "type": "boolean",
-          "default": false,
-          "description": "Connect to Hermes via Tailscale network (uses 100.x.x.x IP)"
-        },
-        "hermes.server.host": {
-          "type": "string",
-          "default": "",
-          "description": "Hermes server host (auto-detected from Tailscale if tailscale=true)"
-        },
-        "hermes.server.port": {
+        "hermes.contextLinesAroundCursor": {
           "type": "integer",
-          "default": 8790,
-          "description": "Hermes server port (default: 8790)"
+          "default": 60,
+          "minimum": 10,
+          "maximum": 500,
+          "description": "Lines of context around cursor for inline completions"
         },
-        "hermes.server.token": {
-          "type": "string",
-          "default": "",
-          "description": "Auth token for Hermes server (optional)"
+        "hermes.chatMaxTokens": {
+          "type": "integer",
+          "default": 4096,
+          "description": "Maximum tokens for chat responses"
+        },
+        "hermes.chatTemperature": {
+          "type": "number",
+          "default": 0.7,
+          "minimum": 0,
+          "maximum": 2,
+          "description": "Temperature for chat responses (higher = more creative)"
+        },
+        "hermes.statusBarEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show connection status in the status bar"
+        },
+        "hermes.statusBarLatency": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show latency in the status bar"
         }
       }
     }
   },
   "scripts": {
     "vscode:prepublish": "npm run build",
-    "build": "npm run build:ext && npm run build:webview",
-    "build:ext": "webpack --mode production --config webpack.ext.config.js",
-    "build:webview": "cd webview && npm run build",
-    "watch": "webpack --mode development --watch",
-    "dev:webview": "cd webview && npm run dev",
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
     "lint": "eslint src --ext ts"
   },
   "devDependencies": {
-    "@types/node": "^20.0.0",
-    "@types/react": "^18.2.0",
-    "@types/react-dom": "^18.2.0",
     "@types/vscode": "^1.85.0",
-    "css-loader": "^6.8.0",
-    "style-loader": "^3.3.0",
-    "ts-loader": "^9.5.0",
-    "typescript": "^5.3.0",
-    "webpack": "^5.89.0",
-    "webpack-cli": "^5.1.4"
-  },
-  "dependencies": {
-    "@vscode/webview-ui-toolkit": "^1.4.0",
-    "marked": "^11.0.0",
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0"
+    "esbuild": "^0.19.0",
+    "typescript": "^5.3.0"
   }
 }
