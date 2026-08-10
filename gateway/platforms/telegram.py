@@ -437,6 +437,17 @@ def _is_menu_trigger(text: str) -> bool:
     return normalized in _MENU_TRIGGERS
 
 
+def _trust_summary(user: dict) -> str:
+    """Return short trust status string for settings display."""
+    prefs = user.get("prefs", {}) or {}
+    domains = prefs.get("trusted_domains", []) or []
+    emails = prefs.get("trusted_emails", []) or []
+    total = len(domains) + len(emails)
+    if total == 0:
+        return "нет"
+    return f"{total} ({', '.join(domains[:2])}{'...' if len(domains) > 2 else ''})"
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """
     Telegram bot adapter.
@@ -8135,7 +8146,8 @@ class TelegramAdapter(BasePlatformAdapter):
         text = (
             f"\u2699\ufe0f Настройки\n\n"
             f"\u0001f310 Часовой пояс: {tz}\n"
-            f"\u0001f4f0 Дайджест: {digest_status}"
+            f"\u0001f4f0 Дайджест: {digest_status}\n"
+            f"\u0001f517 Доверенные домены: {_trust_summary(user)}"
         )
 
         keyboard = [
@@ -8163,6 +8175,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 InlineKeyboardButton("\u0001f556 08:00", callback_data="set:hour:8"),
                 InlineKeyboardButton("\u0001f556 09:00", callback_data="set:hour:9"),
                 InlineKeyboardButton("\u0001f556 10:00", callback_data="set:hour:10"),
+            ],
+            [
+                InlineKeyboardButton("\u0001f6ab Сбросить доверенных", callback_data="set:trust_clear"),
             ],
             [
                 InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
@@ -8216,6 +8231,21 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text=f"\u0001f556 {hour:02d}:00")
             except (ValueError, IndexError):
                 pass
+            await self._render_settings(chat_id, user_id)
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+            return
+
+        if data == "set:trust_clear":
+            from gateway.secretary_user_store import get_user as _gu2
+            u = _gu2(user_id) or {}
+            prefs = u.get("prefs", {}) or {}
+            prefs.pop("trusted_domains", None)
+            prefs.pop("trusted_emails", None)
+            upsert_user(user_id, prefs_json=prefs)
+            await query.answer(text="\u0001f6ab Доверенные сброшены")
             await self._render_settings(chat_id, user_id)
             try:
                 await query.delete_message()
@@ -8314,6 +8344,14 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if action == "edit":
             await self._handle_mail_edit(query, parts, cid, caller_id)
+            return
+
+        if action == "send_confirm":
+            await self._handle_mail_send_confirm(query, parts, cid, caller_id)
+            return
+
+        if action == "trust_domain":
+            await self._handle_mail_trust_domain(query, parts, cid, caller_id)
             return
 
         if action == "followup":
@@ -8451,6 +8489,37 @@ class TelegramAdapter(BasePlatformAdapter):
             original_subject = body.get("subject", "")
             reply_subject = original_subject
 
+            # ── Trust gate ──
+            from gateway.secretary_user_store import get_user
+            user = get_user(user_id) or {}
+            prefs = user.get("prefs", {}) or {}
+            from tools.secretary.mail_draft import is_trusted
+
+            if to_addr and "@" in to_addr and not is_trusted(to_addr, prefs):
+                # Show confirm dialog
+                text = (
+                    f"\u0001f6a8 Новый адресат: {to_addr}\n\n"
+                    f"Отправить ответ?"
+                )
+                keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("\u2705 Да, отправить", callback_data=f"mail:send_confirm:{mail_id}"),
+                        InlineKeyboardButton("\u0001f517 Доверять домену", callback_data=f"mail:trust_domain:{mail_id}"),
+                    ],
+                    [
+                        InlineKeyboardButton("\u274c Нет", callback_data=f"mail:reject:{mail_id}"),
+                        InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+                    ],
+                ])
+                try:
+                    await query.edit_message_text(text=text, reply_markup=keyboard)
+                except Exception:
+                    await self._bot.send_message(
+                        chat_id=chat_id, text=text, reply_markup=keyboard,
+                        **self._link_preview_kwargs(),
+                    )
+                return
+
             # Build reply — use custom draft if edited
             from tools.secretary.mail_draft import generate_draft
             from gateway.secretary_user_store import get_user
@@ -8512,6 +8581,47 @@ class TelegramAdapter(BasePlatformAdapter):
             await query.edit_message_text(text=text, reply_markup=keyboard)
         except Exception:
             pass
+
+    async def _handle_mail_send_confirm(self, query, parts, chat_id: int, user_id: str) -> None:
+        """mail:send_confirm:<id> — confirmed send after trust gate."""
+        if len(parts) < 3:
+            await query.answer(text="Missing message id.")
+            return
+
+        # Reuse the send flow — trust already confirmed
+        await self._handle_mail_send(query, parts, chat_id, user_id)
+
+    async def _handle_mail_trust_domain(self, query, parts, chat_id: int, user_id: str) -> None:
+        """mail:trust_domain:<id> — add domain to trusted + send."""
+        if len(parts) < 3:
+            await query.answer(text="Missing message id.")
+            return
+
+        mail_id = parts[2]
+        await query.answer(text="\u0001f517 Добавляю домен...")
+
+        try:
+            from tools.secretary.mail_inbox import fetch_body
+            body = fetch_body(mail_id)
+            to_addr = body.get("from_addr", "")
+        except Exception:
+            to_addr = ""
+
+        if to_addr and "@" in to_addr:
+            try:
+                from gateway.secretary_user_store import get_user, upsert_user
+                from tools.secretary.mail_draft import trust_domain
+                user = get_user(user_id) or {}
+                prefs = user.get("prefs", {}) or {}
+                prefs = trust_domain(to_addr, prefs)
+                upsert_user(user_id, prefs_json=prefs)
+                domain = to_addr.split("@")[-1].lower()
+                logger.info("Trust domain added: %s for user %s", domain, user_id)
+            except Exception:
+                pass
+
+        # Now send
+        await self._handle_mail_send(query, parts, chat_id, user_id)
 
     async def _handle_mail_edit(self, query, parts, chat_id: int, user_id: str) -> None:
         """mail:edit:<id> — enter edit mode for the draft."""

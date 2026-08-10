@@ -194,3 +194,39 @@ def _build_template_body(original_body: str, from_name: str) -> str:
         return f"Спасибо за ваш вопрос. Я подготовлю ответ и вернусь к вам в ближайшее время."
     else:
         return f"Спасибо за ваше письмо. Я принял информацию к сведению и отвечу при необходимости."
+
+
+# ── Trust policy ────────────────────────────────────────────────
+
+
+def is_trusted(to_addr: str, prefs: dict) -> bool:
+    """Check if to_addr is in trusted_emails or trusted_domains."""
+    addr = to_addr.strip().lower()
+    if not addr or "@" not in addr:
+        return True  # Can't determine — allow
+
+    trusted_emails = prefs.get("trusted_emails", []) or []
+    trusted_domains = prefs.get("trusted_domains", []) or []
+
+    if addr in (e.strip().lower() for e in trusted_emails if e):
+        return True
+
+    domain = addr.split("@")[-1].lower()
+    if domain in (d.strip().lower() for d in trusted_domains if d):
+        return True
+
+    return False
+
+
+def trust_domain(to_addr: str, prefs: dict) -> dict:
+    """Add to_addr's domain to trusted_domains. Returns updated prefs dict."""
+    addr = to_addr.strip().lower()
+    if "@" not in addr:
+        return prefs
+
+    domain = addr.split("@")[-1].lower()
+    domains: list[str] = list(prefs.get("trusted_domains", []) or [])
+    if domain not in domains:
+        domains.append(domain)
+    prefs["trusted_domains"] = domains
+    return prefs
