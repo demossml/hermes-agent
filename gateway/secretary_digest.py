@@ -73,15 +73,43 @@ def build_digest_text(telegram_id: str) -> str:
         logger.warning("Digest mail section failed: %s", e)
         lines.append("\u0001f4e7 Почта недоступна.")
 
-    # ── Mode / Project (optional, best effort) ──
+    # ── Calendar today ──
     try:
-        from modes.router import get_effective_mode
-        mode = get_effective_mode("telegram", str(telegram_id), str(telegram_id))
-        mode_label = "\u0001f6e0\ufe0f разработка" if mode == "dev" else "\u0001f4cb секретарь"
-        lines.append("")
-        lines.append(f"\u0001f500 Режим: {mode_label}")
-    except Exception:
-        pass
+        from tools.secretary.calendar import is_configured as cal_ok, list_events
+        if cal_ok():
+            events = list_events(days_ahead=1)
+            if events:
+                lines.append("")
+                lines.append(f"\u0001f4c5 Сегодня ({len(events)}):")
+                for e in events[:5]:
+                    title = e.get("title", "")
+                    if len(title) > 40:
+                        title = title[:37] + "..."
+                    start = e.get("start")
+                    time_str = start.strftime("%H:%M") if start and not e.get("all_day") else "весь день"
+                    lines.append(f"  {time_str} — {title}")
+            else:
+                lines.append("")
+                lines.append("\u0001f4c5 Календарь: событий нет.")
+    except Exception as e:
+        logger.warning("Digest calendar section failed: %s", e)
+
+    # ── Follow-up ──
+    try:
+        from tools.secretary.mail_inbox import is_configured as mail_ok, list_awaiting_reply
+        if mail_ok():
+            awaiting = list_awaiting_reply(days=3, limit=5)
+            if awaiting:
+                lines.append("")
+                lines.append(f"\u0001f4ec Без ответа >3 дн ({len(awaiting)}):")
+                for i, m in enumerate(awaiting[:3], 1):
+                    sender = m.get("from_name", "") or m.get("from_addr", "")
+                    subject = m.get("subject", "")
+                    if len(subject) > 40:
+                        subject = subject[:37] + "..."
+                    lines.append(f"  {i}. {sender} — {subject}")
+    except Exception as e:
+        logger.warning("Digest follow-up section failed: %s", e)
 
     return "\n".join(lines)
 
@@ -104,6 +132,10 @@ async def send_digest_to_user(bot, telegram_id: str) -> bool:
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("\u0001f4e7 Почта", callback_data="menu:mail"),
+                InlineKeyboardButton("\u0001f4c5 Календарь", callback_data="menu:cal"),
+            ],
+            [
+                InlineKeyboardButton("\u0001f4ec Без ответа", callback_data="mail:followup"),
                 InlineKeyboardButton("\u0001f4cb Меню", callback_data="menu:home"),
             ],
         ])
