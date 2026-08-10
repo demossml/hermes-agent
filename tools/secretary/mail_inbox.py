@@ -499,29 +499,120 @@ def _awaiting_reply_himalaya(days: int, limit: int) -> list[dict[str, Any]]:
 # ── Formatting for Telegram ────────────────────────────────────
 
 
+# ── Classification ──────────────────────────────────────────────
+
+_LABEL_EMOJI: dict[str, str] = {
+    "important": "\u0001f534",
+    "newsletter": "\u0001f4f0",
+    "other": "\u26aa\ufe0f",
+}
+
+_RULES_NEWSLETTER_DOMAINS: frozenset[str] = frozenset({
+    "noreply", "no-reply", "no_reply", "noreply@", "mailer", "bounce",
+    "notifications", "notification", "updates@", "news@", "digest@",
+    "marketing@", "team@slack", "calendar-notification",
+})
+
+_RULES_NEWSLETTER_WORDS: frozenset[str] = frozenset({
+    "unsubscribe", "отписаться", "отписка", "рассылка",
+    "newsletter", "bulletin",
+})
+
+_RULES_IMPORTANT_DOMAINS: frozenset[str] = frozenset({
+    "gmail.com", "yandex.ru", "mail.ru", "icloud.com", "proton.me",
+})
+
+_RULES_IMPORTANT_KEYWORDS: frozenset[str] = frozenset({
+    "срочно", "urgent", "asap", "важно", "important",
+    "договор", "contract", "счёт", "invoice", "оплата", "payment",
+    "подпись", "sign", "согласование", "approval",
+})
+
+
+def classify_mail(subject: str, from_addr: str, snippet: str = "") -> str:
+    """Classify an email as important, newsletter, or other.
+
+    Uses rules-based detection. LLM mode deferred to S16-llm.
+    """
+    subj_lower = subject.lower()
+    addr_lower = from_addr.lower()
+
+    # ── Newsletter detection ──
+    # Unsubscribe link in snippet
+    if any(w in snippet.lower() for w in _RULES_NEWSLETTER_WORDS if len(snippet) > 0):
+        return "newsletter"
+    if any(w in subj_lower for w in _RULES_NEWSLETTER_WORDS):
+        return "newsletter"
+    # Common newsletter sender patterns
+    for nd in _RULES_NEWSLETTER_DOMAINS:
+        if nd in addr_lower:
+            return "newsletter"
+    # Subject patterns
+    if any(subj_lower.startswith(p) for p in ("fw:", "fwd:", "re:", "авто:")):
+        pass  # forwarded — might still be important
+
+    # ── Important detection ──
+    # Keywords in subject
+    for kw in _RULES_IMPORTANT_KEYWORDS:
+        if kw in subj_lower:
+            return "important"
+    # Personal domains (if not newsletter)
+    domain = addr_lower.split("@")[-1] if "@" in addr_lower else ""
+    if domain in _RULES_IMPORTANT_DOMAINS and addr_lower not in _RULES_NEWSLETTER_DOMAINS:
+        return "important"
+
+    return "other"
+
+
 def format_mail_list(emails: list[dict[str, Any]], hours: int = 12) -> str:
-    """Format mail list for Telegram message."""
+    """Format mail list with classification prefixes."""
     if not emails:
         return f"\u0001f4ed Нет новых писем за {hours} ч."
 
-    lines = [f"\u0001f4e7 Почта за {hours} ч ({len(emails)}):", ""]
-    for i, m in enumerate(emails[:15], 1):
-        date = m.get("date_display", "") or m.get("date_iso", "") or "?"
-        sender = m.get("from_name", "") or m.get("from_addr", "")
-        subject = m.get("subject", "")
-        # Truncate long subjects
-        if len(subject) > 60:
-            subject = subject[:57] + "..."
-        lines.append(f"{i}. [{date}] {sender}")
-        lines.append(f"   {subject}")
+    # Group by label
+    important = [m for m in emails if m.get("label", classify_mail(
+        m.get("subject", ""), m.get("from_addr", ""), m.get("snippet", ""),
+    )) == "important"]
+    newsletters = [m for m in emails if m.get("label", classify_mail(
+        m.get("subject", ""), m.get("from_addr", ""), m.get("snippet", ""),
+    )) == "newsletter"]
+    other = [m for m in emails if m.get("label", classify_mail(
+        m.get("subject", ""), m.get("from_addr", ""), m.get("snippet", ""),
+    )) not in ("important", "newsletter")]
 
-    if len(emails) > 15:
-        lines.append(f"\n  ... и ещё {len(emails) - 15}")
+    lines = [f"\u0001f4e7 Почта за {hours} ч ({len(emails)}):", ""]
+    idx = 0
+
+    if important:
+        lines.append("\u0001f534 Важное:")
+        for m in important[:5]:
+            idx += 1
+            lines.append(_format_one(idx, m))
+    if newsletters:
+        lines.append(f"\u0001f4f0 Рассылки ({len(newsletters)}):")
+        for m in newsletters[:3]:
+            idx += 1
+            lines.append(_format_one(idx, m))
+    if other:
+        lines.append("\u26aa\ufe0f Прочее:")
+        for m in other[:7]:
+            idx += 1
+            lines.append(_format_one(idx, m))
+
+    remaining = len(emails) - idx
+    if remaining > 0:
+        lines.append(f"\n  ... и ещё {remaining}")
 
     return "\n".join(lines)
 
 
-# ── Fetch body ─────────────────────────────────────────────────
+def _format_one(idx: int, m: dict) -> str:
+    date = m.get("date_display", "") or m.get("date_iso", "") or "?"
+    sender = m.get("from_name", "") or m.get("from_addr", "")
+    subject = m.get("subject", "")
+    if len(subject) > 55:
+        subject = subject[:52] + "..."
+    return f"{idx}. [{date}] {sender}\n   {subject}"
 
 
 def fetch_body(mail_id: str) -> dict[str, str]:

@@ -40,16 +40,31 @@ def build_digest_text(telegram_id: str) -> str:
         if is_configured():
             emails = list_recent(hours=12, limit=10)
             if emails:
-                lines.append(f"\u0001f4e7 Почта за ночь ({len(emails)}):")
-                for i, m in enumerate(emails[:8], 1):
-                    sender = m.get("from_name", "") or m.get("from_addr", "")
-                    subject = m.get("subject", "")
-                    if len(subject) > 50:
-                        subject = subject[:47] + "..."
-                    lines.append(f"  {i}. {sender}")
-                    lines.append(f"     {subject}")
-                if len(emails) > 8:
-                    lines.append(f"  ... и ещё {len(emails) - 8}")
+                # Classify and group
+                from tools.secretary.mail_inbox import classify_mail
+                important = [m for m in emails if classify_mail(
+                    m.get("subject", ""), m.get("from_addr", ""), m.get("snippet", ""),
+                ) == "important"]
+                newsletters = [m for m in emails if classify_mail(
+                    m.get("subject", ""), m.get("from_addr", ""), m.get("snippet", ""),
+                ) == "newsletter"]
+
+                if important:
+                    lines.append(f"\u0001f534 Важное ({len(important)}):")
+                    for i, m in enumerate(important[:5], 1):
+                        sender = m.get("from_name", "") or m.get("from_addr", "")
+                        subject = m.get("subject", "")
+                        if len(subject) > 50:
+                            subject = subject[:47] + "..."
+                        lines.append(f"  {i}. {sender}")
+                        lines.append(f"     {subject}")
+                if newsletters:
+                    lines.append(f"\u0001f4f0 Рассылки: {len(newsletters)}")
+                remaining = len(emails) - len(important) - len(newsletters)
+                if remaining > 0:
+                    lines.append(f"\u26aa\ufe0f Прочее: {remaining}")
+                if not important and not newsletters:
+                    lines.append(f"\u0001f4e7 Всего писем: {len(emails)}")
             else:
                 lines.append("\u0001f4ed Важных писем нет.")
         else:

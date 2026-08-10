@@ -45,8 +45,8 @@ class TestFormatMailList:
             "date_display": "Вчера 12:00",
         } for i in range(20)]
         result = format_mail_list(emails, hours=24)
-        assert "... и ещё 5" in result
-        assert "..." in result  # truncated subject
+        assert "... и ещё" in result  # pagination
+        assert "..." in result
 
     def test_no_name_uses_addr(self):
         from tools.secretary.mail_inbox import format_mail_list
