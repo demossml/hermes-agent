@@ -33,9 +33,14 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-# ── Output dict shape ──────────────────────────────────────────
+# ── Constants ───────────────────────────────────────────────────
 
-# {id, from_addr, from_name, subject, date_iso, date_display, snippet}
+_IMAP_TIMEOUT = 15  # seconds
+_SMTP_TIMEOUT = 15
+_DEFAULT_IMAP_PORT = 993
+_DEFAULT_SMTP_PORT = 587
+
+# Output dict shape: {id, from_addr, from_name, subject, date_iso, date_display, snippet}
 
 
 def _now_utc() -> datetime:
@@ -46,11 +51,24 @@ def _now_utc() -> datetime:
 
 
 def is_configured() -> bool:
-    """Return True if the mail backend can authenticate."""
+    """Return True if the mail backend can authenticate.
+
+    For imap: requires host, email, and password.
+    For himalaya: requires binary and config.
+    """
     backend = _backend_name()
     if backend == "himalaya":
         return _himalaya_available()
-    return bool(_imap_host() and _imap_email() and _imap_password())
+    # IMAP: need at minimum host + email + password
+    host = _imap_host()
+    email = _imap_email()
+    pwd = _imap_password()
+    if not (host and email and pwd):
+        return False
+    # Basic format validation
+    if "@" not in email or "." not in host:
+        return False
+    return True
 
 
 def list_recent(hours: int = 12, limit: int = 20) -> list[dict[str, Any]]:
@@ -103,10 +121,18 @@ def _list_imap(since: datetime, limit: int) -> list[dict[str, Any]]:
         raise RuntimeError("IMAP not configured: set SECRETARY_MAIL_IMAP_HOST, _EMAIL, _PASSWORD")
 
     ctx = ssl.create_default_context()
-    conn = imaplib.IMAP4_SSL(host, port, ssl_context=ctx, timeout=15)
     try:
-        conn.login(user, pwd)
-        conn.select("INBOX", readonly=True)
+        conn = imaplib.IMAP4_SSL(host, port, ssl_context=ctx, timeout=_IMAP_TIMEOUT)
+    except (OSError, imaplib.IMAP4.error) as e:
+        raise RuntimeError(f"IMAP connection failed: {host}:{port} — {e}")
+    try:
+        try:
+            conn.login(user, pwd)
+        except imaplib.IMAP4.error as e:
+            raise RuntimeError(f"IMAP login failed for {user}: {e}")
+        typ, _ = conn.select("INBOX", readonly=True)
+        if typ != "OK":
+            raise RuntimeError(f"IMAP: cannot open INBOX")
 
         # IMAP search: SINCE DD-Mon-YYYY
         since_str = since.strftime("%d-%b-%Y")
@@ -330,10 +356,18 @@ def _awaiting_reply_imap(days: int, limit: int) -> list[dict[str, Any]]:
         raise RuntimeError("IMAP not configured.")
 
     ctx = ssl.create_default_context()
-    conn = imaplib.IMAP4_SSL(host, port, ssl_context=ctx, timeout=15)
     try:
-        conn.login(user, pwd)
-        conn.select("INBOX", readonly=True)
+        conn = imaplib.IMAP4_SSL(host, port, ssl_context=ctx, timeout=_IMAP_TIMEOUT)
+    except (OSError, imaplib.IMAP4.error) as e:
+        raise RuntimeError(f"IMAP connection failed: {host}:{port} — {e}")
+    try:
+        try:
+            conn.login(user, pwd)
+        except imaplib.IMAP4.error as e:
+            raise RuntimeError(f"IMAP login failed for {user}: {e}")
+        typ, _ = conn.select("INBOX", readonly=True)
+        if typ != "OK":
+            raise RuntimeError(f"IMAP: cannot open INBOX")
 
         # Get old inbox emails
         cutoff = _now_utc() - timedelta(days=days)
@@ -514,10 +548,18 @@ def _fetch_body_imap(mail_id: str) -> dict[str, str]:
     pwd = _imap_password()
 
     ctx = ssl.create_default_context()
-    conn = imaplib.IMAP4_SSL(host, port, ssl_context=ctx, timeout=15)
     try:
-        conn.login(user, pwd)
-        conn.select("INBOX", readonly=True)
+        conn = imaplib.IMAP4_SSL(host, port, ssl_context=ctx, timeout=_IMAP_TIMEOUT)
+    except (OSError, imaplib.IMAP4.error) as e:
+        raise RuntimeError(f"IMAP connection failed: {host}:{port} — {e}")
+    try:
+        try:
+            conn.login(user, pwd)
+        except imaplib.IMAP4.error as e:
+            raise RuntimeError(f"IMAP login failed for {user}: {e}")
+        typ, _ = conn.select("INBOX", readonly=True)
+        if typ != "OK":
+            raise RuntimeError(f"IMAP: cannot open INBOX")
 
         # Fetch by UID
         mid = mail_id.encode() if isinstance(mail_id, str) else mail_id
@@ -677,14 +719,18 @@ def _send_smtp(to_addr: str, subject: str, body: str) -> dict[str, Any]:
 
     ctx = ssl.create_default_context()
     try:
-        conn = smtplib.SMTP(host, port, timeout=15)
+        conn = smtplib.SMTP(host, port, timeout=_SMTP_TIMEOUT)
         conn.starttls(context=ctx)
         conn.login(user, pwd)
         conn.sendmail(user, [to_addr], msg.as_string())
         conn.quit()
         logger.info("Sent mail to=%s subject=%s", to_addr, subject)
         return {"sent": True, "dry_run": False, "details": f"Sent to {to_addr}: «{subject}»"}
-    except Exception as e:
+    except smtplib.SMTPAuthenticationError:
+        return {"sent": False, "dry_run": False, "details": f"SMTP auth failed for {user}"}
+    except smtplib.SMTPConnectError as e:
+        return {"sent": False, "dry_run": False, "details": f"SMTP connection failed: {host}:{port} — {e}"}
+    except (smtplib.SMTPException, OSError) as e:
         logger.error("SMTP send failed: %s", e)
         return {"sent": False, "dry_run": False, "details": f"SMTP error: {e}"}
 

@@ -29,32 +29,46 @@ def _ics_url() -> str:
     return os.environ.get("SECRETARY_CAL_ICS_URL", "").strip()
 
 
+# ── Cache ───────────────────────────────────────────────────────
+
+_cache: dict[str, tuple[float, str]] = {}  # url → (expiry_ts, raw_ics)
+_CACHE_TTL = 300  # 5 minutes
+
+
 def is_configured() -> bool:
     return bool(_ics_url())
 
 
 def list_events(days_ahead: int = 1) -> list[dict[str, Any]]:
-    """Fetch and parse .ics feed, return events within the window.
-
-    Returns list of: {start, end, title, location, all_day}
-    Raises RuntimeError if not configured.
-    """
+    """Fetch and parse .ics feed, return events within the window."""
     url = _ics_url()
     if not url:
         raise RuntimeError("Calendar not configured. Set SECRETARY_CAL_ICS_URL.")
 
-    raw = _fetch_ics(url)
+    raw = _fetch_ics_cached(url)
     return _parse_ics(raw, days_ahead)
 
 
+def _fetch_ics_cached(url: str) -> str:
+    """Fetch with 5-min in-memory cache."""
+    now_ts = _now_utc().timestamp()
+    entry = _cache.get(url)
+    if entry and entry[0] > now_ts:
+        return entry[1]
+
+    raw = _fetch_ics(url)
+    _cache[url] = (now_ts + _CACHE_TTL, raw)
+    return raw
+
+
 def _fetch_ics(url: str) -> str:
-    """Fetch .ics file with 20s timeout."""
+    """Fetch .ics file with timeout."""
     req = Request(url, headers={"User-Agent": "Hermes-Secretary/1.0"})
     try:
         with urlopen(req, timeout=20) as resp:
             return resp.read().decode("utf-8", errors="replace")
     except Exception as e:
-        raise RuntimeError(f"Failed to fetch calendar: {e}")
+        raise RuntimeError(f"Calendar temporarily unavailable: {e}")
 
 
 def _parse_ics(raw: str, days_ahead: int) -> list[dict[str, Any]]:

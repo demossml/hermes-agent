@@ -6171,6 +6171,11 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._handle_digest_command(msg)
             return
 
+        # ── /secretary_health — live readiness check ──
+        if text == "/secretary_health":
+            await self._handle_health_command(msg)
+            return
+
         if not self._should_process_message(msg, is_command=True):
             return
         await self._ensure_forum_commands(msg)
@@ -8697,3 +8702,56 @@ class TelegramAdapter(BasePlatformAdapter):
                 chat_id=cid, text=text, reply_markup=keyboard,
                 **self._link_preview_kwargs(),
             )
+
+    # ═══════════════════════════════════════════════════════════
+    # Health Check (/secretary_health)
+    # ═══════════════════════════════════════════════════════════
+
+    async def _handle_health_command(self, msg) -> None:
+        """Handle /secretary_health — show live readiness status."""
+        chat_id = str(msg.chat.id)
+        user_id = str(getattr(msg.from_user, "id", ""))
+
+        lines = ["\u0001f3e5 Hermes Secretary Health", ""]
+
+        try:
+            from tools.secretary.mail_inbox import is_configured as mail_ok, _is_dry_run
+            mc = mail_ok()
+            dr = _is_dry_run()
+        except Exception:
+            mc = False; dr = True
+        mail_icon = "\u2705" if mc else "\u274c"
+        dry_label = "DRY_RUN" if dr else "LIVE"
+        lines.append(f"\u0001f4e7 Почта: {mail_icon} ({dry_label})")
+
+        try:
+            from tools.secretary.calendar import is_configured as cal_ok
+            cc = cal_ok()
+        except Exception:
+            cc = False
+        cal_icon = "\u2705" if cc else "\u274c"
+        lines.append(f"\u0001f4c5 Календарь: {cal_icon}")
+
+        try:
+            from gateway.secretary_router import get_active
+            sec = get_active(user_id)
+        except Exception:
+            sec = "?"
+        lines.append(f"\u0001f464 Профиль: {sec}")
+
+        try:
+            from gateway.secretary_user_store import is_onboarded
+            ob = is_onboarded(user_id)
+        except Exception:
+            ob = False
+        ob_icon = "\u2705 done" if ob else "\u274c нет"
+        lines.append(f"\u0001f3d7\ufe0f Онбординг: {ob_icon}")
+
+        try:
+            await self._bot.send_message(
+                chat_id=int(chat_id), text="\n".join(lines),
+                reply_to_message_id=msg.message_id,
+                **self._link_preview_kwargs(),
+            )
+        except Exception as e:
+            logger.warning("Health check failed: %s", e)
