@@ -418,6 +418,47 @@ def _is_who_trigger(text: str) -> bool:
     return False
 
 
+_MENU_TRIGGERS: frozenset[str] = frozenset({
+    "\u043c\u0435\u043d\u044e",           # меню
+    "\u0433\u043b\u0430\u0432\u043d\u043e\u0435 \u043c\u0435\u043d\u044e",  # главное меню
+    "menu",
+    "main menu",
+    "\u0432 \u043c\u0435\u043d\u044e",     # в меню
+})
+
+
+def _is_menu_trigger(text: str) -> bool:
+    """Check if text is a request to show the main menu — short exact matches only."""
+    normalized = text.strip().casefold()
+    if not normalized:
+        return False
+    if len(normalized) > 30:
+        return False
+    return normalized in _MENU_TRIGGERS
+
+
+def _trust_summary(user: dict) -> str:
+    """Return short trust status string for settings display."""
+    prefs = user.get("prefs", {}) or {}
+    domains = prefs.get("trusted_domains", []) or []
+    emails = prefs.get("trusted_emails", []) or []
+    total = len(domains) + len(emails)
+    if total == 0:
+        return "нет"
+    return f"{total} ({', '.join(domains[:2])}{'...' if len(domains) > 2 else ''})"
+
+
+def _mail_status() -> str:
+    """Return mail config status for settings display."""
+    try:
+        from tools.secretary.mail_inbox import is_configured, _is_dry_run
+        if is_configured():
+            return "\u2705 настроена" + (" (DRY_RUN)" if _is_dry_run() else "")
+        return "\u274c не настроена"
+    except Exception:
+        return "?"
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """
     Telegram bot adapter.
@@ -4095,6 +4136,31 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._handle_proj_callback(query, data, query_chat_id, query_thread_id, query_user_name)
             return
 
+        # --- Task callbacks (task:add | task:done:<id>) ---
+        if data.startswith("task:"):
+            await self._handle_task_callback(query, data, query_chat_id, query_thread_id, query_user_name)
+            return
+
+        # --- Onboarding callbacks (onb:go | onb:later | onb:name_ok | onb:tz:* | onb:email_skip | onb:digest:*) ---
+        if data.startswith("onb:"):
+            await self._handle_onboarding_callback(query, data, query_chat_id, query_thread_id, query_user_name)
+            return
+
+        # --- Mail callbacks (mail:list:N | mail:list:N:page:P) ---
+        if data.startswith("mail:"):
+            await self._handle_mail_callback(query, data, query_chat_id, query_thread_id, query_user_name)
+            return
+
+        # --- Calendar callbacks (cal:day:N | cal:week) ---
+        if data.startswith("cal:"):
+            await self._handle_calendar_callback(query, data, query_chat_id, query_thread_id, query_user_name)
+            return
+
+        # --- Main menu callbacks (menu:home | menu:mail | menu:tasks | menu:cal | menu:mode | menu:project | menu:secretary | menu:settings | menu:who | set:*) ---
+        if data.startswith("menu:") or data.startswith("set:"):
+            await self._handle_menu_callback(query, data, query_chat_id, query_thread_id, query_user_name)
+            return
+
         # --- Clarify callbacks (cl:clarify_id:idx | cl:clarify_id:other) ---
         if data.startswith("cl:"):
             parts = data.split(":", 2)
@@ -6069,6 +6135,23 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._handle_who_locally(msg)
             return
 
+        # ── Onboarding text intercept — step=name or tz_custom ──
+        if text and await self._handle_onboarding_text(msg, text):
+            return
+
+        # ── Pending mail edit intercept ──
+        if text and await self._handle_pending_mail_edit(msg, text):
+            return
+
+        # ── Pending task add intercept ──
+        if text and await self._handle_pending_task_add(msg, text):
+            return
+
+        # ── NL menu triggers — handle locally, no LLM ──
+        if text and _is_menu_trigger(text):
+            await self._handle_menu_command(msg)
+            return
+
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
@@ -6088,6 +6171,16 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._handle_rule_command_locally(msg, text)
             return
 
+        # ── /start — secretary onboarding (no LLM) ──
+        if text == "/start":
+            await self._handle_start_command(msg)
+            return
+
+        # ── /menu / /меню — main menu (no LLM) ──
+        if text in ("/menu", "/меню"):
+            await self._handle_menu_command(msg)
+            return
+
         # ── /mode (no args) and /modes — show picker keyboard ──
         if text == "/mode" or text == "/modes":
             await self._handle_mode_picker_locally(msg)
@@ -6104,8 +6197,23 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         # ── /who — show current state (secretary + project + mode) ──
-        if text == "/who" or text == "/where":
+        if text in ("/who", "/where", "/кто"):
             await self._handle_who_locally(msg)
+            return
+
+        # ── /digest — force send morning digest (test command) ──
+        if text == "/digest":
+            await self._handle_digest_command(msg)
+            return
+
+        # ── /secretary_health — live readiness check ──
+        if text == "/secretary_health":
+            await self._handle_health_command(msg)
+            return
+
+        # ── /help / /помощь ──
+        if text in ("/help", "/помощь"):
+            await self._handle_help_command(msg)
             return
 
         if not self._should_process_message(msg, is_command=True):
@@ -6435,43 +6543,82 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("Failed to send project picker: %s", e)
 
     async def _handle_who_locally(self, msg) -> None:
-        """Send /who status — secretary + project + mode — zero LLM cost."""
+        """Send /who status — full secretary state — zero LLM cost."""
         chat_id = str(msg.chat.id)
         user_id = str(getattr(msg.from_user, "id", ""))
+        first_name = getattr(msg.from_user, "first_name", "") or ""
 
-        # Secretary
-        try:
-            from gateway.secretary_router import get_active
-            secretary = get_active(user_id)
-        except Exception:
-            secretary = "default"
+        # Build each line with safe fallbacks
+        lines = ["\u2139\ufe0f Кто я", ""]
 
-        # Project
+        # Name — from user store or Telegram
+        name = first_name or "\u2014"
         try:
-            from projects.project_context import get_current_project_name
-            project = get_current_project_name() or "—"
+            from gateway.secretary_user_store import get_user
+            u = get_user(user_id)
+            if u and u.get("display_name"):
+                name = u["display_name"]
         except Exception:
-            project = "—"
+            pass
+        lines.append(f"\u0001f464 Имя: {name}")
 
         # Mode
         try:
             from modes.router import get_effective_mode
             mode = get_effective_mode("telegram", chat_id, user_id)
-            mode_label = {"dev": "🛠 разработка", "secretary": "📋 секретарь"}.get(mode, mode)
+            mode_label = {"dev": "\u0001f6e0\ufe0f разработка", "secretary": "\u0001f4cb секретарь"}.get(mode, mode)
         except Exception:
-            mode_label = "—"
+            mode_label = "\u2014"
+        lines.append(f"\u0001f500 Режим: {mode_label}")
 
-        text = (
-            f"Секретарь: {secretary}\n"
-            f"Проект: {project}\n"
-            f"Режим: {mode_label}"
-        )
+        # Project
+        try:
+            from projects.project_context import get_current_project_name
+            project = get_current_project_name()
+            project_label = project if project else "(neutral)"
+        except Exception:
+            project_label = "\u2014"
+        lines.append(f"\u0001f4c1 Проект: {project_label}")
+
+        # Secretary profile
+        try:
+            from gateway.secretary_router import get_active
+            secretary = get_active(user_id)
+        except Exception:
+            secretary = "default"
+        lines.append(f"\u0001f464 Секретарь (profile): {secretary}")
+
+        # Timezone + Digest — from user store
+        tz_label = "\u2014"
+        digest_label = "\u2014"
+        onboard_label = "\u2014"
+        try:
+            from gateway.secretary_user_store import get_user as _gu
+            u2 = _gu(user_id)
+            if u2:
+                tz_label = u2.get("timezone", "\u2014") or "\u2014"
+                d_on = bool(u2.get("digest_enabled", 1))
+                d_hour = u2.get("digest_hour", 9)
+                if d_on:
+                    digest_label = f"\u0432\u043a\u043b {d_hour:02d}:00"
+                else:
+                    digest_label = "\u0432\u044b\u043a\u043b"
+                step = u2.get("onboarding_step")
+                onboard_label = "done" if step == "done" else (step or "нет")
+        except Exception:
+            pass
+        lines.append(f"\u0001f310 Часовой пояс: {tz_label}")
+        lines.append(f"\u0001f4f0 Дайджест: {digest_label}")
+        lines.append(f"\u0001f3d7\ufe0f Онбординг: {onboard_label}")
+
+        text = "\n".join(lines)
 
         try:
             await self._bot.send_message(
                 chat_id=int(chat_id),
                 text=text,
                 reply_to_message_id=msg.message_id,
+                **self._link_preview_kwargs(),
             )
         except Exception as e:
             logger.warning("Failed to send /who reply: %s", e)
@@ -7473,3 +7620,1605 @@ class TelegramAdapter(BasePlatformAdapter):
                 message_id,
                 "\U0001f44d" if outcome == ProcessingOutcome.SUCCESS else "\U0001f44e",
             )
+
+    # ═══════════════════════════════════════════════════════════
+    # Secretary Onboarding (/start)
+    # ═══════════════════════════════════════════════════════════
+
+    async def _handle_start_command(self, msg) -> None:
+        """Handle /start — show onboarding or menu stub."""
+        chat_id = str(msg.chat.id)
+        user_id = str(getattr(msg.from_user, "id", ""))
+        first_name = getattr(msg.from_user, "first_name", "") or ""
+
+        try:
+            from gateway.secretary_user_store import is_onboarded, get_user, upsert_user
+
+            if is_onboarded(user_id):
+                # Already done — show main menu
+                await self.send_main_menu(
+                    int(chat_id), user_id,
+                    reply_to_msg_id=msg.message_id,
+                )
+                return
+
+            # Not onboarded — set step=welcome if not set yet
+            user = get_user(user_id)
+            step = (user or {}).get("onboarding_step")
+            if not step:
+                upsert_user(user_id, onboarding_step="welcome", display_name=first_name)
+
+            await self._render_onboarding_step(int(chat_id), user_id, "welcome", msg.message_id)
+
+        except Exception as e:
+            logger.warning("Failed to handle /start: %s", e)
+            try:
+                await self._bot.send_message(
+                    chat_id=int(chat_id),
+                    text="\u26a0\ufe0f Что-то пошло не так. Попробуйте позже.",
+                    reply_to_message_id=msg.message_id,
+                )
+            except Exception:
+                pass
+
+    async def _render_onboarding_step(
+        self, chat_id: int, user_id: str, step: str, reply_to_msg_id: int | None = None
+    ) -> None:
+        """Render the onboarding message for a given step."""
+        from gateway.secretary_user_store import get_user
+
+        user = get_user(user_id) or {}
+        first_name = user.get("display_name", "")
+
+        send_kwargs: dict = {"chat_id": chat_id, **self._link_preview_kwargs()}
+        if reply_to_msg_id is not None:
+            send_kwargs["reply_to_message_id"] = reply_to_msg_id
+
+        if step == "welcome":
+            text = (
+                "\u0001f44b Привет! Я — ваш AI-секретарь на базе Hermes Agent.\n\n"
+                "\u0001f4cb Я помогу:\n"
+                "\u2022 Разбирать почту по утрам\n"
+                "\u2022 Вести архив чатов\n"
+                "\u2022 Напоминать о задачах\n"
+                "\u2022 Управлять проектами\n\n"
+                "Настроимся за пару минут?"
+            )
+            keyboard = [
+                [
+                    InlineKeyboardButton("\u2705 Давай", callback_data="onb:go"),
+                    InlineKeyboardButton("\u23f3 Позже", callback_data="onb:later"),
+                ],
+            ]
+
+        elif step == "name":
+            text = (
+                f"\u0001f464 Как к вам обращаться?\n\n"
+                f"Нажмите кнопку или напишите имя текстом."
+            )
+            keyboard = [
+                [InlineKeyboardButton(
+                    f"\u2705 Оставить {first_name}",
+                    callback_data="onb:name_ok",
+                )],
+            ]
+
+        elif step == "tz":
+            text = "\u0001f310 Выберите часовой пояс:"
+            keyboard = [
+                [InlineKeyboardButton("\u0001f1f7\u0001f1fa Москва (UTC+3)", callback_data="onb:tz:Europe/Moscow")],
+                [InlineKeyboardButton("\u0001f1fa\u0001f1e6 Киев (UTC+3)", callback_data="onb:tz:Europe/Kyiv")],
+                [InlineKeyboardButton("\u270f\ufe0f Другой", callback_data="onb:tz:custom")],
+            ]
+
+        elif step == "tz_custom":
+            text = (
+                "\u0001f310 Напишите ваш часовой пояс в формате IANA.\n"
+                "Например: Europe/London, Asia/Tokyo, America/New_York"
+            )
+            keyboard = []
+
+        elif step == "email_skip":
+            text = (
+                "\u0001f4e7 Почту подключим позже — в Фазе 2.\n"
+                "Пока можно пропустить этот шаг."
+            )
+            keyboard = [
+                [InlineKeyboardButton("\u25b6\ufe0f Продолжить", callback_data="onb:email_skip")],
+            ]
+
+        elif step == "digest":
+            text = (
+                "\u0001f4f0 Утренний дайджест почты.\n"
+                "Присылать сводку новых писем каждое утро?"
+            )
+            keyboard = [
+                [InlineKeyboardButton("\u2600\ufe0f Да, в 09:00", callback_data="onb:digest:9")],
+                [InlineKeyboardButton("\u0001f6ab Выключить", callback_data="onb:digest:off")],
+            ]
+
+        else:
+            # Safety fallback — go to welcome
+            await self._render_onboarding_step(chat_id, user_id, "welcome", reply_to_msg_id)
+            return
+
+        reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+        send_kwargs["text"] = text
+        if reply_markup:
+            send_kwargs["reply_markup"] = reply_markup
+
+        try:
+            await self._bot.send_message(**send_kwargs)
+        except Exception as e:
+            logger.warning("Failed to render onboarding step %s: %s", step, e)
+
+    async def _handle_onboarding_callback(
+        self, query, data: str, chat_id, thread_id, user_name
+    ) -> None:
+        """Handle onb:* callback — progress through onboarding steps."""
+        caller_id = str(getattr(query.from_user, "id", ""))
+
+        # ACL check
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=chat_id,
+            chat_type=str(getattr(getattr(query.message, "chat", None), "type", "")),
+            thread_id=str(thread_id) if thread_id is not None else None,
+            user_name=user_name,
+        ):
+            await query.answer(text="\u26d4 Not authorized.")
+            return
+
+        from gateway.secretary_user_store import (
+            upsert_user, set_onboarding_step, get_user,
+        )
+
+        action = data[4:]  # strip "onb:"
+        cid = int(chat_id) if chat_id else 0
+        user = get_user(caller_id) or {}
+
+        # ── onb:later — exit without changing step ──
+        if action == "later":
+            await query.answer(text="\u23f3 Ок, жду.")
+            try:
+                await query.edit_message_text(
+                    text="\u23f3 Ок, напишите /start когда будете готовы.",
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            return
+
+        # ── onb:go → step=name ──
+        if action == "go":
+            set_onboarding_step(caller_id, "name")
+            await query.answer()
+            await self._render_onboarding_step(cid, caller_id, "name")
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+            return
+
+        # ── onb:name_ok → use existing display_name, step=tz ──
+        if action == "name_ok":
+            # display_name already set from first_name in /start
+            set_onboarding_step(caller_id, "tz")
+            await query.answer()
+            await self._render_onboarding_step(cid, caller_id, "tz")
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+            return
+
+        # ── onb:tz:Europe/Moscow | Europe/Kyiv → save, step=email_skip ──
+        if action.startswith("tz:") and not action.startswith("tz:custom"):
+            tz = action[3:]  # strip "tz:"
+            upsert_user(caller_id, timezone=tz)
+            set_onboarding_step(caller_id, "email_skip")
+            await query.answer(text=f"\u0001f310 {tz}")
+            await self._render_onboarding_step(cid, caller_id, "email_skip")
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+            return
+
+        # ── onb:tz:custom → step=tz_custom (wait for text) ──
+        if action == "tz:custom":
+            set_onboarding_step(caller_id, "tz_custom")
+            await query.answer()
+            await self._render_onboarding_step(cid, caller_id, "tz_custom")
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+            return
+
+        # ── onb:email_skip → step=digest ──
+        if action == "email_skip":
+            set_onboarding_step(caller_id, "digest")
+            await query.answer()
+            await self._render_onboarding_step(cid, caller_id, "digest")
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+            return
+
+        # ── onb:digest:9 → enable, step=done ──
+        if action == "digest:9":
+            upsert_user(caller_id, digest_enabled=True, digest_hour=9)
+            set_onboarding_step(caller_id, "done")
+            await query.answer(text="\u2600\ufe0f Дайджест в 09:00")
+            await self._render_onboarding_done(cid, caller_id, user)
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+            return
+
+        # ── onb:digest:off → disable, step=done ──
+        if action == "digest:off":
+            upsert_user(caller_id, digest_enabled=False)
+            set_onboarding_step(caller_id, "done")
+            await query.answer(text="\u0001f6ab Дайджест выключен")
+            await self._render_onboarding_done(cid, caller_id, user)
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+            return
+
+        # ── onb:who — fallback from post-onboarding ──
+        if action == "who":
+            await query.answer()
+            await self._handle_who_locally(query.message)
+            return
+
+        # Unknown
+        await query.answer(text="Unknown onboarding action.")
+
+    async def _render_onboarding_done(
+        self, chat_id: int, user_id: str, user: dict
+    ) -> None:
+        """Show final onboarding screen."""
+        name = user.get("display_name", "друг")
+        text = (
+            f"\u2705 Готово, {name}!\n\n"
+            f"\u0001f4cb Теперь вы полностью настроены.\n"
+            f"Используйте меню для навигации."
+        )
+        keyboard = [
+            [
+                InlineKeyboardButton("\u0001f4cb Меню", callback_data="menu:home"),
+                InlineKeyboardButton("\u2139\ufe0f Кто я", callback_data="menu:who"),
+            ],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        try:
+            await self._bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=reply_markup,
+                **self._link_preview_kwargs(),
+            )
+        except Exception as e:
+            logger.warning("Failed to send onboarding done: %s", e)
+
+        # Show one-time tour
+        await self._send_tour(chat_id, user_id)
+
+    async def _handle_onboarding_text(self, msg, text: str) -> bool:
+        """Intercept text messages during onboarding (name, tz_custom steps).
+
+        Returns True if the message was handled (consumed), False to continue
+        to normal agent processing.
+        """
+        user_id = str(getattr(msg.from_user, "id", ""))
+        if not user_id:
+            return False
+
+        from gateway.secretary_user_store import get_user, set_onboarding_step, upsert_user
+
+        user = get_user(user_id)
+        if not user:
+            return False
+
+        step = user.get("onboarding_step")
+
+        # ── Step: name — user typed their name ──
+        if step == "name":
+            name = text.strip()[:100]
+            if not name or name.startswith("/"):
+                return False  # Let commands through
+            upsert_user(user_id, display_name=name)
+            set_onboarding_step(user_id, "tz")
+            try:
+                await self._bot.send_message(
+                    chat_id=int(msg.chat.id),
+                    text=f"\u2705 Буду звать вас {name}.",
+                    reply_to_message_id=msg.message_id,
+                    **self._link_preview_kwargs(),
+                )
+            except Exception:
+                pass
+            await self._render_onboarding_step(
+                int(msg.chat.id), user_id, "tz", reply_to_msg_id=None,
+            )
+            return True
+
+        # ── Step: tz_custom — user typed IANA timezone ──
+        if step == "tz_custom":
+            tz = text.strip()
+            if not tz or tz.startswith("/"):
+                return False
+            # Validate IANA timezone format
+            if "/" not in tz or " " in tz:
+                try:
+                    await self._bot.send_message(
+                        chat_id=int(msg.chat.id),
+                        text="\u26a0\ufe0f Не похоже на часовой пояс. Пример: Europe/London",
+                        reply_to_message_id=msg.message_id,
+                        **self._link_preview_kwargs(),
+                    )
+                except Exception:
+                    pass
+                return True  # Consumed — don't send to LLM
+
+            upsert_user(user_id, timezone=tz)
+            set_onboarding_step(user_id, "email_skip")
+            try:
+                await self._bot.send_message(
+                    chat_id=int(msg.chat.id),
+                    text=f"\u0001f310 Часовой пояс: {tz}",
+                    reply_to_message_id=msg.message_id,
+                    **self._link_preview_kwargs(),
+                )
+            except Exception:
+                pass
+            await self._render_onboarding_step(
+                int(msg.chat.id), user_id, "email_skip", reply_to_msg_id=None,
+            )
+            return True
+
+        return False
+
+    # ═══════════════════════════════════════════════════════════
+    # Main Menu (/menu)
+    # ═══════════════════════════════════════════════════════════
+
+    async def _handle_menu_command(self, msg) -> None:
+        """Handle /menu, /меню, or NL menu trigger."""
+        chat_id = str(msg.chat.id)
+        user_id = str(getattr(msg.from_user, "id", ""))
+        thread_id = str(getattr(msg, "message_thread_id", "") or "")
+
+        await self.send_main_menu(
+            int(chat_id), user_id,
+            thread_id=thread_id if thread_id else None,
+            reply_to_msg_id=msg.message_id,
+        )
+
+    async def send_main_menu(
+        self,
+        chat_id: int,
+        user_id: str,
+        thread_id: str | None = None,
+        reply_to_msg_id: int | None = None,
+    ) -> None:
+        """Send the main secretary menu InlineKeyboard."""
+        from gateway.secretary_user_store import get_user
+
+        user = get_user(user_id) or {}
+        name = user.get("display_name", "") or ""
+
+        greeting = f"\u0001f4cb Меню секретаря"
+        if name:
+            greeting += f" \u2014 {name}"
+
+        keyboard = [
+            [
+                InlineKeyboardButton("\u0001f4e7 Почта", callback_data="menu:mail"),
+                InlineKeyboardButton("\u2705 Задачи", callback_data="menu:tasks"),
+            ],
+            [
+                InlineKeyboardButton("\u0001f4c5 Календарь", callback_data="menu:cal"),
+                InlineKeyboardButton("\u0001f500 Режим", callback_data="menu:mode"),
+            ],
+            [
+                InlineKeyboardButton("\u0001f4c1 Проект", callback_data="menu:project"),
+                InlineKeyboardButton("\u0001f464 Секретарь", callback_data="menu:secretary"),
+            ],
+            [
+                InlineKeyboardButton("\u2699\ufe0f Настройки", callback_data="menu:settings"),
+                InlineKeyboardButton("\u2139\ufe0f Кто я", callback_data="menu:who"),
+            ],
+        ]
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        send_kwargs: dict = {
+            "chat_id": chat_id,
+            "text": greeting,
+            "reply_markup": reply_markup,
+            **self._link_preview_kwargs(),
+        }
+        if reply_to_msg_id is not None:
+            send_kwargs["reply_to_message_id"] = reply_to_msg_id
+        if thread_id:
+            send_kwargs.update(
+                self._thread_kwargs_for_send(
+                    str(chat_id), str(thread_id),
+                    {"thread_id": str(thread_id)},
+                    reply_to_mode=self._reply_to_mode,
+                )
+            )
+
+        try:
+            await self._bot.send_message(**send_kwargs)
+        except Exception as e:
+            logger.warning("Failed to send main menu: %s", e)
+
+    async def _handle_menu_callback(
+        self, query, data: str, chat_id, thread_id, user_name
+    ) -> None:
+        """Handle menu:* and set:* callbacks."""
+        caller_id = str(getattr(query.from_user, "id", ""))
+
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=chat_id,
+            chat_type=str(getattr(getattr(query.message, "chat", None), "type", "")),
+            thread_id=str(thread_id) if thread_id is not None else None,
+            user_name=user_name,
+        ):
+            await query.answer(text="\u26d4 Not authorized.")
+            return
+
+        cid = int(chat_id) if chat_id else 0
+
+        # ── menu:home — back to main menu ──
+        if data == "menu:home":
+            await query.answer()
+            await self.send_main_menu(cid, caller_id)
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+            return
+
+        # ── menu:mode — delegate to mode picker ──
+        if data == "menu:mode":
+            await query.answer()
+            await self._handle_mode_picker_locally(query.message)
+            return
+
+        # ── menu:project — delegate to project picker ──
+        if data == "menu:project":
+            await query.answer()
+            await self._handle_project_picker_locally(query.message)
+            return
+
+        # ── menu:secretary — delegate to secretary picker ──
+        if data == "menu:secretary":
+            await query.answer()
+            await self._handle_secretary_picker_locally(query.message)
+            return
+
+        # ── menu:who — delegate to /who ──
+        if data == "menu:who":
+            await query.answer()
+            await self._handle_who_locally(query.message)
+            return
+
+        # ── menu:mail — show mail submenu ──
+        if data == "menu:mail":
+            await query.answer()
+            await self._render_mail_menu(cid, caller_id)
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+            return
+
+        # ── menu:cal — show calendar submenu ──
+        if data == "menu:cal":
+            await query.answer()
+            await self._render_calendar_menu(cid, caller_id)
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+            return
+
+        # ── menu:tasks — show tasks ──
+        if data == "menu:tasks":
+            await query.answer()
+            await self._handle_tasks_show(cid, caller_id)
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+            return
+
+        # ── menu:settings — show settings submenu ──
+        if data == "menu:settings":
+            await query.answer()
+            await self._render_settings(cid, caller_id)
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+            return
+
+        # ── set:* callbacks ──
+        await self._handle_settings_callback(query, data, cid, caller_id)
+
+    async def _render_settings(self, chat_id: int, user_id: str) -> None:
+        """Render the settings submenu."""
+        from gateway.secretary_user_store import get_user
+
+        user = get_user(user_id) or {}
+        tz = user.get("timezone", "Europe/Moscow")
+        digest_on = bool(user.get("digest_enabled", 1))
+        digest_hour = user.get("digest_hour", 9)
+
+        digest_status = (
+            f"\u2600\ufe0f {digest_hour:02d}:00" if digest_on
+            else "\u0001f6ab Выключен"
+        )
+
+        text = (
+            f"\u2699\ufe0f Настройки\n\n"
+            f"\u0001f310 Часовой пояс: {tz}\n"
+            f"\u0001f4f0 Дайджест: {digest_status}\n"
+            f"\u0001f4e7 Почта: {_mail_status()}\n"
+            f"\u0001f517 Доверенные домены: {_trust_summary(user)}"
+        )
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "\u0001f1f7\u0001f1fa Москва",
+                    callback_data="set:tz:Europe/Moscow",
+                ),
+                InlineKeyboardButton(
+                    "\u0001f1fa\u0001f1e6 Киев",
+                    callback_data="set:tz:Europe/Kyiv",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "\u2600\ufe0f Дайджест ВКЛ" if not digest_on else "\u2600\ufe0f Дайджест (\u0432\u043a\u043b)",
+                    callback_data="set:digest:1",
+                ),
+                InlineKeyboardButton(
+                    "\u0001f6ab Дайджест ВЫКЛ" if digest_on else "\u0001f6ab Дайджест (\u0432\u044b\u043a\u043b)",
+                    callback_data="set:digest:0",
+                ),
+            ],
+            [
+                InlineKeyboardButton("\u0001f556 08:00", callback_data="set:hour:8"),
+                InlineKeyboardButton("\u0001f556 09:00", callback_data="set:hour:9"),
+                InlineKeyboardButton("\u0001f556 10:00", callback_data="set:hour:10"),
+            ],
+            [
+                InlineKeyboardButton("\u0001f6ab Сбросить доверенных", callback_data="set:trust_clear"),
+            ],
+            [
+                InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+            ],
+        ]
+
+        try:
+            await self._bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                **self._link_preview_kwargs(),
+            )
+        except Exception as e:
+            logger.warning("Failed to render settings: %s", e)
+
+    async def _handle_settings_callback(
+        self, query, data: str, chat_id: int, user_id: str
+    ) -> None:
+        """Handle set:* callbacks — update user prefs."""
+        from gateway.secretary_user_store import upsert_user
+
+        if data.startswith("set:tz:"):
+            tz = data[7:]  # strip "set:tz:"
+            upsert_user(user_id, timezone=tz)
+            await query.answer(text=f"\u0001f310 {tz}")
+            await self._render_settings(chat_id, user_id)
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+            return
+
+        if data in ("set:digest:1", "set:digest:0"):
+            on = data == "set:digest:1"
+            upsert_user(user_id, digest_enabled=on)
+            label = "\u2600\ufe0f ВКЛ" if on else "\u0001f6ab ВЫКЛ"
+            await query.answer(text=f"\u0001f4f0 Дайджест: {label}")
+            await self._render_settings(chat_id, user_id)
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+            return
+
+        if data.startswith("set:hour:"):
+            try:
+                hour = int(data[9:])
+                hour = max(0, min(23, hour))
+                upsert_user(user_id, digest_hour=hour)
+                await query.answer(text=f"\u0001f556 {hour:02d}:00")
+            except (ValueError, IndexError):
+                pass
+            await self._render_settings(chat_id, user_id)
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+            return
+
+        if data == "set:trust_clear":
+            from gateway.secretary_user_store import get_user as _gu2
+            u = _gu2(user_id) or {}
+            prefs = u.get("prefs", {}) or {}
+            prefs.pop("trusted_domains", None)
+            prefs.pop("trusted_emails", None)
+            upsert_user(user_id, prefs_json=prefs)
+            await query.answer(text="\u0001f6ab Доверенные сброшены")
+            await self._render_settings(chat_id, user_id)
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+            return
+
+        await query.answer(text="Unknown setting.")
+
+    # ═══════════════════════════════════════════════════════════
+    # Mail Inbox (menu:mail)
+    # ═══════════════════════════════════════════════════════════
+
+    async def _render_mail_menu(self, chat_id: int, user_id: str) -> None:
+        """Show mail submenu with list buttons."""
+        from tools.secretary.mail_inbox import is_configured
+
+        configured = is_configured()
+
+        if not configured:
+            text = (
+                "\u0001f4e7 Почта не настроена.\n\n"
+                "Добавьте в .env:\n"
+                "  SECRETARY_MAIL_BACKEND=imap\n"
+                "  SECRETARY_MAIL_IMAP_HOST=...\n"
+                "  SECRETARY_MAIL_EMAIL=...\n"
+                "  SECRETARY_MAIL_PASSWORD=..."
+            )
+            keyboard = [
+                [InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home")],
+            ]
+        else:
+            text = "\u0001f4e7 Почта"
+            keyboard = [
+                [
+                    InlineKeyboardButton("\u0001f319 За ночь (12ч)", callback_data="mail:list:12"),
+                    InlineKeyboardButton("\u0001f4c6 За 48ч", callback_data="mail:list:48"),
+                ],
+                [
+                    InlineKeyboardButton("\u0001f4ec Без ответа", callback_data="mail:followup"),
+                    InlineKeyboardButton("\u0001f504 Обновить", callback_data="mail:list:12"),
+                ],
+                [
+                    InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+                ],
+            ]
+
+        try:
+            await self._bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                **self._link_preview_kwargs(),
+            )
+        except Exception as e:
+            logger.warning("Failed to render mail menu: %s", e)
+
+    async def _handle_mail_callback(
+        self, query, data: str, chat_id, thread_id, user_name
+    ) -> None:
+        """Handle mail:list:N callbacks."""
+        caller_id = str(getattr(query.from_user, "id", ""))
+
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=chat_id,
+            chat_type=str(getattr(getattr(query.message, "chat", None), "type", "")),
+            thread_id=str(thread_id) if thread_id is not None else None,
+            user_name=user_name,
+        ):
+            await query.answer(text="\u26d4 Not authorized.")
+            return
+
+        cid = int(chat_id) if chat_id else 0
+
+        # Parse mail:list:N, mail:digest_now, mail:reply:<id>, mail:send:<id>, mail:reject:<id>
+        parts = data.split(":")
+        action = parts[1] if len(parts) >= 2 else ""
+
+        if action == "digest_now":
+            await query.answer(text="\u2600\ufe0f Готовлю дайджест...")
+            await self._handle_digest_command(query.message)
+            return
+
+        if action == "reply":
+            await self._handle_mail_reply(query, parts, cid, caller_id)
+            return
+
+        if action == "send":
+            await self._handle_mail_send(query, parts, cid, caller_id)
+            return
+
+        if action == "reject":
+            await self._handle_mail_reject(query, caller_id)
+            return
+
+        if action == "edit":
+            await self._handle_mail_edit(query, parts, cid, caller_id)
+            return
+
+        if action == "send_confirm":
+            await self._handle_mail_send_confirm(query, parts, cid, caller_id)
+            return
+
+        if action == "trust_domain":
+            await self._handle_mail_trust_domain(query, parts, cid, caller_id)
+            return
+
+        if action == "followup":
+            await self._handle_mail_followup(query, cid, caller_id)
+            return
+
+        if action != "list":
+            await query.answer(text="Unknown mail action.")
+            return
+
+        try:
+            hours = int(parts[2])
+        except (ValueError, IndexError):
+            hours = 12
+
+        await query.answer(text="\u0001f4ec Загружаю...")
+
+        emails: list = []
+        try:
+            from tools.secretary.mail_inbox import list_recent, format_mail_list
+            emails = list_recent(hours=hours, limit=10)
+            text = format_mail_list(emails, hours=hours)
+        except RuntimeError as e:
+            text = f"\u26a0\ufe0f {e}"
+        except Exception as e:
+            logger.warning("Mail list failed: %s", e)
+            text = f"\u26a0\ufe0f Ошибка при загрузке почты: {e}"
+
+        # Truncate for Telegram
+        if len(text) > 3500:
+            text = text[:3500] + "\n\n... (обрезано)"
+
+        # Build keyboard with reply buttons for first 5 emails
+        keyboard = []
+        for m in emails[:5] if isinstance(emails, list) else []:
+            mid = m.get("id", "")[:40]  # safe truncated id
+            sender = (m.get("from_name", "") or m.get("from_addr", ""))[:20]
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"\u2709\ufe0f {sender}",
+                    callback_data=f"mail:reply:{mid}",
+                ),
+            ])
+        keyboard.append([
+            InlineKeyboardButton("\u0001f504 Обновить", callback_data=f"mail:list:{hours}"),
+            InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+        ])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        try:
+            await query.edit_message_text(text=text, reply_markup=reply_markup)
+        except Exception:
+            try:
+                await self._bot.send_message(
+                    chat_id=cid, text=text, reply_markup=reply_markup,
+                    **self._link_preview_kwargs(),
+                )
+            except Exception as e2:
+                logger.warning("Failed to send mail list: %s", e2)
+
+    async def _handle_mail_reply(self, query, parts, chat_id: int, user_id: str) -> None:
+        """mail:reply:<id> — fetch body, generate draft, show with send/reject buttons."""
+        if len(parts) < 3:
+            await query.answer(text="Missing message id.")
+            return
+
+        mail_id = parts[2]
+        await query.answer(text="\u270d\ufe0f Готовлю черновик...")
+
+        try:
+            from tools.secretary.mail_inbox import fetch_body
+            body = fetch_body(mail_id)
+        except Exception as e:
+            text = f"\u26a0\ufe0f Не удалось загрузить письмо: {e}"
+            keyboard = [[InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home")]]
+            try:
+                await query.edit_message_text(
+                    text=text, reply_markup=InlineKeyboardMarkup(keyboard),
+                )
+            except Exception:
+                pass
+            return
+
+        # Generate draft
+        try:
+            from gateway.secretary_user_store import get_user
+            user = get_user(user_id) or {}
+            sender_name = user.get("display_name", "")
+        except Exception:
+            sender_name = ""
+
+        try:
+            from tools.secretary.mail_draft import generate_draft
+            draft = generate_draft(body, sender_name=sender_name)
+        except Exception:
+            draft = f"Re: {body.get('subject', '')}\n\n[Черновик недоступен]"
+
+        # Show draft
+        text = f"\u270d\ufe0f Черновик ответа:\n\n{draft}"
+        if len(text) > 3500:
+            text = text[:3500] + "\n\n... (обрезано)"
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("\u2705 Отправить", callback_data=f"mail:send:{mail_id}"),
+                InlineKeyboardButton("\u270f\ufe0f Править", callback_data=f"mail:edit:{mail_id}"),
+            ],
+            [
+                InlineKeyboardButton("\u274c Отклонить", callback_data=f"mail:reject:{mail_id}"),
+                InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+            ],
+        ])
+
+        try:
+            await query.edit_message_text(text=text, reply_markup=keyboard)
+        except Exception:
+            await self._bot.send_message(
+                chat_id=chat_id, text=text, reply_markup=keyboard,
+                **self._link_preview_kwargs(),
+            )
+
+    async def _handle_mail_send(self, query, parts, chat_id: int, user_id: str) -> None:
+        """mail:send:<id> — send the draft email."""
+        if len(parts) < 3:
+            await query.answer(text="Missing message id.")
+            return
+
+        mail_id = parts[2]
+        await query.answer(text="\u0001f4e8 Отправляю...")
+
+        try:
+            from tools.secretary.mail_inbox import fetch_body, send_mail
+            body = fetch_body(mail_id)
+            to_addr = body.get("from_addr", "")
+            original_subject = body.get("subject", "")
+            reply_subject = original_subject
+
+            # ── Trust gate ──
+            from gateway.secretary_user_store import get_user
+            user = get_user(user_id) or {}
+            prefs = user.get("prefs", {}) or {}
+            from tools.secretary.mail_draft import is_trusted
+
+            if to_addr and "@" in to_addr and not is_trusted(to_addr, prefs):
+                # Show confirm dialog
+                text = (
+                    f"\u0001f6a8 Новый адресат: {to_addr}\n\n"
+                    f"Отправить ответ?"
+                )
+                keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("\u2705 Да, отправить", callback_data=f"mail:send_confirm:{mail_id}"),
+                        InlineKeyboardButton("\u0001f517 Доверять домену", callback_data=f"mail:trust_domain:{mail_id}"),
+                    ],
+                    [
+                        InlineKeyboardButton("\u274c Нет", callback_data=f"mail:reject:{mail_id}"),
+                        InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+                    ],
+                ])
+                try:
+                    await query.edit_message_text(text=text, reply_markup=keyboard)
+                except Exception:
+                    await self._bot.send_message(
+                        chat_id=chat_id, text=text, reply_markup=keyboard,
+                        **self._link_preview_kwargs(),
+                    )
+                return
+
+            # Build reply — use custom draft if edited
+            from tools.secretary.mail_draft import generate_draft
+            from gateway.secretary_user_store import get_user
+            user = get_user(user_id) or {}
+            sender_name = user.get("display_name", "")
+            prefs = user.get("prefs", {}) or {}
+            custom_key = f"custom_draft_{mail_id}"
+            custom_draft = prefs.pop(custom_key, None)
+
+            if custom_draft:
+                full_draft = custom_draft
+                # Clean up stored draft
+                try:
+                    from gateway.secretary_user_store import upsert_user
+                    upsert_user(user_id, prefs_json=prefs)
+                except Exception:
+                    pass
+            else:
+                full_draft = generate_draft(body, sender_name=sender_name)
+            # Extract subject and body from draft
+            draft_lines = full_draft.split("\n")
+            reply_body = full_draft
+            if draft_lines and draft_lines[0].startswith("Тема: "):
+                reply_subject = draft_lines[0][6:]
+                reply_body = "\n".join(draft_lines[2:])
+
+            result = send_mail(to_addr, reply_subject, reply_body)
+        except Exception as e:
+            result = {"sent": False, "dry_run": False, "details": str(e)}
+            to_addr = "?"
+            reply_subject = "?"
+
+        if result.get("sent"):
+            details = result.get("details", "")
+            text = f"\u2705 {details}\n\n\u0001f4cb Отправлено. Кому: {to_addr}\nТема: {reply_subject}"
+        else:
+            text = f"\u274c Ошибка отправки: {result.get('details', '')}"
+
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+        ]])
+        try:
+            await query.edit_message_text(text=text, reply_markup=keyboard)
+        except Exception:
+            await self._bot.send_message(
+                chat_id=chat_id, text=text, reply_markup=keyboard,
+                **self._link_preview_kwargs(),
+            )
+
+    async def _handle_mail_reject(self, query, user_id: str) -> None:
+        """mail:reject:<id> — cancel the draft."""
+        await query.answer(text="\u274c Отменено")
+        text = "\u274c Отправка отменена."
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("\u0001f4e7 Почта", callback_data="menu:mail"),
+            InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+        ]])
+        try:
+            await query.edit_message_text(text=text, reply_markup=keyboard)
+        except Exception:
+            pass
+
+    async def _handle_mail_send_confirm(self, query, parts, chat_id: int, user_id: str) -> None:
+        """mail:send_confirm:<id> — confirmed send after trust gate."""
+        if len(parts) < 3:
+            await query.answer(text="Missing message id.")
+            return
+
+        # Reuse the send flow — trust already confirmed
+        await self._handle_mail_send(query, parts, chat_id, user_id)
+
+    async def _handle_mail_trust_domain(self, query, parts, chat_id: int, user_id: str) -> None:
+        """mail:trust_domain:<id> — add domain to trusted + send."""
+        if len(parts) < 3:
+            await query.answer(text="Missing message id.")
+            return
+
+        mail_id = parts[2]
+        await query.answer(text="\u0001f517 Добавляю домен...")
+
+        try:
+            from tools.secretary.mail_inbox import fetch_body
+            body = fetch_body(mail_id)
+            to_addr = body.get("from_addr", "")
+        except Exception:
+            to_addr = ""
+
+        if to_addr and "@" in to_addr:
+            try:
+                from gateway.secretary_user_store import get_user, upsert_user
+                from tools.secretary.mail_draft import trust_domain
+                user = get_user(user_id) or {}
+                prefs = user.get("prefs", {}) or {}
+                prefs = trust_domain(to_addr, prefs)
+                upsert_user(user_id, prefs_json=prefs)
+                domain = to_addr.split("@")[-1].lower()
+                logger.info("Trust domain added: %s for user %s", domain, user_id)
+            except Exception:
+                pass
+
+        # Now send
+        await self._handle_mail_send(query, parts, chat_id, user_id)
+
+    async def _handle_mail_edit(self, query, parts, chat_id: int, user_id: str) -> None:
+        """mail:edit:<id> — enter edit mode for the draft."""
+        if len(parts) < 3:
+            await query.answer(text="Missing message id.")
+            return
+
+        mail_id = parts[2]
+        await query.answer(text="\u270f\ufe0f Жду новый текст...")
+
+        # Store pending edit in prefs
+        try:
+            from gateway.secretary_user_store import upsert_user, get_user
+            user = get_user(user_id) or {}
+            prefs = user.get("prefs", {}) or {}
+            prefs["pending_edit_mail_id"] = mail_id
+            upsert_user(user_id, prefs_json=prefs)
+        except Exception:
+            pass
+
+        text = "\u270f\ufe0f Напишите новый текст ответа.\nДля отмены — /menu или «отмена»."
+        try:
+            await query.edit_message_text(
+                text=text,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+                ]]),
+            )
+        except Exception:
+            pass
+
+    async def _handle_mail_followup(self, query, chat_id: int, user_id: str) -> None:
+        """mail:followup — list emails awaiting reply."""
+        await query.answer(text="\u0001f4ec Ищу письма без ответа...")
+
+        try:
+            from gateway.secretary_user_store import get_user
+            user = get_user(user_id) or {}
+            prefs = user.get("prefs", {}) or {}
+            days = int(prefs.get("followup_days", 3))
+        except Exception:
+            days = 3
+
+        try:
+            from tools.secretary.mail_inbox import list_awaiting_reply
+            emails = list_awaiting_reply(days=days, limit=10)
+        except RuntimeError as e:
+            text = f"\u26a0\ufe0f {e}"
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+            ]])
+            try:
+                await query.edit_message_text(text=text, reply_markup=keyboard)
+            except Exception:
+                pass
+            return
+        except Exception as e:
+            logger.warning("Follow-up failed: %s", e)
+            text = f"\u26a0\ufe0f Ошибка: {e}"
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+            ]])
+            try:
+                await query.edit_message_text(text=text, reply_markup=keyboard)
+            except Exception:
+                pass
+            return
+
+        if not emails:
+            text = f"\u2705 Нет писем без ответа за {days} дн."
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("\u0001f4e7 Почта", callback_data="menu:mail"),
+                InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+            ]])
+        else:
+            lines = [f"\u0001f4ec Без ответа >{days} дн ({len(emails)}):", ""]
+            for i, m in enumerate(emails[:8], 1):
+                sender = m.get("from_name", "") or m.get("from_addr", "")
+                subject = m.get("subject", "")
+                if len(subject) > 50:
+                    subject = subject[:47] + "..."
+                lines.append(f"{i}. {sender}")
+                lines.append(f"   {subject}")
+            text = "\n".join(lines)
+
+            # Reply buttons
+            kb_rows = []
+            for m in emails[:5]:
+                mid = m.get("id", "")[:40]
+                sender = (m.get("from_name", "") or m.get("from_addr", ""))[:20]
+                kb_rows.append([
+                    InlineKeyboardButton(
+                        f"\u2709\ufe0f {sender}",
+                        callback_data=f"mail:reply:{mid}",
+                    ),
+                ])
+            kb_rows.append([
+                InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+            ])
+            keyboard = InlineKeyboardMarkup(kb_rows)
+
+        try:
+            await query.edit_message_text(text=text, reply_markup=keyboard)
+        except Exception:
+            await self._bot.send_message(
+                chat_id=chat_id, text=text, reply_markup=keyboard,
+                **self._link_preview_kwargs(),
+            )
+
+    # ═══════════════════════════════════════════════════════════
+    # Morning Digest (/digest)
+    # ═══════════════════════════════════════════════════════════
+
+    async def _handle_digest_command(self, msg) -> None:
+        """Handle /digest or mail:digest_now — force-send digest to this user."""
+        chat_id = str(msg.chat.id)
+        user_id = str(getattr(msg.from_user, "id", ""))
+
+        try:
+            from gateway.secretary_digest import build_digest_text
+            text = build_digest_text(user_id)
+        except Exception as e:
+            logger.warning("Digest build failed: %s", e)
+            text = f"\u26a0\ufe0f Ошибка при сборке дайджеста: {e}"
+
+        if not text:
+            text = "\u2600\ufe0f Дайджест не требуется (уже отправлен сегодня, или отключён, или не настроен)."
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("\u0001f4e7 Почта", callback_data="menu:mail"),
+                InlineKeyboardButton("\u0001f4cb Меню", callback_data="menu:home"),
+            ],
+        ])
+
+        try:
+            await self._bot.send_message(
+                chat_id=int(chat_id),
+                text=text,
+                reply_markup=keyboard,
+                reply_to_message_id=msg.message_id,
+                **self._link_preview_kwargs(),
+            )
+            # Mark as sent (force-send overrides daily check)
+            try:
+                from gateway.secretary_user_store import mark_digest_sent
+                mark_digest_sent(user_id)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning("Failed to send digest: %s", e)
+
+    # ═══════════════════════════════════════════════════════════
+    # Calendar (menu:cal)
+    # ═══════════════════════════════════════════════════════════
+
+    async def _render_calendar_menu(self, chat_id: int, user_id: str) -> None:
+        """Show calendar submenu."""
+        from tools.secretary.calendar import is_configured
+
+        if not is_configured():
+            text = (
+                "\u0001f4c5 Календарь не настроен.\n\n"
+                "Добавьте в .env:\n"
+                "  SECRETARY_CAL_ICS_URL=https://..."
+            )
+            keyboard = [[InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home")]]
+        else:
+            text = "\u0001f4c5 Календарь"
+            keyboard = [
+                [
+                    InlineKeyboardButton("\u0001f4c6 Сегодня", callback_data="cal:day:0"),
+                    InlineKeyboardButton("\u0001f4c6 Завтра", callback_data="cal:day:1"),
+                ],
+                [
+                    InlineKeyboardButton("\u0001f4c5 7 дней", callback_data="cal:week"),
+                    InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+                ],
+            ]
+
+        try:
+            await self._bot.send_message(
+                chat_id=chat_id, text=text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                **self._link_preview_kwargs(),
+            )
+        except Exception as e:
+            logger.warning("Failed to render calendar menu: %s", e)
+
+    async def _handle_calendar_callback(
+        self, query, data: str, chat_id, thread_id, user_name
+    ) -> None:
+        """Handle cal:day:N and cal:week."""
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=chat_id,
+            chat_type=str(getattr(getattr(query.message, "chat", None), "type", "")),
+            thread_id=str(thread_id) if thread_id is not None else None,
+            user_name=user_name,
+        ):
+            await query.answer(text="\u26d4 Not authorized.")
+            return
+
+        cid = int(chat_id) if chat_id else 0
+        parts = data.split(":")
+        action = parts[1] if len(parts) >= 2 else ""
+
+        if action == "week":
+            days = 7
+        elif action == "day":
+            try:
+                days = int(parts[2]) + 1  # day:0 = today (1 day window)
+            except (ValueError, IndexError):
+                days = 1
+        else:
+            await query.answer(text="Unknown calendar action.")
+            return
+
+        await query.answer(text="\u0001f4c5 Загружаю...")
+
+        try:
+            from tools.secretary.calendar import list_events, format_calendar_list
+            events = list_events(days_ahead=days)
+            text = format_calendar_list(events)
+        except RuntimeError as e:
+            text = f"\u26a0\ufe0f {e}"
+        except Exception as e:
+            logger.warning("Calendar list failed: %s", e)
+            text = f"\u26a0\ufe0f Ошибка: {e}"
+
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+        ]])
+        try:
+            await query.edit_message_text(text=text, reply_markup=keyboard)
+        except Exception:
+            await self._bot.send_message(
+                chat_id=cid, text=text, reply_markup=keyboard,
+                **self._link_preview_kwargs(),
+            )
+
+    # ═══════════════════════════════════════════════════════════
+    # Health Check (/secretary_health)
+    # ═══════════════════════════════════════════════════════════
+
+    async def _handle_health_command(self, msg) -> None:
+        """Handle /secretary_health — show live readiness status."""
+        chat_id = str(msg.chat.id)
+        user_id = str(getattr(msg.from_user, "id", ""))
+
+        lines = ["\u0001f3e5 Hermes Secretary Health", ""]
+
+        try:
+            from tools.secretary.mail_inbox import is_configured as mail_ok, _is_dry_run
+            mc = mail_ok()
+            dr = _is_dry_run()
+        except Exception:
+            mc = False; dr = True
+        mail_icon = "\u2705" if mc else "\u274c"
+        dry_label = "DRY_RUN" if dr else "LIVE"
+        lines.append(f"\u0001f4e7 Почта: {mail_icon} ({dry_label})")
+
+        try:
+            from tools.secretary.calendar import is_configured as cal_ok
+            cc = cal_ok()
+        except Exception:
+            cc = False
+        cal_icon = "\u2705" if cc else "\u274c"
+        lines.append(f"\u0001f4c5 Календарь: {cal_icon}")
+
+        try:
+            from gateway.secretary_router import get_active
+            sec = get_active(user_id)
+        except Exception:
+            sec = "?"
+        lines.append(f"\u0001f464 Профиль: {sec}")
+
+        try:
+            from gateway.secretary_user_store import is_onboarded
+            ob = is_onboarded(user_id)
+        except Exception:
+            ob = False
+        ob_icon = "\u2705 done" if ob else "\u274c нет"
+        lines.append(f"\u0001f3d7\ufe0f Онбординг: {ob_icon}")
+
+        try:
+            await self._bot.send_message(
+                chat_id=int(chat_id), text="\n".join(lines),
+                reply_to_message_id=msg.message_id,
+                **self._link_preview_kwargs(),
+            )
+        except Exception as e:
+            logger.warning("Health check failed: %s", e)
+
+    # ═══════════════════════════════════════════════════════════
+    # Pending Mail Edit Intercept
+    # ═══════════════════════════════════════════════════════════
+
+    async def _handle_pending_mail_edit(self, msg, text: str) -> bool:
+        """Intercept text when user has pending_edit_mail_id in prefs.
+
+        Returns True if consumed, False to continue normal processing.
+        """
+        user_id = str(getattr(msg.from_user, "id", ""))
+        if not user_id:
+            return False
+
+        # Check for cancel
+        if text.strip().lower() in ("отмена", "cancel", "/menu"):
+            try:
+                from gateway.secretary_user_store import upsert_user, get_user
+                user = get_user(user_id) or {}
+                prefs = user.get("prefs", {}) or {}
+                prefs.pop("pending_edit_mail_id", None)
+                upsert_user(user_id, prefs_json=prefs)
+            except Exception:
+                pass
+            await self._bot.send_message(
+                chat_id=int(msg.chat.id),
+                text="\u274c Редактирование отменено.",
+                reply_to_message_id=msg.message_id,
+                **self._link_preview_kwargs(),
+            )
+            return True
+
+        try:
+            from gateway.secretary_user_store import get_user, upsert_user
+            user = get_user(user_id) or {}
+            prefs = user.get("prefs", {}) or {}
+            mail_id = prefs.get("pending_edit_mail_id")
+            if not mail_id:
+                return False
+        except Exception:
+            return False
+
+        # Build draft from user's text
+        draft = text.strip()
+        if not draft or draft.startswith("/"):
+            return False
+
+        # Clear pending state, store draft for send
+        draft_key = f"custom_draft_{mail_id}"
+        try:
+            prefs.pop("pending_edit_mail_id", None)
+            prefs[draft_key] = draft
+            upsert_user(user_id, prefs_json=prefs)
+        except Exception:
+            pass
+
+        await self._bot.send_message(
+            chat_id=int(msg.chat.id),
+            text="\u270f\ufe0f Новый текст:",
+            reply_to_message_id=msg.message_id,
+        )
+
+        # Show with send/reject buttons
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("\u2705 Отправить", callback_data=f"mail:send:{mail_id}"),
+                InlineKeyboardButton("\u270f\ufe0f Править", callback_data=f"mail:edit:{mail_id}"),
+            ],
+            [
+                InlineKeyboardButton("\u274c Отклонить", callback_data=f"mail:reject:{mail_id}"),
+                InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+            ],
+        ])
+
+        try:
+            await self._bot.send_message(
+                chat_id=int(msg.chat.id),
+                text=f"\u270d\ufe0f Ваш ответ:\n\n{draft}",
+                reply_markup=keyboard,
+                **self._link_preview_kwargs(),
+            )
+        except Exception as e:
+            logger.warning("Failed to show edited draft: %s", e)
+
+        return True
+
+    # ═══════════════════════════════════════════════════════════
+    # Help & Tour
+    # ═══════════════════════════════════════════════════════════
+
+    async def _handle_help_command(self, msg) -> None:
+        text = (
+            "\u0001f4cb Hermes Secretary\n\n"
+            "\u0001f4e7 Почта — чтение, ответы, дайджест\n"
+            "\u0001f4c5 Календарь — события на сегодня/неделю\n"
+            "\u0001f500 Режимы — разработка / секретарь\n"
+            "\u0001f4c1 Проекты — переключение контекста\n"
+            "\u0001f464 Профили — изоляция предприятий\n\n"
+            "/меню /who /secretary_health /help"
+        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("\u0001f4cb Меню", callback_data="menu:home"),
+        ]])
+        try:
+            await self._bot.send_message(
+                chat_id=int(msg.chat.id), text=text, reply_markup=keyboard,
+                reply_to_message_id=msg.message_id,
+                **self._link_preview_kwargs(),
+            )
+        except Exception as e:
+            logger.warning("Help failed: %s", e)
+
+    async def _send_tour(self, chat_id: int, user_id: str) -> None:
+        try:
+            from gateway.secretary_user_store import get_user, upsert_user
+            u = get_user(user_id) or {}
+            prefs = u.get("prefs", {}) or {}
+            if prefs.get("tour_seen"):
+                return
+            prefs["tour_seen"] = True
+            upsert_user(user_id, prefs_json=prefs)
+        except Exception:
+            return
+        text = (
+            "\u0001f4cb Я умею: почта, дайджест, календарь, режимы, проекты.\n"
+            "/меню — главное меню | /help — подсказка"
+        )
+        try:
+            await self._bot.send_message(chat_id=chat_id, text=text, **self._link_preview_kwargs())
+        except Exception as e:
+            logger.warning("Tour failed: %s", e)
+
+    # ═══════════════════════════════════════════════════════════
+    # Tasks (menu:tasks)
+    # ═══════════════════════════════════════════════════════════
+
+    async def _handle_tasks_show(self, chat_id: int, user_id: str) -> None:
+        """Show task list with add/done buttons."""
+        try:
+            from tools.secretary.tasks import list_tasks
+            tasks = list_tasks(user_id, limit=10)
+        except Exception:
+            tasks = []
+
+        if not tasks:
+            text = "\u2705 Нет открытых задач."
+        else:
+            lines = [f"\u0001f4cb Задачи ({len(tasks)}):", ""]
+            for t in tasks:
+                lines.append(f"  \u25cb {t['text']}")
+            text = "\n".join(lines)
+
+        keyboard = [
+            [InlineKeyboardButton("\u2795 Добавить", callback_data="task:add")],
+        ]
+        if tasks:
+            for t in tasks[:5]:
+                txt = t["text"][:30]
+                keyboard.append([
+                    InlineKeyboardButton(f"\u2705 {txt}", callback_data=f"task:done:{t['id']}"),
+                ])
+        keyboard.append([
+            InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+        ])
+
+        try:
+            await self._bot.send_message(
+                chat_id=chat_id, text=text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                **self._link_preview_kwargs(),
+            )
+        except Exception as e:
+            logger.warning("Tasks show failed: %s", e)
+
+    async def _handle_task_callback(
+        self, query, data: str, chat_id, thread_id, user_name
+    ) -> None:
+        """Handle task:add and task:done:<id>."""
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=chat_id,
+            chat_type=str(getattr(getattr(query.message, "chat", None), "type", "")),
+            thread_id=str(thread_id) if thread_id is not None else None,
+            user_name=user_name,
+        ):
+            await query.answer(text="\u26d4 Not authorized.")
+            return
+
+        cid = int(chat_id) if chat_id else 0
+        parts = data.split(":")
+        action = parts[1] if len(parts) >= 2 else ""
+
+        if action == "add":
+            await query.answer(text="\u270f\ufe0f Напишите задачу текстом")
+            try:
+                from gateway.secretary_user_store import upsert_user, get_user
+                u = get_user(caller_id) or {}
+                prefs = u.get("prefs", {}) or {}
+                prefs["pending_task_add"] = True
+                upsert_user(caller_id, prefs_json=prefs)
+            except Exception:
+                pass
+            try:
+                await query.edit_message_text(
+                    text="\u270f\ufe0f Напишите текст задачи.\nДля отмены — «отмена» или /menu.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+                    ]]),
+                )
+            except Exception:
+                pass
+            return
+
+        if action == "done":
+            try:
+                tid = int(parts[2])
+                from tools.secretary.tasks import mark_done
+                if mark_done(caller_id, tid):
+                    await query.answer(text="\u2705 Готово")
+                else:
+                    await query.answer(text="\u274c Не найдена")
+            except (ValueError, IndexError, Exception):
+                await query.answer(text="\u274c Ошибка")
+            await self._handle_tasks_show(cid, caller_id)
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+            return
+
+        await query.answer(text="Unknown task action.")
+
+    async def _handle_pending_task_add(self, msg, text: str) -> bool:
+        """Intercept text when pending_task_add flag is set."""
+        user_id = str(getattr(msg.from_user, "id", ""))
+        if not user_id:
+            return False
+        if text.strip().lower() in ("отмена", "cancel", "/menu"):
+            try:
+                from gateway.secretary_user_store import upsert_user, get_user
+                u = get_user(user_id) or {}
+                prefs = u.get("prefs", {}) or {}
+                prefs.pop("pending_task_add", None)
+                upsert_user(user_id, prefs_json=prefs)
+            except Exception:
+                pass
+            await self._bot.send_message(
+                chat_id=int(msg.chat.id), text="\u274c Отменено.",
+                reply_to_message_id=msg.message_id, **self._link_preview_kwargs(),
+            )
+            return True
+        try:
+            from gateway.secretary_user_store import get_user, upsert_user
+            u = get_user(user_id) or {}
+            prefs = u.get("prefs", {}) or {}
+            if not prefs.get("pending_task_add"):
+                return False
+            prefs.pop("pending_task_add", None)
+            upsert_user(user_id, prefs_json=prefs)
+        except Exception:
+            return False
+        task_text = text.strip()
+        if not task_text or task_text.startswith("/"):
+            return False
+        try:
+            from tools.secretary.tasks import add_task
+            add_task(user_id, task_text)
+            await self._bot.send_message(
+                chat_id=int(msg.chat.id), text=f"\u2705 Добавлено: {task_text}",
+                reply_to_message_id=msg.message_id, **self._link_preview_kwargs(),
+            )
+        except Exception as e:
+            await self._bot.send_message(
+                chat_id=int(msg.chat.id), text=f"\u274c Ошибка: {e}",
+                reply_to_message_id=msg.message_id, **self._link_preview_kwargs(),
+            )
+        return True
