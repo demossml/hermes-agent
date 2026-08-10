@@ -448,6 +448,17 @@ def _trust_summary(user: dict) -> str:
     return f"{total} ({', '.join(domains[:2])}{'...' if len(domains) > 2 else ''})"
 
 
+def _mail_status() -> str:
+    """Return mail config status for settings display."""
+    try:
+        from tools.secretary.mail_inbox import is_configured, _is_dry_run
+        if is_configured():
+            return "\u2705 настроена" + (" (DRY_RUN)" if _is_dry_run() else "")
+        return "\u274c не настроена"
+    except Exception:
+        return "?"
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """
     Telegram bot adapter.
@@ -6191,6 +6202,11 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._handle_health_command(msg)
             return
 
+        # ── /help / /помощь ──
+        if text in ("/help", "/помощь"):
+            await self._handle_help_command(msg)
+            return
+
         if not self._should_process_message(msg, is_command=True):
             return
         await self._ensure_forum_commands(msg)
@@ -7883,6 +7899,9 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("Failed to send onboarding done: %s", e)
 
+        # Show one-time tour
+        await self._send_tour(chat_id, user_id)
+
     async def _handle_onboarding_text(self, msg, text: str) -> bool:
         """Intercept text messages during onboarding (name, tz_custom steps).
 
@@ -8147,6 +8166,7 @@ class TelegramAdapter(BasePlatformAdapter):
             f"\u2699\ufe0f Настройки\n\n"
             f"\u0001f310 Часовой пояс: {tz}\n"
             f"\u0001f4f0 Дайджест: {digest_status}\n"
+            f"\u0001f4e7 Почта: {_mail_status()}\n"
             f"\u0001f517 Доверенные домены: {_trust_summary(user)}"
         )
 
@@ -9001,3 +9021,49 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("Failed to show edited draft: %s", e)
 
         return True
+
+    # ═══════════════════════════════════════════════════════════
+    # Help & Tour
+    # ═══════════════════════════════════════════════════════════
+
+    async def _handle_help_command(self, msg) -> None:
+        text = (
+            "\u0001f4cb Hermes Secretary\n\n"
+            "\u0001f4e7 Почта — чтение, ответы, дайджест\n"
+            "\u0001f4c5 Календарь — события на сегодня/неделю\n"
+            "\u0001f500 Режимы — разработка / секретарь\n"
+            "\u0001f4c1 Проекты — переключение контекста\n"
+            "\u0001f464 Профили — изоляция предприятий\n\n"
+            "/меню /who /secretary_health /help"
+        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("\u0001f4cb Меню", callback_data="menu:home"),
+        ]])
+        try:
+            await self._bot.send_message(
+                chat_id=int(msg.chat.id), text=text, reply_markup=keyboard,
+                reply_to_message_id=msg.message_id,
+                **self._link_preview_kwargs(),
+            )
+        except Exception as e:
+            logger.warning("Help failed: %s", e)
+
+    async def _send_tour(self, chat_id: int, user_id: str) -> None:
+        try:
+            from gateway.secretary_user_store import get_user, upsert_user
+            u = get_user(user_id) or {}
+            prefs = u.get("prefs", {}) or {}
+            if prefs.get("tour_seen"):
+                return
+            prefs["tour_seen"] = True
+            upsert_user(user_id, prefs_json=prefs)
+        except Exception:
+            return
+        text = (
+            "\u0001f4cb Я умею: почта, дайджест, календарь, режимы, проекты.\n"
+            "/меню — главное меню | /help — подсказка"
+        )
+        try:
+            await self._bot.send_message(chat_id=chat_id, text=text, **self._link_preview_kwargs())
+        except Exception as e:
+            logger.warning("Tour failed: %s", e)
