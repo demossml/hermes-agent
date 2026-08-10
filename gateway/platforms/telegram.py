@@ -4136,6 +4136,11 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._handle_proj_callback(query, data, query_chat_id, query_thread_id, query_user_name)
             return
 
+        # --- Task callbacks (task:add | task:done:<id>) ---
+        if data.startswith("task:"):
+            await self._handle_task_callback(query, data, query_chat_id, query_thread_id, query_user_name)
+            return
+
         # --- Onboarding callbacks (onb:go | onb:later | onb:name_ok | onb:tz:* | onb:email_skip | onb:digest:*) ---
         if data.startswith("onb:"):
             await self._handle_onboarding_callback(query, data, query_chat_id, query_thread_id, query_user_name)
@@ -6138,6 +6143,10 @@ class TelegramAdapter(BasePlatformAdapter):
         if text and await self._handle_pending_mail_edit(msg, text):
             return
 
+        # ── Pending task add intercept ──
+        if text and await self._handle_pending_task_add(msg, text):
+            return
+
         # ── NL menu triggers — handle locally, no LLM ──
         if text and _is_menu_trigger(text):
             await self._handle_menu_command(msg)
@@ -8124,13 +8133,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 pass
             return
 
-        # ── menu:tasks — coming soon stub ──
+        # ── menu:tasks — show tasks ──
         if data == "menu:tasks":
-            await query.answer(text="\u23f3 Задачи — скоро")
-            stub_text = "\u23f3 Задачи — появится в Фазе 3.\n\nПока доступны: меню, режим, проект, секретарь, /who."
-            keyboard = [[InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home")]]
+            await query.answer()
+            await self._handle_tasks_show(cid, caller_id)
             try:
-                await query.edit_message_text(text=stub_text, reply_markup=InlineKeyboardMarkup(keyboard))
+                await query.delete_message()
             except Exception:
                 pass
             return
@@ -9067,3 +9075,150 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._bot.send_message(chat_id=chat_id, text=text, **self._link_preview_kwargs())
         except Exception as e:
             logger.warning("Tour failed: %s", e)
+
+    # ═══════════════════════════════════════════════════════════
+    # Tasks (menu:tasks)
+    # ═══════════════════════════════════════════════════════════
+
+    async def _handle_tasks_show(self, chat_id: int, user_id: str) -> None:
+        """Show task list with add/done buttons."""
+        try:
+            from tools.secretary.tasks import list_tasks
+            tasks = list_tasks(user_id, limit=10)
+        except Exception:
+            tasks = []
+
+        if not tasks:
+            text = "\u2705 Нет открытых задач."
+        else:
+            lines = [f"\u0001f4cb Задачи ({len(tasks)}):", ""]
+            for t in tasks:
+                lines.append(f"  \u25cb {t['text']}")
+            text = "\n".join(lines)
+
+        keyboard = [
+            [InlineKeyboardButton("\u2795 Добавить", callback_data="task:add")],
+        ]
+        if tasks:
+            for t in tasks[:5]:
+                txt = t["text"][:30]
+                keyboard.append([
+                    InlineKeyboardButton(f"\u2705 {txt}", callback_data=f"task:done:{t['id']}"),
+                ])
+        keyboard.append([
+            InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+        ])
+
+        try:
+            await self._bot.send_message(
+                chat_id=chat_id, text=text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                **self._link_preview_kwargs(),
+            )
+        except Exception as e:
+            logger.warning("Tasks show failed: %s", e)
+
+    async def _handle_task_callback(
+        self, query, data: str, chat_id, thread_id, user_name
+    ) -> None:
+        """Handle task:add and task:done:<id>."""
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=chat_id,
+            chat_type=str(getattr(getattr(query.message, "chat", None), "type", "")),
+            thread_id=str(thread_id) if thread_id is not None else None,
+            user_name=user_name,
+        ):
+            await query.answer(text="\u26d4 Not authorized.")
+            return
+
+        cid = int(chat_id) if chat_id else 0
+        parts = data.split(":")
+        action = parts[1] if len(parts) >= 2 else ""
+
+        if action == "add":
+            await query.answer(text="\u270f\ufe0f Напишите задачу текстом")
+            try:
+                from gateway.secretary_user_store import upsert_user, get_user
+                u = get_user(caller_id) or {}
+                prefs = u.get("prefs", {}) or {}
+                prefs["pending_task_add"] = True
+                upsert_user(caller_id, prefs_json=prefs)
+            except Exception:
+                pass
+            try:
+                await query.edit_message_text(
+                    text="\u270f\ufe0f Напишите текст задачи.\nДля отмены — «отмена» или /menu.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+                    ]]),
+                )
+            except Exception:
+                pass
+            return
+
+        if action == "done":
+            try:
+                tid = int(parts[2])
+                from tools.secretary.tasks import mark_done
+                if mark_done(caller_id, tid):
+                    await query.answer(text="\u2705 Готово")
+                else:
+                    await query.answer(text="\u274c Не найдена")
+            except (ValueError, IndexError, Exception):
+                await query.answer(text="\u274c Ошибка")
+            await self._handle_tasks_show(cid, caller_id)
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+            return
+
+        await query.answer(text="Unknown task action.")
+
+    async def _handle_pending_task_add(self, msg, text: str) -> bool:
+        """Intercept text when pending_task_add flag is set."""
+        user_id = str(getattr(msg.from_user, "id", ""))
+        if not user_id:
+            return False
+        if text.strip().lower() in ("отмена", "cancel", "/menu"):
+            try:
+                from gateway.secretary_user_store import upsert_user, get_user
+                u = get_user(user_id) or {}
+                prefs = u.get("prefs", {}) or {}
+                prefs.pop("pending_task_add", None)
+                upsert_user(user_id, prefs_json=prefs)
+            except Exception:
+                pass
+            await self._bot.send_message(
+                chat_id=int(msg.chat.id), text="\u274c Отменено.",
+                reply_to_message_id=msg.message_id, **self._link_preview_kwargs(),
+            )
+            return True
+        try:
+            from gateway.secretary_user_store import get_user, upsert_user
+            u = get_user(user_id) or {}
+            prefs = u.get("prefs", {}) or {}
+            if not prefs.get("pending_task_add"):
+                return False
+            prefs.pop("pending_task_add", None)
+            upsert_user(user_id, prefs_json=prefs)
+        except Exception:
+            return False
+        task_text = text.strip()
+        if not task_text or task_text.startswith("/"):
+            return False
+        try:
+            from tools.secretary.tasks import add_task
+            add_task(user_id, task_text)
+            await self._bot.send_message(
+                chat_id=int(msg.chat.id), text=f"\u2705 Добавлено: {task_text}",
+                reply_to_message_id=msg.message_id, **self._link_preview_kwargs(),
+            )
+        except Exception as e:
+            await self._bot.send_message(
+                chat_id=int(msg.chat.id), text=f"\u274c Ошибка: {e}",
+                reply_to_message_id=msg.message_id, **self._link_preview_kwargs(),
+            )
+        return True
