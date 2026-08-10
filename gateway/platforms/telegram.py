@@ -6112,6 +6112,10 @@ class TelegramAdapter(BasePlatformAdapter):
         if text and await self._handle_onboarding_text(msg, text):
             return
 
+        # ── Pending mail edit intercept ──
+        if text and await self._handle_pending_mail_edit(msg, text):
+            return
+
         # ── NL menu triggers — handle locally, no LLM ──
         if text and _is_menu_trigger(text):
             await self._handle_menu_command(msg)
@@ -8308,6 +8312,10 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._handle_mail_reject(query, caller_id)
             return
 
+        if action == "edit":
+            await self._handle_mail_edit(query, parts, cid, caller_id)
+            return
+
         if action == "followup":
             await self._handle_mail_followup(query, cid, caller_id)
             return
@@ -8411,9 +8419,10 @@ class TelegramAdapter(BasePlatformAdapter):
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("\u2705 Отправить", callback_data=f"mail:send:{mail_id}"),
-                InlineKeyboardButton("\u274c Отклонить", callback_data=f"mail:reject:{mail_id}"),
+                InlineKeyboardButton("\u270f\ufe0f Править", callback_data=f"mail:edit:{mail_id}"),
             ],
             [
+                InlineKeyboardButton("\u274c Отклонить", callback_data=f"mail:reject:{mail_id}"),
                 InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
             ],
         ])
@@ -8442,13 +8451,25 @@ class TelegramAdapter(BasePlatformAdapter):
             original_subject = body.get("subject", "")
             reply_subject = original_subject
 
-            # Build reply
+            # Build reply — use custom draft if edited
             from tools.secretary.mail_draft import generate_draft
             from gateway.secretary_user_store import get_user
             user = get_user(user_id) or {}
             sender_name = user.get("display_name", "")
+            prefs = user.get("prefs", {}) or {}
+            custom_key = f"custom_draft_{mail_id}"
+            custom_draft = prefs.pop(custom_key, None)
 
-            full_draft = generate_draft(body, sender_name=sender_name)
+            if custom_draft:
+                full_draft = custom_draft
+                # Clean up stored draft
+                try:
+                    from gateway.secretary_user_store import upsert_user
+                    upsert_user(user_id, prefs_json=prefs)
+                except Exception:
+                    pass
+            else:
+                full_draft = generate_draft(body, sender_name=sender_name)
             # Extract subject and body from draft
             draft_lines = full_draft.split("\n")
             reply_body = full_draft
@@ -8489,6 +8510,36 @@ class TelegramAdapter(BasePlatformAdapter):
         ]])
         try:
             await query.edit_message_text(text=text, reply_markup=keyboard)
+        except Exception:
+            pass
+
+    async def _handle_mail_edit(self, query, parts, chat_id: int, user_id: str) -> None:
+        """mail:edit:<id> — enter edit mode for the draft."""
+        if len(parts) < 3:
+            await query.answer(text="Missing message id.")
+            return
+
+        mail_id = parts[2]
+        await query.answer(text="\u270f\ufe0f Жду новый текст...")
+
+        # Store pending edit in prefs
+        try:
+            from gateway.secretary_user_store import upsert_user, get_user
+            user = get_user(user_id) or {}
+            prefs = user.get("prefs", {}) or {}
+            prefs["pending_edit_mail_id"] = mail_id
+            upsert_user(user_id, prefs_json=prefs)
+        except Exception:
+            pass
+
+        text = "\u270f\ufe0f Напишите новый текст ответа.\nДля отмены — /menu или «отмена»."
+        try:
+            await query.edit_message_text(
+                text=text,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+                ]]),
+            )
         except Exception:
             pass
 
@@ -8755,3 +8806,88 @@ class TelegramAdapter(BasePlatformAdapter):
             )
         except Exception as e:
             logger.warning("Health check failed: %s", e)
+
+    # ═══════════════════════════════════════════════════════════
+    # Pending Mail Edit Intercept
+    # ═══════════════════════════════════════════════════════════
+
+    async def _handle_pending_mail_edit(self, msg, text: str) -> bool:
+        """Intercept text when user has pending_edit_mail_id in prefs.
+
+        Returns True if consumed, False to continue normal processing.
+        """
+        user_id = str(getattr(msg.from_user, "id", ""))
+        if not user_id:
+            return False
+
+        # Check for cancel
+        if text.strip().lower() in ("отмена", "cancel", "/menu"):
+            try:
+                from gateway.secretary_user_store import upsert_user, get_user
+                user = get_user(user_id) or {}
+                prefs = user.get("prefs", {}) or {}
+                prefs.pop("pending_edit_mail_id", None)
+                upsert_user(user_id, prefs_json=prefs)
+            except Exception:
+                pass
+            await self._bot.send_message(
+                chat_id=int(msg.chat.id),
+                text="\u274c Редактирование отменено.",
+                reply_to_message_id=msg.message_id,
+                **self._link_preview_kwargs(),
+            )
+            return True
+
+        try:
+            from gateway.secretary_user_store import get_user, upsert_user
+            user = get_user(user_id) or {}
+            prefs = user.get("prefs", {}) or {}
+            mail_id = prefs.get("pending_edit_mail_id")
+            if not mail_id:
+                return False
+        except Exception:
+            return False
+
+        # Build draft from user's text
+        draft = text.strip()
+        if not draft or draft.startswith("/"):
+            return False
+
+        # Clear pending state, store draft for send
+        draft_key = f"custom_draft_{mail_id}"
+        try:
+            prefs.pop("pending_edit_mail_id", None)
+            prefs[draft_key] = draft
+            upsert_user(user_id, prefs_json=prefs)
+        except Exception:
+            pass
+
+        await self._bot.send_message(
+            chat_id=int(msg.chat.id),
+            text="\u270f\ufe0f Новый текст:",
+            reply_to_message_id=msg.message_id,
+        )
+
+        # Show with send/reject buttons
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("\u2705 Отправить", callback_data=f"mail:send:{mail_id}"),
+                InlineKeyboardButton("\u270f\ufe0f Править", callback_data=f"mail:edit:{mail_id}"),
+            ],
+            [
+                InlineKeyboardButton("\u274c Отклонить", callback_data=f"mail:reject:{mail_id}"),
+                InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+            ],
+        ])
+
+        try:
+            await self._bot.send_message(
+                chat_id=int(msg.chat.id),
+                text=f"\u270d\ufe0f Ваш ответ:\n\n{draft}",
+                reply_markup=keyboard,
+                **self._link_preview_kwargs(),
+            )
+        except Exception as e:
+            logger.warning("Failed to show edited draft: %s", e)
+
+        return True
