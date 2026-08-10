@@ -4124,6 +4124,11 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._handle_mail_callback(query, data, query_chat_id, query_thread_id, query_user_name)
             return
 
+        # --- Calendar callbacks (cal:day:N | cal:week) ---
+        if data.startswith("cal:"):
+            await self._handle_calendar_callback(query, data, query_chat_id, query_thread_id, query_user_name)
+            return
+
         # --- Main menu callbacks (menu:home | menu:mail | menu:tasks | menu:cal | menu:mode | menu:project | menu:secretary | menu:settings | menu:who | set:*) ---
         if data.startswith("menu:") or data.startswith("set:"):
             await self._handle_menu_callback(query, data, query_chat_id, query_thread_id, query_user_name)
@@ -8070,24 +8075,23 @@ class TelegramAdapter(BasePlatformAdapter):
                 pass
             return
 
-        # ── menu:tasks | menu:cal — coming soon stubs ──
-        if data in ("menu:tasks", "menu:cal"):
-            labels = {
-                "menu:tasks": "\u2705 Задачи",
-                "menu:cal": "\u0001f4c5 Календарь",
-            }
-            label = labels.get(data, data)
-            await query.answer(text=f"\u23f3 {label} — скоро")
-            stub_text = (
-                f"\u23f3 {label} — появится в Фазе 2\u20133.\n\n"
-                f"Пока доступны: меню, режим, проект, секретарь, /who."
-            )
+        # ── menu:cal — show calendar submenu ──
+        if data == "menu:cal":
+            await query.answer()
+            await self._render_calendar_menu(cid, caller_id)
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+            return
+
+        # ── menu:tasks — coming soon stub ──
+        if data == "menu:tasks":
+            await query.answer(text="\u23f3 Задачи — скоро")
+            stub_text = "\u23f3 Задачи — появится в Фазе 3.\n\nПока доступны: меню, режим, проект, секретарь, /who."
             keyboard = [[InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home")]]
             try:
-                await query.edit_message_text(
-                    text=stub_text,
-                    reply_markup=InlineKeyboardMarkup(keyboard),
-                )
+                await query.edit_message_text(text=stub_text, reply_markup=InlineKeyboardMarkup(keyboard))
             except Exception:
                 pass
             return
@@ -8603,3 +8607,93 @@ class TelegramAdapter(BasePlatformAdapter):
                 pass
         except Exception as e:
             logger.warning("Failed to send digest: %s", e)
+
+    # ═══════════════════════════════════════════════════════════
+    # Calendar (menu:cal)
+    # ═══════════════════════════════════════════════════════════
+
+    async def _render_calendar_menu(self, chat_id: int, user_id: str) -> None:
+        """Show calendar submenu."""
+        from tools.secretary.calendar import is_configured
+
+        if not is_configured():
+            text = (
+                "\u0001f4c5 Календарь не настроен.\n\n"
+                "Добавьте в .env:\n"
+                "  SECRETARY_CAL_ICS_URL=https://..."
+            )
+            keyboard = [[InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home")]]
+        else:
+            text = "\u0001f4c5 Календарь"
+            keyboard = [
+                [
+                    InlineKeyboardButton("\u0001f4c6 Сегодня", callback_data="cal:day:0"),
+                    InlineKeyboardButton("\u0001f4c6 Завтра", callback_data="cal:day:1"),
+                ],
+                [
+                    InlineKeyboardButton("\u0001f4c5 7 дней", callback_data="cal:week"),
+                    InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+                ],
+            ]
+
+        try:
+            await self._bot.send_message(
+                chat_id=chat_id, text=text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                **self._link_preview_kwargs(),
+            )
+        except Exception as e:
+            logger.warning("Failed to render calendar menu: %s", e)
+
+    async def _handle_calendar_callback(
+        self, query, data: str, chat_id, thread_id, user_name
+    ) -> None:
+        """Handle cal:day:N and cal:week."""
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=chat_id,
+            chat_type=str(getattr(getattr(query.message, "chat", None), "type", "")),
+            thread_id=str(thread_id) if thread_id is not None else None,
+            user_name=user_name,
+        ):
+            await query.answer(text="\u26d4 Not authorized.")
+            return
+
+        cid = int(chat_id) if chat_id else 0
+        parts = data.split(":")
+        action = parts[1] if len(parts) >= 2 else ""
+
+        if action == "week":
+            days = 7
+        elif action == "day":
+            try:
+                days = int(parts[2]) + 1  # day:0 = today (1 day window)
+            except (ValueError, IndexError):
+                days = 1
+        else:
+            await query.answer(text="Unknown calendar action.")
+            return
+
+        await query.answer(text="\u0001f4c5 Загружаю...")
+
+        try:
+            from tools.secretary.calendar import list_events, format_calendar_list
+            events = list_events(days_ahead=days)
+            text = format_calendar_list(events)
+        except RuntimeError as e:
+            text = f"\u26a0\ufe0f {e}"
+        except Exception as e:
+            logger.warning("Calendar list failed: %s", e)
+            text = f"\u26a0\ufe0f Ошибка: {e}"
+
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+        ]])
+        try:
+            await query.edit_message_text(text=text, reply_markup=keyboard)
+        except Exception:
+            await self._bot.send_message(
+                chat_id=cid, text=text, reply_markup=keyboard,
+                **self._link_preview_kwargs(),
+            )

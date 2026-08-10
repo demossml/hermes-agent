@@ -8342,6 +8342,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source.chat_id or "unknown", _msg_preview,
         )
 
+        # ── Secretary profile isolation ──
+        # Apply per-turn HERMES_HOME override via ContextVar (scoped to this
+        # asyncio task — automatically cleared when the task finishes).
+        # The agent turn reads/writes memory, sessions, and project state
+        # from the correct secretary profile.
+        _active_sec_path = getattr(event, "_active_secretary_path", None)
+        if _active_sec_path:
+            try:
+                from hermes_constants import set_hermes_home_override
+                set_hermes_home_override(_active_sec_path)
+                logger.debug(
+                    "Secretary isolation: HERMES_HOME override → %s",
+                    _active_sec_path,
+                )
+            except Exception:
+                pass
+
         # Get or create session
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
         # last-active topic so a cross-topic Reply or stripped plain reply
