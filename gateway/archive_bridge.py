@@ -54,6 +54,7 @@ def build_hook_context(
     full_message: str = "",
     media_urls: Optional[Sequence[str]] = None,
     media_types: Optional[Sequence[str]] = None,
+    telegram_file_ids: Optional[Sequence[str]] = None,
     message_id: str = "",
 ) -> dict:
     text = full_message or message or ""
@@ -68,6 +69,7 @@ def build_hook_context(
         "full_message": text or "",
         "media_urls": list(media_urls or []),
         "media_types": list(media_types or []),
+        "telegram_file_ids": list(telegram_file_ids or []),
         "message_id": str(message_id or ""),
     }
 
@@ -114,6 +116,7 @@ async def _inline_archive(context: dict) -> None:
     raw_text = context.get("full_message") or context.get("message") or ""
     media_urls = list(context.get("media_urls") or [])
     media_types = list(context.get("media_types") or [])
+    file_ids = list(context.get("telegram_file_ids") or [])
     base = dict(
         platform=context.get("platform", ""),
         chat_id=context.get("chat_id", ""),
@@ -169,6 +172,18 @@ async def _inline_archive(context: dict) -> None:
             )
         except Exception:
             pass
+        telegram_file_id = file_ids[i] if i < len(file_ids) else ""
+        receipt_data = {}
+        if doc_category == "receipt" and extracted:
+            try:
+                receipt_data = extractors.parse_receipt(extracted)
+            except Exception:
+                pass
+        metadata = {}
+        if doc_category:
+            metadata["doc_category"] = doc_category
+        if receipt_data:
+            metadata["receipt"] = receipt_data
         db.enqueue(
             ArchiveRecord(
                 **item,
@@ -180,6 +195,8 @@ async def _inline_archive(context: dict) -> None:
                 original_name=src.name,
                 mime_type=str(mtype or ""),
                 doc_category=doc_category,
+                telegram_file_id=telegram_file_id,
+                metadata=metadata,
             )
         )
         logger.info(

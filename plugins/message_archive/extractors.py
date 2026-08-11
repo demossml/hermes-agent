@@ -175,3 +175,46 @@ def categorize_document(text: str = "", file_name: str = "") -> str:
             if kw in combined:
                 return category
     return ""
+
+
+def parse_receipt(text: str) -> dict:
+    """Extract structured fields from receipt OCR text.
+
+    Returns dict with: store, inn, total, date.
+    Empty dict if nothing found.
+    """
+    import re
+    result: dict = {}
+
+    # Store name — usually after "ООО"/"ИП"/"ЗАО"/"АО"
+    store_m = re.search(r'(?:ООО|ИП|ЗАО|АО)\s*[«"](.+?)[»"]', text)
+    if store_m:
+        result["store"] = store_m.group(0)
+
+    # INN: 10 or 12 digits
+    inn_m = re.search(r'ИНН\s*[:\s]*(\d{10,12})', text)
+    if inn_m:
+        result["inn"] = inn_m.group(1)
+
+    # Total
+    total_m = re.search(
+        r'(?:ИТОГО?|ИТОГ|ВСЕГО|СУММА|К\s*ОПЛАТЕ)[:\s]*([\d\s]+[.,]\d{2})',
+        text, re.IGNORECASE,
+    )
+    if total_m:
+        try:
+            result["total"] = float(
+                total_m.group(1).replace(' ', '').replace(',', '.')
+            )
+        except ValueError:
+            pass
+
+    # Date (DD.MM.YYYY or DD/MM/YYYY)
+    date_m = re.search(
+        r'(\d{2}[./-]\d{2}[./-](?:20)?\d{2})',
+        text,
+    )
+    if date_m:
+        result["date"] = date_m.group(1)
+
+    return result

@@ -5842,6 +5842,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event.media_urls = [cached.path]
         event.media_types = [cached.media_type]
+        event.telegram_file_ids = [getattr(source, "file_id", "")]
         if cached.kind == "image":
             event.message_type = MessageType.PHOTO
         elif cached.kind == "video":
@@ -5884,6 +5885,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event.media_urls.append(cached.path)
         event.media_types.append(cached.media_type)
+        event.telegram_file_ids.append(getattr(source, "file_id", ""))
         if len(event.media_urls) == 1:
             if cached.kind == "image":
                 event.message_type = MessageType.PHOTO
@@ -6960,6 +6962,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             message_id=str(getattr(_m, "message_id", "") or ""),
                             media_urls=list(getattr(_event, "media_urls", None) or []),
                             media_types=list(getattr(_event, "media_types", None) or []),
+                            telegram_file_ids=list(getattr(_event, "telegram_file_ids", None) or []),
                         )
                         import asyncio
                         asyncio.create_task(archive_message_context(ctx))

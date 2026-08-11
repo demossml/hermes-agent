@@ -217,6 +217,146 @@ class TestCfgRegression:
         assert isinstance(silence_without_reply_enabled(), bool)
 
 
+class TestTelegramFileId:
+    """file_id propagates through context and schema."""
+
+    def test_build_hook_context_with_file_ids(self):
+        from gateway.archive_bridge import build_hook_context
+        ctx = build_hook_context(
+            telegram_file_ids=["AgACAgIAAxkBAAICtest"],
+            media_urls=["/tmp/photo.jpg"],
+            media_types=["image/jpeg"],
+        )
+        assert ctx["telegram_file_ids"] == ["AgACAgIAAxkBAAICtest"]
+
+    def test_build_hook_context_empty_file_ids(self):
+        from gateway.archive_bridge import build_hook_context
+        ctx = build_hook_context()
+        assert ctx["telegram_file_ids"] == []
+
+    def test_file_id_in_schema(self):
+        from plugins.message_archive.db import SCHEMA_SQL
+        assert "telegram_file_id" in SCHEMA_SQL
+
+    def test_file_id_in_dataclass(self):
+        from plugins.message_archive.db import ArchiveRecord
+        fields = ArchiveRecord.__dataclass_fields__
+        assert "telegram_file_id" in fields
+
+    def test_file_id_in_db_column(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "archive" / "test.db"
+            from plugins.message_archive.db import get_db
+            import plugins.message_archive.db as db_mod
+            db_mod._db = None
+            db = get_db(db_path)
+            cols = db._conn.execute("PRAGMA table_info(messages)").fetchall()
+            col_names = [c[1] for c in cols]
+            assert "telegram_file_id" in col_names
+            db.close()
+            db_mod._db = None
+
+    def test_message_event_has_file_ids(self):
+        from gateway.platforms.base import MessageEvent
+        event = MessageEvent(text="test")
+        assert event.telegram_file_ids == []
+
+    def test_enqueue_with_file_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "archive" / "test.db"
+            from plugins.message_archive.db import get_db, ArchiveRecord, utc_now_iso
+            import plugins.message_archive.db as db_mod
+            db_mod._db = None
+            db = get_db(db_path)
+            fid = "AgACAgIAAxkBAAICtest123"
+            record = ArchiveRecord(
+                platform="telegram", chat_id="-100123", thread_id="42",
+                user_id="100500", message_id="1", ts_utc=utc_now_iso(),
+                msg_type="photo", raw_text="чек", telegram_file_id=fid,
+            )
+            db.enqueue(record)
+            import time
+            time.sleep(2.5)
+            rows = db.query(chat_id="-100123")
+            assert len(rows) > 0
+            assert rows[0]["telegram_file_id"] == fid
+            db.close()
+            db_mod._db = None
+
+
+class TestParseReceipt:
+    """Receipt parser extracts structured fields."""
+
+    def test_import(self):
+        from plugins.message_archive.extractors import parse_receipt
+        assert callable(parse_receipt)
+
+    def test_parse_inn(self):
+        from plugins.message_archive.extractors import parse_receipt
+        result = parse_receipt("ООО «Ромашка» ИНН: 1234567890")
+        assert result["inn"] == "1234567890"
+
+    def test_parse_inn_12_digits(self):
+        from plugins.message_archive.extractors import parse_receipt
+        result = parse_receipt("ИП Иванов ИНН 123456789012")
+        assert result["inn"] == "123456789012"
+
+    def test_parse_total(self):
+        from plugins.message_archive.extractors import parse_receipt
+        result = parse_receipt("ИТОГО: 1 500.00")
+        assert result["total"] == 1500.0
+
+    def test_parse_total_comma(self):
+        from plugins.message_archive.extractors import parse_receipt
+        result = parse_receipt("ИТОГ: 255,50")
+        assert result["total"] == 255.5
+
+    def test_parse_date(self):
+        from plugins.message_archive.extractors import parse_receipt
+        result = parse_receipt("11.08.2026 14:30")
+        assert result["date"] == "11.08.2026"
+
+    def test_parse_date_slash(self):
+        from plugins.message_archive.extractors import parse_receipt
+        result = parse_receipt("01/12/2026")
+        assert result["date"] == "01/12/2026"
+
+    def test_parse_empty(self):
+        from plugins.message_archive.extractors import parse_receipt
+        assert parse_receipt("") == {}
+        assert parse_receipt("просто текст без цифр") == {}
+
+    def test_parse_full_receipt(self):
+        from plugins.message_archive.extractors import parse_receipt
+        text = """
+        ООО «Продукты»
+        ИНН: 6732123456
+        Кассовый чек №1234
+        11.08.2026 15:22
+        Молоко 2.5% — 2 x 95.00 = 190.00
+        Хлеб ржаной — 1 x 65.00 = 65.00
+        ИТОГО: 255.00
+        """
+        result = parse_receipt(text)
+        assert result["store"] == 'ООО «Продукты»'
+        assert result["inn"] == "6732123456"
+        assert result["total"] == 255.0
+        assert result["date"] == "11.08.2026"
+
+
+class TestReDownloadUtil:
+    """re_download_file utility exists and is callable."""
+
+    def test_import(self):
+        from plugins.message_archive.re_download import re_download_file
+        assert callable(re_download_file)
+
+    def test_returns_none_without_token(self):
+        from plugins.message_archive.re_download import re_download_file
+        assert re_download_file("", "some_id", "/tmp") is None
+        assert re_download_file("token", "", "/tmp") is None
+
+
 class TestEnqueueWithDocCategory:
     """Verify enqueue writes doc_category to DB."""
 
