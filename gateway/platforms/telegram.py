@@ -6271,14 +6271,12 @@ class TelegramAdapter(BasePlatformAdapter):
             )
 
         reply_text = "\n".join(reply_lines)
-        try:
-            await self._bot.send_message(
-                chat_id=int(chat_id),
-                text=reply_text,
-                reply_to_message_id=msg.message_id,
-            )
-        except Exception as e:
-            logger.warning(f"Failed to send /rule reply: {e}")
+        await self._send_local_with_topic(
+            msg,
+            chat_id=int(chat_id),
+            text=reply_text,
+            reply_to_message_id=msg.message_id,
+        )
 
     async def _handle_mode_picker_locally(self, msg) -> None:
         """Send mode picker InlineKeyboard — zero LLM cost."""
@@ -6302,15 +6300,13 @@ class TelegramAdapter(BasePlatformAdapter):
         reply_markup = InlineKeyboardMarkup(keyboard)
         text = f"Выберите режим. Сейчас: {current_label}"
 
-        try:
-            await self._bot.send_message(
-                chat_id=int(chat_id),
-                text=text,
-                reply_markup=reply_markup,
-                reply_to_message_id=msg.message_id,
-            )
-        except Exception as e:
-            logger.warning("Failed to send mode picker: %s", e)
+        await self._send_local_with_topic(
+            msg,
+            chat_id=int(chat_id),
+            text=text,
+            reply_markup=reply_markup,
+            reply_to_message_id=msg.message_id,
+        )
 
     async def _handle_mode_callback(
         self, query, data: str, chat_id, thread_id, user_name
@@ -6385,14 +6381,12 @@ class TelegramAdapter(BasePlatformAdapter):
 
         secretaries = list_secretaries()
         if not secretaries:
-            try:
-                await self._bot.send_message(
-                    chat_id=int(chat_id),
-                    text="Нет профилей secretary-*. Создайте через `hermes profile create secretary-<name>`.",
-                    reply_to_message_id=msg.message_id,
-                )
-            except Exception as e:
-                logger.warning("Failed to send empty secretary list: %s", e)
+            await self._send_local_with_topic(
+                msg,
+                chat_id=int(chat_id),
+                text="Нет профилей secretary-*. Создайте через `hermes profile create secretary-<name>`.",
+                reply_to_message_id=msg.message_id,
+            )
             return
 
         keyboard = []
@@ -6405,15 +6399,13 @@ class TelegramAdapter(BasePlatformAdapter):
         reply_markup = InlineKeyboardMarkup(keyboard)
         text = f"Выберите секретаря. Сейчас: {active}"
 
-        try:
-            await self._bot.send_message(
-                chat_id=int(chat_id),
-                text=text,
-                reply_markup=reply_markup,
-                reply_to_message_id=msg.message_id,
-            )
-        except Exception as e:
-            logger.warning("Failed to send secretary picker: %s", e)
+        await self._send_local_with_topic(
+            msg,
+            chat_id=int(chat_id),
+            text=text,
+            reply_markup=reply_markup,
+            reply_to_message_id=msg.message_id,
+        )
 
     async def _handle_sec_callback(
         self, query, data: str, chat_id, thread_id, user_name
@@ -6495,25 +6487,21 @@ class TelegramAdapter(BasePlatformAdapter):
             current_id = get_current_project_id()
         except Exception as e:
             logger.warning("Failed to list projects: %s", e)
-            try:
-                await self._bot.send_message(
-                    chat_id=int(chat_id),
-                    text="Не удалось получить список проектов.",
-                    reply_to_message_id=msg.message_id,
-                )
-            except Exception:
-                pass
+            await self._send_local_with_topic(
+                msg,
+                chat_id=int(chat_id),
+                text="Не удалось получить список проектов.",
+                reply_to_message_id=msg.message_id,
+            )
             return
 
         if not projects:
-            try:
-                await self._bot.send_message(
-                    chat_id=int(chat_id),
-                    text="Нет проектов. Создайте через /project new <имя>.",
-                    reply_to_message_id=msg.message_id,
-                )
-            except Exception as e:
-                logger.warning("Failed to send empty project list: %s", e)
+            await self._send_local_with_topic(
+                msg,
+                chat_id=int(chat_id),
+                text="Нет проектов. Создайте через /project new <имя>.",
+                reply_to_message_id=msg.message_id,
+            )
             return
 
         keyboard = []
@@ -6532,15 +6520,13 @@ class TelegramAdapter(BasePlatformAdapter):
         current_name = "neutral" if current_id is None else current_id
         text = f"Проекты. Сейчас: {current_name}"
 
-        try:
-            await self._bot.send_message(
-                chat_id=int(chat_id),
-                text=text,
-                reply_markup=reply_markup,
-                reply_to_message_id=msg.message_id,
-            )
-        except Exception as e:
-            logger.warning("Failed to send project picker: %s", e)
+        await self._send_local_with_topic(
+            msg,
+            chat_id=int(chat_id),
+            text=text,
+            reply_markup=reply_markup,
+            reply_to_message_id=msg.message_id,
+        )
 
     async def _handle_who_locally(self, msg) -> None:
         """Send /who status — full secretary state — zero LLM cost."""
@@ -6613,15 +6599,13 @@ class TelegramAdapter(BasePlatformAdapter):
 
         text = "\n".join(lines)
 
-        try:
-            await self._bot.send_message(
-                chat_id=int(chat_id),
-                text=text,
-                reply_to_message_id=msg.message_id,
-                **self._link_preview_kwargs(),
-            )
-        except Exception as e:
-            logger.warning("Failed to send /who reply: %s", e)
+        await self._send_local_with_topic(
+            msg,
+            chat_id=int(chat_id),
+            text=text,
+            reply_to_message_id=msg.message_id,
+            **self._link_preview_kwargs(),
+        )
 
     async def _handle_proj_callback(
         self, query, data: str, chat_id, thread_id, user_name
@@ -8001,6 +7985,36 @@ class TelegramAdapter(BasePlatformAdapter):
             thread_id=thread_id if thread_id else None,
             reply_to_msg_id=msg.message_id,
         )
+
+    async def _send_local_with_topic(
+        self, msg, chat_id: str | int | None = None, **send_kwargs
+    ) -> bool:
+        """Send a message in the same topic as the incoming ``msg``.
+
+        Extracts ``message_thread_id`` from the PTB Message and adds the
+        correct thread kwargs.  Falls back to plain send when the thread
+        is gone.  Returns True on success, False on failure.
+        """
+        thread_id = getattr(msg, "message_thread_id", None)
+        if thread_id is not None and chat_id is None:
+            chat_id = str(msg.chat.id)
+        if chat_id is not None and thread_id is not None:
+            send_kwargs.update(
+                self._thread_kwargs_for_send(
+                    str(chat_id), str(thread_id),
+                    {"thread_id": str(thread_id)},
+                    reply_to_mode=self._reply_to_mode,
+                )
+            )
+        try:
+            await self._send_message_with_thread_fallback(**send_kwargs)
+            return True
+        except Exception as e:
+            logger.debug(
+                "[%s] _send_local_with_topic failed (chat=%s thread=%s): %s",
+                self.name, chat_id, thread_id, e,
+            )
+            return False
 
     async def send_main_menu(
         self,
