@@ -383,3 +383,96 @@ class TestEnqueueWithDocCategory:
             assert rows[0]["doc_category"] == "invoice"
             db.close()
             db_mod._db = None
+
+
+class TestSchemaMigration:
+    """_migrate_schema добавляет отсутствующие колонки."""
+
+    def test_migration_adds_missing_column(self):
+        """При запуске на БД без telegram_file_id — колонка добавляется."""
+        import sqlite3
+        from plugins.message_archive.db import _migrate_schema
+        conn = sqlite3.connect(":memory:")
+        conn.execute("""
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                platform TEXT DEFAULT '',
+                chat_id TEXT DEFAULT '',
+                doc_category TEXT DEFAULT ''
+            )
+        """)
+        # Миграция должна добавить telegram_file_id и project_id
+        _migrate_schema(conn.cursor())
+        conn.commit()
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
+        assert "telegram_file_id" in cols
+        assert "project_id" in cols
+        # doc_category уже была — не должна сломаться
+        assert "doc_category" in cols
+        conn.close()
+
+    def test_migration_idempotent(self):
+        """Повторная миграция не ломает БД."""
+        import sqlite3
+        from plugins.message_archive.db import _migrate_schema
+        conn = sqlite3.connect(":memory:")
+        conn.execute("""
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                platform TEXT DEFAULT '',
+                telegram_file_id TEXT DEFAULT '',
+                doc_category TEXT DEFAULT '',
+                project_id TEXT DEFAULT ''
+            )
+        """)
+        # Первый проход
+        _migrate_schema(conn.cursor())
+        # Второй проход не должен упасть
+        _migrate_schema(conn.cursor())
+        conn.commit()
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
+        assert "telegram_file_id" in cols
+        assert "doc_category" in cols
+        assert "project_id" in cols
+        conn.close()
+
+    def test_message_archive_db_runs_migration(self):
+        """MessageArchiveDB.__init__ выполняет миграцию при старте."""
+        with tempfile.TemporaryDirectory() as tmp:
+            import sqlite3
+            # Создаём «старую» БД — все колонки, кроме doc_category, telegram_file_id, project_id
+            raw_db = Path(tmp) / "archive" / "old.db"
+            raw_db.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(raw_db))
+            conn.executescript("""
+                CREATE TABLE messages (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    platform    TEXT DEFAULT '',
+                    chat_id     TEXT DEFAULT '',
+                    thread_id   TEXT DEFAULT '',
+                    user_id     TEXT DEFAULT '',
+                    username    TEXT DEFAULT '',
+                    message_id  TEXT DEFAULT '',
+                    ts_utc      TEXT NOT NULL,
+                    msg_type    TEXT DEFAULT 'text',
+                    raw_text    TEXT DEFAULT '',
+                    extracted_text TEXT DEFAULT '',
+                    extractor   TEXT DEFAULT '',
+                    file_path   TEXT DEFAULT '',
+                    original_name TEXT DEFAULT '',
+                    mime_type   TEXT DEFAULT '',
+                    metadata_json TEXT DEFAULT '{}'
+                );
+            """)
+            conn.commit()
+            conn.close()
+            # Открываем через MessageArchiveDB — миграция должна добавить новые колонки
+            from plugins.message_archive.db import MessageArchiveDB
+            import plugins.message_archive.db as db_mod
+            db_mod._db = None
+            db = MessageArchiveDB(raw_db)
+            cols = {r[1] for r in db._conn.execute("PRAGMA table_info(messages)").fetchall()}
+            assert "telegram_file_id" in cols
+            assert "doc_category" in cols
+            assert "project_id" in cols
+            db.close()

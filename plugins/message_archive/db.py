@@ -85,6 +85,37 @@ END;
 """
 
 
+def _migrate_schema(cursor: sqlite3.Cursor) -> None:
+    """Добавить отсутствующие колонки в таблицу messages.
+
+    SCHEMA_SQL использует CREATE TABLE IF NOT EXISTS — если
+    таблица уже существует (создана предыдущей версией),
+    ALTER TABLE для новых колонок не выполняется.
+
+    Эта функция проверяет реальный состав колонок через
+    PRAGMA table_info и добавляет недостающие.
+
+    Вызывается ДО executescript(SCHEMA_SQL) — иначе индексы
+    на новые колонки (project_id) упадут.
+    """
+    # Проверяем что таблица вообще существует
+    row = cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'"
+    ).fetchone()
+    if not row:
+        return  # таблицы нет — SCHEMA_SQL создаст с нуля
+
+    existing = {row[1] for row in cursor.execute("PRAGMA table_info(messages)").fetchall()}
+    migrations = [
+        ("doc_category", "TEXT DEFAULT ''"),
+        ("telegram_file_id", "TEXT DEFAULT ''"),
+        ("project_id", "TEXT DEFAULT ''"),
+    ]
+    for col_name, col_def in migrations:
+        if col_name not in existing:
+            cursor.execute(f"ALTER TABLE messages ADD COLUMN {col_name} {col_def}")
+            logger.info("message_archive: migrated column %s", col_name)
+
 # ── Data model ────────────────────────────────────────────────
 
 
@@ -134,6 +165,7 @@ class MessageArchiveDB:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=OFF")
+        _migrate_schema(self._conn.cursor())
         self._conn.executescript(SCHEMA_SQL)
         self._conn.commit()
 
