@@ -455,6 +455,78 @@ def remove_wrapper_script(name: str) -> bool:
     return False
 
 
+_SECRETARY_SOUL_MD = """\
+# Group Secretary — Observer Bot
+
+Ты — секретарь-наблюдатель. Твоя задача: сохранять все сообщения
+из группы в архив и отвечать на вопросы по архиву.
+
+## Что ты делаешь
+
+1. При получении ЛЮБОГО сообщения из группы — ОБЯЗАТЕЛЬНО вызываешь
+   `archive_message`
+2. Никогда не отвечаешь в чат (если только тебя явно не спросили)
+3. При вопросе «покажи накладные» — ищешь в archive DB и показываешь
+
+## Поиск по архиву
+
+Когда пользователь спрашивает «найди накладные за июль» или
+«покажи сообщения из темы НДС»:
+- Используй terminal + python3 + sqlite3 для запроса к
+  `archive/messages.db`
+- Фильтруй по дате, категории, thread_id
+- Возвращай результат в чат
+
+## Запреты
+
+- Не писать в чат без явного вопроса
+- Не выдумывать данные — только из БД
+"""
+
+_SECRETARY_CONFIG_YAML = """\
+# ── Secretary profile config (auto-generated) ─────────────────
+# Настроен для работы «из коробки»: слушает группу, архивирует
+# сообщения, не отвечает без явного вопроса.
+
+telegram:
+  extra:
+    group_allowed_chats: []
+    require_mention: true
+    observe_unmentioned_group_messages: true
+
+message_archive:
+  enabled: true
+  chats: []
+  files_dir: \"~/.hermes/profiles/{profile_name}/archive/files\"
+  max_file_mb: 40
+  silence_without_reply: true
+"""
+
+
+def _seed_secretary_profile_config(profile_dir: Path, profile_name: str) -> None:
+    """Seed a secretary-ready SOUL.md and config.yaml into the profile.
+
+    Only called for fresh (non-cloned) profiles whose name starts with
+    ``secretary-``.
+    """
+    # Overwrite SOUL.md with secretary-specific version
+    try:
+        (profile_dir / "SOUL.md").write_text(
+            _SECRETARY_SOUL_MD, encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+    # Write a config.yaml if one doesn't exist yet
+    config_path = profile_dir / "config.yaml"
+    if not config_path.exists():
+        try:
+            config_yaml = _SECRETARY_CONFIG_YAML.format(profile_name=profile_name)
+            config_path.write_text(config_yaml, encoding="utf-8")
+        except Exception:
+            pass
+
+
 def _migrate_profile_config_if_outdated(profile_dir: Path) -> None:
     """Bring a copied profile config.yaml up to the current schema.
 
@@ -927,6 +999,13 @@ def create_profile(
             soul_path.write_text(DEFAULT_SOUL_MD, encoding="utf-8")
         except Exception:
             pass  # best-effort — don't fail profile creation over this
+
+    # ── Secretary profile auto-configuration ──────────────────
+    # When the profile name starts with "secretary-", seed a
+    # ready-to-use config.yaml and SOUL.md with group-observer
+    # defaults so the profile works out of the box.
+    if canon.startswith("secretary-") and not source_dir:
+        _seed_secretary_profile_config(profile_dir, canon)
 
     # Write the opt-out marker so seed_profile_skills() and `hermes update`'s
     # all-profile sync loop both skip this profile for bundled-skill seeding.

@@ -16920,6 +16920,17 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     except Exception as e:
         logger.debug("MCP tool discovery failed: %s", e)
 
+    # Eager-init the message_archive DB so tables are created at startup,
+    # not lazily on the first archived message.  Silent no-op if the plugin
+    # is disabled or missing.
+    try:
+        from plugins.message_archive import is_enabled as _ma_enabled, get_archive_db
+        if _ma_enabled():
+            _db = get_archive_db()
+            logger.info("message_archive: DB initialized at startup")
+    except Exception:
+        pass
+
     # Start the gateway
     success = await runner.start()
     if not success:

@@ -605,6 +605,20 @@ class TelegramAdapter(BasePlatformAdapter):
         self._dm_topic_chat_ids: Set[str] = {
             str(e["chat_id"]) for e in self._dm_topics_config if "chat_id" in e
         }
+        # Forum topic names: manual mapping chat_id → {thread_id: name}
+        # from extra.forum_topic_names. Used to humanise thread_ids in logs.
+        self._forum_topic_names: Dict[int, Dict[int, str]] = {}
+        _raw_topics = self.config.extra.get("forum_topic_names", {})
+        if isinstance(_raw_topics, dict):
+            for chat_id_str, topics in _raw_topics.items():
+                if isinstance(topics, dict):
+                    try:
+                        chat_id_num = int(chat_id_str)
+                        self._forum_topic_names[chat_id_num] = {
+                            int(tid): str(name) for tid, name in topics.items()
+                        }
+                    except (ValueError, TypeError):
+                        pass
         # Document size cap. Telegram's public Bot API caps getFile at 20MB; a
         # locally-hosted telegram-bot-api server (configured via extra.base_url)
         # raises that to 2GB, so the presence of base_url is the opt-in.
@@ -5269,6 +5283,30 @@ class TelegramAdapter(BasePlatformAdapter):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
         return os.getenv("TELEGRAM_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
+
+    def get_topic_name(self, chat_id: str, thread_id: str) -> str:
+        """Return human-friendly topic name, or fallback 'Тема #N'.
+
+        Resolved in order:
+        1. General topic (thread_id is None, empty, or 1) → "General"
+        2. forum_topic_names config mapping
+        3. Fallback: "Тема #{thread_id}"
+        """
+        tid = None
+        try:
+            tid = int(thread_id) if thread_id else None
+        except (ValueError, TypeError):
+            pass
+        if tid is None or tid == 1:
+            return "General"
+        try:
+            chat_num = int(chat_id) if chat_id else 0
+            chat_topics = self._forum_topic_names.get(chat_num, {})
+            if tid in chat_topics:
+                return chat_topics[tid]
+        except (ValueError, TypeError):
+            pass
+        return f"Тема #{tid}"
 
     def _telegram_observe_unmentioned_group_messages(self) -> bool:
         """Return whether skipped unmentioned group messages are stored as context.

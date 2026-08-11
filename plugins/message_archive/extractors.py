@@ -141,3 +141,37 @@ async def extract_document(file_path: str) -> Tuple[str, str]:
         return ("", f"error: {e}")
 
     return (text[:2000], extractor)
+
+
+# ── Document categorization ──────────────────────────────────
+
+CATEGORIES: dict[str, list[str]] = {
+    "receipt":  ["чек", "кассовый", "фискальный", "итого", "сдача", "кассир",
+                 "приход", "касса", "терминал"],
+    "invoice":  ["счёт", "инвойс", "счет-фактура", "счёт-фактура",
+                 "на оплату", "к оплате"],
+    "contract": ["договор", "контракт", "соглашение", "доп соглашение",
+                 "дополнительное соглашение"],
+    "act":      ["акт", "приёма", "передачи", "выполненных", "оказанных",
+                 "сверки", "приема-передачи", "акт сдачи"],
+    "waybill":  ["накладная", "торг-12", "торг12", "транспортная",
+                 "товарная", "ттн", "товарно-транспортная"],
+    "payment":  ["платёжное", "поручение", "квитанция", "оплата", "платеж",
+                 "п/п", "платёжка"],
+}
+
+
+def categorize_document(text: str = "", file_name: str = "") -> str:
+    """Return category based on document text and/or file name.
+
+    Returns one of: receipt, invoice, contract, act, waybill, payment,
+    or empty string if no category matched.
+    """
+    combined = ((text or "") + " " + (file_name or "")).lower()
+    if not combined.strip():
+        return ""
+    for category, keywords in CATEGORIES.items():
+        for kw in keywords:
+            if kw in combined:
+                return category
+    return ""

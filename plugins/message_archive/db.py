@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS messages (
     original_name TEXT  DEFAULT '',
     mime_type   TEXT    DEFAULT '',
     metadata_json TEXT  DEFAULT '{}',
+    doc_category TEXT   DEFAULT '',
     project_id  TEXT    DEFAULT ''
 );
 
@@ -104,6 +105,7 @@ class ArchiveRecord:
     original_name: str = ""
     mime_type: str = ""
     metadata: dict = field(default_factory=dict)
+    doc_category: str = ""
     project_id: str = ""
 
 
@@ -171,8 +173,8 @@ class MessageArchiveDB:
                        (platform, chat_id, thread_id, user_id, username,
                         message_id, ts_utc, msg_type, raw_text, extracted_text,
                         extractor, file_path, original_name, mime_type,
-                        metadata_json, project_id)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        metadata_json, doc_category, project_id)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     [
                         (
                             r.platform, r.chat_id, r.thread_id, r.user_id,
@@ -180,6 +182,7 @@ class MessageArchiveDB:
                             r.raw_text, r.extracted_text, r.extractor,
                             r.file_path, r.original_name, r.mime_type,
                             json.dumps(r.metadata, ensure_ascii=False),
+                            r.doc_category,
                             r.project_id,
                         )
                         for r in batch

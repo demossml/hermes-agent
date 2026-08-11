@@ -74,19 +74,28 @@ def build_hook_context(
 
 async def archive_message_context(context: Mapping[str, Any]) -> bool:
     """Archive using message-archiver handler or inline fallback."""
-    if not archive_enabled():
-        return False
     chat_id = str(context.get("chat_id") or "")
-    if not chat_should_archive(chat_id):
+    _enabled = archive_enabled()
+    _allowed = chat_should_archive(chat_id) if _enabled else False
+    logger.info(
+        "archive_bridge: archive_enabled=%s chat=%s allowed=%s msg_id=%s thread_id=%s",
+        _enabled, chat_id, _allowed,
+        context.get("message_id", ""), context.get("thread_id", ""),
+    )
+    if not _enabled:
+        return False
+    if not _allowed:
         return False
     try:
         from hooks.message_archiver.handler import handle as archiver_handle
         await archiver_handle("agent:start", dict(context))
+        logger.info("archive_bridge: archived via hook msg_id=%s", context.get("message_id", ""))
         return True
     except Exception:
         logger.debug("archive_bridge: hook handler import failed, trying inline", exc_info=True)
     try:
         await _inline_archive(dict(context))
+        logger.info("archive_bridge: archived inline msg_id=%s", context.get("message_id", ""))
         return True
     except Exception:
         logger.exception("archive_bridge: failed to archive message")
@@ -115,7 +124,12 @@ async def _inline_archive(context: dict) -> None:
         ts_utc=utc_now_iso(),
     )
     if not media_urls:
-        db.enqueue(ArchiveRecord(**base, msg_type="text", raw_text=raw_text))
+        record = ArchiveRecord(**base, msg_type="text", raw_text=raw_text)
+        db.enqueue(record)
+        logger.info(
+            "archive_bridge: enqueued msg_id=%s thread_id=%s msg_type=text",
+            base["message_id"], base["thread_id"],
+        )
         return
 
     multi = len(media_urls) > 1
@@ -147,6 +161,14 @@ async def _inline_archive(context: dict) -> None:
                 archived_path = str(dest)
         except Exception:
             logger.exception("archive_bridge: copy failed for %s", path)
+        doc_category = ""
+        try:
+            doc_category = extractors.categorize_document(
+                extracted or raw_text,
+                str(src.name),
+            )
+        except Exception:
+            pass
         db.enqueue(
             ArchiveRecord(
                 **item,
@@ -157,7 +179,12 @@ async def _inline_archive(context: dict) -> None:
                 file_path=archived_path,
                 original_name=src.name,
                 mime_type=str(mtype or ""),
+                doc_category=doc_category,
             )
+        )
+        logger.info(
+            "archive_bridge: enqueued msg_id=%s thread_id=%s msg_type=%s extractor=%s",
+            item["message_id"], item["thread_id"], msg_type, extractor,
         )
 
 

@@ -10,12 +10,21 @@ logger = logging.getLogger(__name__)
 def is_enabled() -> bool:
     """Check if message_archive is enabled in config."""
     try:
-        from hermes_cli.config import cfg_get, load_config
-        cfg = load_config()
-        archive = cfg.get("message_archive", {})
-        return bool(archive.get("enabled", False)) if isinstance(archive, dict) else False
+        cfg = _cfg()
+        return bool(cfg.get("enabled", False)) if isinstance(cfg, dict) else False
     except Exception:
         return False
+
+
+def _cfg() -> dict:
+    """Return message_archive config section (cached)."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        archive = cfg.get("message_archive", {})
+        return archive if isinstance(archive, dict) else {}
+    except Exception:
+        return {}
 
 
 def files_dir() -> str:
