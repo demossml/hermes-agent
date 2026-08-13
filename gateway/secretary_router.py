@@ -260,6 +260,35 @@ def set_active(telegram_user_id: str, profile_name: str) -> None:
     logger.info("Secretary router: user %s → profile %s", user_id, name)
 
 
+def unset_active_for_profile(profile_name: str) -> int:
+    """Clear the active pointer for every user pointing at ``profile_name``.
+
+    Called when a profile is deleted so stale routing pointers don't linger in
+    the state file. Deleting the entry (rather than rewriting it to "default")
+    leaves the user in the natural "no explicit preference → default" state.
+
+    Returns the number of users affected.
+    """
+    name = str(profile_name).strip()
+    count = 0
+    with _lock:
+        data = _load()
+        users = data.get("users", {})
+        for user_id, entry in list(users.items()):
+            if isinstance(entry, dict) and str(entry.get("active_profile", "")).strip() == name:
+                del users[user_id]
+                count += 1
+        if count:
+            _save(data)
+    if count:
+        logger.info(
+            "Secretary router: cleared active pointers for profile %s (%d user(s))",
+            name,
+            count,
+        )
+    return count
+
+
 def validate_profile(name: str) -> bool:
     """
     Validate a profile name for secretary routing.

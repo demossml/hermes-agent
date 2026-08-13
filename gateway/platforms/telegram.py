@@ -370,6 +370,28 @@ def _is_secretary_picker_trigger(text: str) -> bool:
     return False
 
 
+# ── Secretary profile create/delete lifecycle helpers ────────
+
+# Same rule as hermes_cli/profiles.py (_PROFILE_ID_RE): lowercase, digits,
+# hyphens, underscores; 1–64 chars; must start with alphanumeric.
+_SECRETARY_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def _normalize_secretary_slug(text: str) -> str:
+    """Normalize and validate a user-supplied secretary slug.
+
+    Strips whitespace, lowercases, and removes an optional ``secretary-``
+    prefix the user may have typed. Returns the bare slug (no ``secretary-``
+    prefix) if it matches the profile-id rule, otherwise ``""``.
+    """
+    slug = (text or "").strip().lower()
+    if slug.startswith("secretary-"):
+        slug = slug[len("secretary-"):]
+    if not _SECRETARY_SLUG_RE.match(slug):
+        return ""
+    return slug
+
+
 # ── Project picker NL trigger detection ───────────────────────
 
 _PROJECT_PICKER_RE = re.compile(
@@ -6143,7 +6165,6 @@ class TelegramAdapter(BasePlatformAdapter):
                             chat_type="group", message=text, full_message=text,
                             message_id=str(getattr(msg, "message_id", "") or ""),
                         )
-                        import asyncio
                         asyncio.create_task(archive_message_context(ctx))
                 except Exception: pass
             return
@@ -6177,6 +6198,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # ── Onboarding text intercept — step=name or tz_custom ──
         if text and await self._handle_onboarding_text(msg, text):
+            return
+
+        # ── Awaiting secretary name (create flow) intercept ──
+        if text and await self._handle_secretary_name_text(msg, text):
             return
 
         # ── Pending mail edit intercept ──
@@ -6411,34 +6436,80 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("Failed to send mode confirmation: %s", e)
 
-    async def _handle_secretary_picker_locally(self, msg) -> None:
-        """Send secretary profile picker InlineKeyboard — zero LLM cost."""
-        from gateway.secretary_router import list_secretaries, get_active
+    def _secretary_picker_view(self, active: str):
+        """Build the secretary switch picker (text, markup).
 
-        chat_id = str(msg.chat.id)
-        user_id = str(getattr(msg.from_user, "id", ""))
-        active = get_active(user_id)
+        Shows the profile row (default + secretary-*) with a ✓ on the active
+        profile, plus a bottom action row [➕ Создать] / [🗑 Удалить].  When no
+        secretary-* profiles exist yet, shows a single "create first" button.
+        """
+        from gateway.secretary_router import list_secretaries
 
-        secretaries = list_secretaries()
-        if not secretaries:
-            await self._send_local_with_topic(
-                msg,
-                chat_id=int(chat_id),
-                text="Нет профилей secretary-*. Создайте через `hermes profile create secretary-<name>`.",
-                reply_to_message_id=msg.message_id,
+        all_secretaries = list_secretaries()
+        named = [n for n in all_secretaries if n != "default"]
+
+        if not named:
+            return (
+                "Нет профилей secretary-*. Создайте первого.",
+                InlineKeyboardMarkup([[
+                    InlineKeyboardButton("➕ Создать первого секретаря", callback_data="sec:create"),
+                ]]),
             )
-            return
 
         keyboard = []
-        for name in secretaries:
+        for name in all_secretaries:
             label = f"{name} ✓" if name == active else name
             # Truncate to fit callback_data (64 bytes max)
             cb_data = f"sec:{name}"[:64]
             keyboard.append([InlineKeyboardButton(label, callback_data=cb_data)])
 
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        text = f"Выберите секретаря. Сейчас: {active}"
+        keyboard.append([
+            InlineKeyboardButton("➕ Создать", callback_data="sec:create"),
+            InlineKeyboardButton("🗑 Удалить", callback_data="sec:delete"),
+        ])
 
+        text = f"Выберите секретаря. Сейчас: {active}"
+        return text, InlineKeyboardMarkup(keyboard)
+
+    def _secretary_delete_view(self, active: str):
+        """Build the delete-target picker (text, markup).
+
+        Lists only secretary-* profiles (no ``default``/control home), marks the
+        active one, and appends an [↩ Отмена] button.
+        """
+        from gateway.secretary_router import list_secretaries
+
+        named = [n for n in list_secretaries() if n != "default"]
+
+        if not named:
+            return (
+                "Нет секретарей для удаления.",
+                InlineKeyboardMarkup([[
+                    InlineKeyboardButton("↩ Отмена", callback_data="sec:cancel"),
+                ]]),
+            )
+
+        keyboard = []
+        for name in named:
+            label = f"{name} (активен)" if name == active else name
+            cb_data = f"sec:del:{name}"[:64]
+            keyboard.append([InlineKeyboardButton(label, callback_data=cb_data)])
+
+        keyboard.append([
+            InlineKeyboardButton("↩ Отмена", callback_data="sec:cancel"),
+        ])
+
+        return "Выберите секретаря для удаления.", InlineKeyboardMarkup(keyboard)
+
+    async def _handle_secretary_picker_locally(self, msg) -> None:
+        """Send secretary profile picker InlineKeyboard — zero LLM cost."""
+        from gateway.secretary_router import get_active
+
+        chat_id = str(msg.chat.id)
+        user_id = str(getattr(msg.from_user, "id", ""))
+        active = get_active(user_id)
+
+        text, reply_markup = self._secretary_picker_view(active)
         await self._send_local_with_topic(
             msg,
             chat_id=int(chat_id),
@@ -6450,21 +6521,42 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _handle_sec_callback(
         self, query, data: str, chat_id, thread_id, user_name
     ) -> None:
-        """Handle sec:<profile_name> callback — switch active secretary."""
-        name = data.split(":", 1)[1] if ":" in data else ""
-        if not name:
-            await query.answer(text="Invalid secretary name.")
-            return
+        """Handle sec:* callbacks — switch / create / delete secretary profiles."""
+        remainder = data.split(":", 1)[1] if ":" in data else ""
 
         caller_id = str(getattr(query.from_user, "id", ""))
+        chat_type = str(getattr(getattr(query.message, "chat", None), "type", "") or "")
         if not self._is_callback_user_authorized(
             caller_id,
             chat_id=chat_id,
-            chat_type=str(getattr(getattr(query.message, "chat", None), "type", "")),
+            chat_type=chat_type,
             thread_id=str(thread_id) if thread_id is not None else None,
             user_name=user_name,
         ):
-            await query.answer(text="⛔ You are not authorized to switch secretaries.")
+            await query.answer(text="⛔ You are not authorized to manage secretaries.")
+            return
+
+        # ── Action callbacks (create / delete / cancel) ──
+        if remainder == "create":
+            await self._sec_create_flow(query, caller_id, chat_type)
+            return
+        if remainder == "delete":
+            await self._sec_delete_picker(query, caller_id)
+            return
+        if remainder == "cancel":
+            await self._sec_cancel(query, caller_id)
+            return
+        if remainder.startswith("del:"):
+            await self._sec_del_confirm(query, caller_id, remainder.split(":", 1)[1])
+            return
+        if remainder.startswith("confirm_del:"):
+            await self._sec_confirm_delete(query, caller_id, remainder.split(":", 1)[1])
+            return
+
+        # ── Switch (existing behavior) ──
+        name = remainder
+        if not name:
+            await query.answer(text="Invalid secretary name.")
             return
 
         from gateway.secretary_router import validate_profile, set_active, get_active
@@ -6486,21 +6578,9 @@ class TelegramAdapter(BasePlatformAdapter):
 
         await query.answer(text=f"✅ {name}")
 
-        # Rebuild keyboard with new active
-        from gateway.secretary_router import list_secretaries
-        secretaries = list_secretaries()
-        keyboard = []
-        for sname in secretaries:
-            label = f"{sname} ✓" if sname == name else sname
-            cb_data = f"sec:{sname}"[:64]
-            keyboard.append([InlineKeyboardButton(label, callback_data=cb_data)])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
+        text, reply_markup = self._secretary_picker_view(name)
         try:
-            await query.edit_message_text(
-                text=f"Выберите секретаря. Сейчас: {name}",
-                reply_markup=reply_markup,
-            )
+            await query.edit_message_text(text=text, reply_markup=reply_markup)
         except Exception as e:
             logger.debug("Failed to edit secretary picker: %s", e)
 
@@ -6516,6 +6596,244 @@ class TelegramAdapter(BasePlatformAdapter):
             )
         except Exception as e:
             logger.warning("Failed to send secretary confirmation: %s", e)
+
+    # ── Secretary create / delete lifecycle ───────────────────
+
+    async def _sec_create_flow(self, query, caller_id: str, chat_type: str) -> None:
+        """Start secretary-profile creation — prompt for a slug.
+
+        Preferred in a private chat only; in groups, alert and bail out.
+        Sets ``awaiting_secretary_name`` in prefs so the next text message is
+        intercepted as the slug (see :meth:`_handle_secretary_name_text`).
+        """
+        normalized_chat_type = str(chat_type or "").strip().lower()
+        if normalized_chat_type not in ("", "private"):
+            await query.answer(
+                text="⚠️ Создавайте секретаря в личном чате с ботом.",
+                show_alert=True,
+            )
+            return
+
+        from gateway.secretary_user_store import set_pref
+        # Clear any other transient awaiting flags, then arm the create flag.
+        set_pref(caller_id, "awaiting_secretary_name", True)
+
+        logger.info("Secretary create: user=%s action=create:prompt", caller_id)
+
+        text = (
+            "Введите slug латиницей (например: ceh, hr, logist).\n"
+            "Будет создан профиль secretary-<slug>."
+        )
+        reply_markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("↩ Отмена", callback_data="sec:cancel"),
+        ]])
+        try:
+            await query.edit_message_text(text=text, reply_markup=reply_markup)
+        except Exception as e:
+            logger.debug("Failed to edit to secretary create prompt: %s", e)
+        await query.answer()
+
+    async def _sec_delete_picker(self, query, caller_id: str) -> None:
+        """Show the delete-target picker."""
+        from gateway.secretary_router import get_active
+
+        active = get_active(caller_id)
+        text, reply_markup = self._secretary_delete_view(active)
+        try:
+            await query.edit_message_text(text=text, reply_markup=reply_markup)
+        except Exception as e:
+            logger.debug("Failed to edit to secretary delete picker: %s", e)
+        await query.answer()
+
+    async def _sec_del_confirm(self, query, caller_id: str, name: str) -> None:
+        """Request confirmation before deleting a secretary profile."""
+        from gateway.secretary_router import get_active, validate_profile
+
+        name = (name or "").strip()
+        if not name:
+            await query.answer(text="Invalid secretary name.")
+            return
+        if name == "default":
+            await query.answer(text="Нельзя удалить default.", show_alert=True)
+            return
+        if not validate_profile(name):
+            await query.answer(text=f"Неизвестный секретарь: {name}")
+            return
+        if name == get_active(caller_id):
+            await query.answer(
+                text="Нельзя удалить активного секретаря. Сначала переключитесь на другого.",
+                show_alert=True,
+            )
+            return
+
+        text = (
+            f"Удалить {name}?\n"
+            "Memory, sessions, skills, config профиля будут удалены. Необратимо."
+        )
+        reply_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Да, удалить", callback_data=f"sec:confirm_del:{name}"[:64])],
+            [InlineKeyboardButton("❌ Отмена", callback_data="sec:cancel")],
+        ])
+        try:
+            await query.edit_message_text(text=text, reply_markup=reply_markup)
+        except Exception as e:
+            logger.debug("Failed to edit to secretary delete confirm: %s", e)
+        await query.answer()
+
+    async def _sec_confirm_delete(self, query, caller_id: str, name: str) -> None:
+        """Execute secretary-profile deletion."""
+        from gateway.secretary_router import (
+            get_active,
+            validate_profile,
+            unset_active_for_profile,
+        )
+
+        name = (name or "").strip()
+        if not name:
+            await query.answer(text="Invalid secretary name.")
+            return
+        if name == "default":
+            await query.answer(text="Нельзя удалить default.", show_alert=True)
+            return
+        if not validate_profile(name):
+            await query.answer(text=f"Неизвестный секретарь: {name}")
+            return
+        if name == get_active(caller_id):
+            await query.answer(
+                text="Нельзя удалить активного секретаря. Сначала переключитесь на другого.",
+                show_alert=True,
+            )
+            return
+
+        from hermes_cli.profiles import delete_profile
+        try:
+            delete_profile(name, yes=True)
+        except FileNotFoundError:
+            await query.answer(text=f"{name} уже удалён.")
+        except ValueError as e:
+            await query.answer(text=str(e), show_alert=True)
+            return
+        except Exception as e:
+            logger.error("Failed to delete secretary profile %s: %s", name, e)
+            await query.answer(text=f"Ошибка удаления: {e}", show_alert=True)
+            return
+
+        # Clear stale active pointers for this profile across all users.
+        unset_active_for_profile(name)
+        logger.info("Secretary delete: user=%s action=delete profile=%s", caller_id, name)
+
+        await query.answer(text=f"🗑 {name} удалён")
+
+        from gateway.secretary_router import get_active as _get_active
+        active = _get_active(caller_id)
+        text, reply_markup = self._secretary_picker_view(active)
+        try:
+            await query.edit_message_text(text=text, reply_markup=reply_markup)
+        except Exception as e:
+            logger.debug("Failed to edit picker after delete: %s", e)
+
+    async def _sec_cancel(self, query, caller_id: str) -> None:
+        """Reset transient create/delete state and return to the picker."""
+        from gateway.secretary_user_store import set_pref
+        from gateway.secretary_router import get_active
+
+        set_pref(caller_id, "awaiting_secretary_name", None)
+
+        active = get_active(caller_id)
+        text, reply_markup = self._secretary_picker_view(active)
+        try:
+            await query.edit_message_text(text=text, reply_markup=reply_markup)
+        except Exception as e:
+            logger.debug("Failed to edit back to picker on cancel: %s", e)
+        await query.answer()
+
+    async def _handle_secretary_name_text(self, msg, text: str) -> bool:
+        """Intercept slug input during secretary-create flow (no LLM).
+
+        Returns True if consumed (handled), False to continue to normal
+        agent processing.
+        """
+        user_id = str(getattr(msg.from_user, "id", ""))
+        if not user_id:
+            return False
+
+        from gateway.secretary_user_store import get_pref, set_pref
+
+        if not get_pref(user_id, "awaiting_secretary_name"):
+            return False
+
+        # Commands pass through to the normal command handler.
+        if text.startswith("/"):
+            return False
+
+        slug = _normalize_secretary_slug(text)
+        if not slug:
+            try:
+                await self._bot.send_message(
+                    chat_id=int(msg.chat.id),
+                    text="⚠️ Неверный slug. Латиница, цифры, дефис/подчёркивание (например: ceh, hr, logist).",
+                    reply_to_message_id=msg.message_id,
+                    **self._link_preview_kwargs(),
+                )
+            except Exception:
+                pass
+            return True  # consumed — keep awaiting, let user retry
+
+        full = f"secretary-{slug}"
+
+        from gateway.secretary_router import validate_profile
+        if validate_profile(full):
+            try:
+                await self._bot.send_message(
+                    chat_id=int(msg.chat.id),
+                    text=f"⚠️ Профиль {full} уже существует.",
+                    reply_to_message_id=msg.message_id,
+                    **self._link_preview_kwargs(),
+                )
+            except Exception:
+                pass
+            return True  # consumed — do NOT reset state, let user retry
+
+        from hermes_cli.profiles import create_profile
+        try:
+            create_profile(full, no_skills=True)
+        except Exception as e:
+            set_pref(user_id, "awaiting_secretary_name", None)
+            try:
+                await self._bot.send_message(
+                    chat_id=int(msg.chat.id),
+                    text=f"⚠️ Не удалось создать профиль: {e}",
+                    reply_to_message_id=msg.message_id,
+                    **self._link_preview_kwargs(),
+                )
+            except Exception:
+                pass
+            return True
+
+        # Reset awaiting state and (optionally) switch to the new profile.
+        set_pref(user_id, "awaiting_secretary_name", None)
+
+        from gateway.secretary_router import set_active
+        try:
+            set_active(user_id, full)
+        except ValueError:
+            pass
+
+        logger.info("Secretary create: user=%s action=create profile=%s", user_id, full)
+
+        try:
+            await self._bot.send_message(
+                chat_id=int(msg.chat.id),
+                text=f"✅ Создан {full}\nАктивен: {full}",
+                reply_to_message_id=msg.message_id,
+                **self._link_preview_kwargs(),
+            )
+        except Exception:
+            pass
+
+        # Show the updated picker (now includes the new profile + actions).
+        await self._handle_secretary_picker_locally(msg)
+        return True
 
     async def _handle_project_picker_locally(self, msg) -> None:
         """Send project picker InlineKeyboard — zero LLM cost."""
@@ -6751,7 +7069,6 @@ class TelegramAdapter(BasePlatformAdapter):
                             chat_type="group", message=text, full_message=text,
                             message_id=str(getattr(msg, "message_id", "") or ""),
                         )
-                        import asyncio
                         asyncio.create_task(archive_message_context(ctx))
                 except Exception: pass
             return
@@ -6964,7 +7281,6 @@ class TelegramAdapter(BasePlatformAdapter):
                             media_types=list(getattr(_event, "media_types", None) or []),
                             telegram_file_ids=list(getattr(_event, "telegram_file_ids", None) or []),
                         )
-                        import asyncio
                         asyncio.create_task(archive_message_context(ctx))
                 except Exception: pass
             return

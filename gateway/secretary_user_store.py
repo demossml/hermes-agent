@@ -253,6 +253,37 @@ def set_onboarding_step(telegram_id: str, step: Optional[str]) -> None:
     upsert_user(telegram_id, onboarding_step=step)
 
 
+def get_pref(telegram_id: str, key: str, default: Any = None) -> Any:
+    """Read a single key from the user's prefs_json blob.
+
+    Returns ``default`` if the user doesn't exist or the key is absent.
+    """
+    user = get_user(telegram_id)
+    if not user:
+        return default
+    return (user.get("prefs") or {}).get(key, default)
+
+
+def set_pref(telegram_id: str, key: str, value: Any) -> dict[str, Any]:
+    """Set (or clear, if ``value is None``) a single prefs_json key.
+
+    Returns the updated prefs dict. Creates the user record if absent.
+    """
+    user = get_user(telegram_id) or {}
+    prefs = dict(user.get("prefs") or {})
+    if value is None:
+        prefs.pop(key, None)
+    else:
+        prefs[key] = value
+    upsert_user(telegram_id, prefs_json=prefs)
+    return prefs
+
+
+def clear_pref(telegram_id: str, key: str) -> dict[str, Any]:
+    """Convenience wrapper — delete a prefs key. Returns updated prefs."""
+    return set_pref(telegram_id, key, None)
+
+
 def get_digest_users() -> list[dict[str, Any]]:
     """Return all onboarded users with digest_enabled=1."""
     with _lock:
