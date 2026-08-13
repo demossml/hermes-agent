@@ -6209,6 +6209,10 @@ class TelegramAdapter(BasePlatformAdapter):
         if text and await self._handle_secretary_name_text(msg, text):
             return
 
+        # ── Awaiting skill setup value (wizard) intercept ──
+        if text and await self._handle_skill_setup_text(msg, text):
+            return
+
         # ── Pending mail edit intercept ──
         if text and await self._handle_pending_mail_edit(msg, text):
             return
@@ -8744,7 +8748,7 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _handle_skill_callback(
         self, query, data: str, chat_id, thread_id, user_name
     ) -> None:
-        """Handle skill:on:<id> | skill:off:<id> | skill:setup:<id>."""
+        """Handle skill:* callbacks — toggle + per-skill setup wizard."""
         parts = data.split(":")
         verb = parts[1] if len(parts) >= 2 else ""
         skill_id = parts[2] if len(parts) >= 3 else ""
@@ -8763,54 +8767,268 @@ class TelegramAdapter(BasePlatformAdapter):
         from gateway.secretary_router import get_active_profile_path
         from gateway.secretary_skills_registry import (
             STATUS_NEEDS_SETUP,
-            STATUS_READY,
             apply_toggle,
+            get_manifest,
             get_skill,
         )
         from gateway.secretary_skills_store import set_skill
+        from gateway.secretary_user_store import get_pref, set_pref
 
-        skill = get_skill(skill_id)
+        skill = get_skill(skill_id) if skill_id else None
+        profile_home = get_active_profile_path(caller_id)
+
+        # ── wizard actions that don't need a known skill id ──
+        if verb == "cancel":
+            await self._setup_cancel(query, caller_id)
+            return
+
+        if verb in ("choice", "keep", "replace"):
+            await self._setup_field_action(query, caller_id, verb, skill_id, parts[3] if len(parts) >= 4 else "")
+            return
+
         if skill is None:
             await query.answer(text="Неизвестное умение.")
             return
 
+        # ── validate (L4 stub) ──
+        if verb == "validate":
+            await query.answer(text=f"Проверка «{skill.title}» появится в L4.", show_alert=True)
+            return
+
+        # ── off ──
+        if verb == "off":
+            entry = apply_toggle(skill_id, False)
+            set_skill(profile_home, skill_id, bool(entry["enabled"]), str(entry["status"]))
+            # If a wizard for this skill is armed, drop it.
+            state = get_pref(caller_id, "awaiting_skill_setup")
+            if isinstance(state, dict) and state.get("skill_id") == skill_id:
+                set_pref(caller_id, "awaiting_skill_setup", None)
+            await query.answer(text=f"{skill.title}: выключено")
+            await self._edit_skills_screen(query, caller_id)
+            return
+
+        # ── on ──
+        if verb == "on":
+            entry = apply_toggle(skill_id, True)
+            set_skill(profile_home, skill_id, bool(entry["enabled"]), str(entry["status"]))
+            if entry["status"] == STATUS_NEEDS_SETUP:
+                # Open the wizard (or skip to done if the skill has no fields).
+                await query.answer(text=f"{skill.title}: настройка")
+                await self._edit_setup_or_done(query, caller_id, skill, profile_home)
+            else:
+                await query.answer(text=f"{skill.title}: включено ✅")
+                await self._edit_skills_screen(query, caller_id)
+            return
+
+        # ── setup (restart wizard) ──
+        if verb == "setup":
+            set_skill(profile_home, skill_id, True, STATUS_NEEDS_SETUP)
+            await query.answer()
+            await self._edit_setup_or_done(query, caller_id, skill, profile_home)
+            return
+
+        await query.answer(text="Неизвестное действие.")
+        return
+
+    # ── Setup wizard helpers ──────────────────────────────────
+
+    def _setup_step_view(self, state: dict, profile_home) -> tuple:
+        """Render the current wizard step as (text, InlineKeyboardMarkup)."""
+        from gateway.secretary_skills_registry import get_manifest, get_skill
+        from gateway.secretary_skills_store import read_env_value
+
+        manifest = get_manifest(state.get("skill_id", ""))
+        skill = get_skill(state.get("skill_id", ""))
+        idx = int(state.get("field_index", 0))
+        await_text = bool(state.get("await_text", False))
+        total = len(manifest)
+        header = f"🔧 Настройка: {skill.title} ({idx + 1}/{total})" if skill else "🔧 Настройка"
+        cancel_row = [InlineKeyboardButton("↩ Отмена", callback_data="skill:cancel")]
+
+        field = manifest[idx]
+
+        # Free-text mode (after "other" on a choice field, or "replace" on secret).
+        if not await_text:
+            if field.type == "choice":
+                rows = [[InlineKeyboardButton(c, callback_data=f"skill:choice:{skill.id}:{c}")] for c in field.choices]
+                rows.append(cancel_row)
+                return f"{header}\n{field.label}?", InlineKeyboardMarkup(rows)
+            if field.secret and read_env_value(profile_home, field.key):
+                rows = [[
+                    InlineKeyboardButton("Оставить", callback_data=f"skill:keep:{skill.id}"),
+                    InlineKeyboardButton("Заменить", callback_data=f"skill:replace:{skill.id}"),
+                ], cancel_row]
+                return f"{header}\n{field.label} — уже задано.", InlineKeyboardMarkup(rows)
+
+        text = f"{header}\nВведите {field.label.lower()}:"
+        if field.help:
+            text += f"\n{field.help}"
+        return text, InlineKeyboardMarkup([cancel_row])
+
+    def _setup_done_view(self, skill) -> tuple:
+        text = f"✅ {skill.title}: значения сохранены.\nОсталось проверить (L4)."
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔍 Проверить", callback_data=f"skill:validate:{skill.id}"),
+            InlineKeyboardButton("⬅️ Меню", callback_data="menu:home"),
+        ]])
+        return text, markup
+
+    def _setup_finish(self, caller_id: str, state: dict, profile_home) -> tuple:
+        """Write draft values to profile .env, clear awaiting, return done view."""
+        from gateway.secretary_skills_registry import get_skill
+        from gateway.secretary_skills_store import write_env_value
+        from gateway.secretary_user_store import set_pref
+
+        for key, value in state.get("draft", {}).items():
+            if value is not None:
+                write_env_value(profile_home, key, str(value))
+        set_pref(caller_id, "awaiting_skill_setup", None)
+        skill = get_skill(state.get("skill_id", ""))
+        return self._setup_done_view(skill)
+
+    async def _edit_setup_or_done(self, query, caller_id: str, skill, profile_home) -> None:
+        """Arm the wizard for a skill and edit the message to its first step (or done)."""
+        from gateway.secretary_skills_registry import get_manifest
+        from gateway.secretary_user_store import set_pref
+
+        manifest = get_manifest(skill.id)
+        if not manifest:
+            # No fields to configure (e.g. vision) — L4 validates the binary.
+            text, markup = self._setup_done_view(skill)
+        else:
+            state = {"skill_id": skill.id, "field_index": 0, "draft": {}, "await_text": False}
+            set_pref(caller_id, "awaiting_skill_setup", state)
+            text, markup = self._setup_step_view(state, profile_home)
+        try:
+            await query.edit_message_text(text=text, reply_markup=markup)
+        except Exception as e:
+            logger.debug("Failed to edit to setup step: %s", e)
+
+    async def _setup_cancel(self, query, caller_id: str) -> None:
+        """Cancel the wizard — disable the skill, clear awaiting, back to skills."""
+        from gateway.secretary_router import get_active_profile_path
+        from gateway.secretary_skills_store import set_skill
+        from gateway.secretary_user_store import get_pref, set_pref
+
+        state = get_pref(caller_id, "awaiting_skill_setup")
+        if isinstance(state, dict):
+            profile_home = get_active_profile_path(caller_id)
+            set_skill(profile_home, state.get("skill_id", ""), False, "off")
+        set_pref(caller_id, "awaiting_skill_setup", None)
+        await query.answer(text="Настройка отменена.")
+        await self._edit_skills_screen(query, caller_id)
+
+    async def _setup_field_action(self, query, caller_id: str, verb: str, skill_id: str, choice: str) -> None:
+        """Handle skill:choice / skill:keep / skill:replace inside the wizard."""
+        from gateway.secretary_router import get_active_profile_path
+        from gateway.secretary_skills_registry import get_manifest, get_skill
+        from gateway.secretary_user_store import get_pref, set_pref
+
+        state = get_pref(caller_id, "awaiting_skill_setup")
+        if not isinstance(state, dict) or state.get("skill_id") != skill_id:
+            await query.answer(text="Нет активной настройки.")
+            return
+
+        manifest = get_manifest(skill_id)
+        skill = get_skill(skill_id)
+        idx = int(state.get("field_index", 0))
+        if idx >= len(manifest):
+            await query.answer(text="Настройка уже завершена.")
+            return
+        field = manifest[idx]
         profile_home = get_active_profile_path(caller_id)
 
-        if verb == "setup":
-            # L2 stub — the per-skill setup wizard arrives in L3.
-            await query.answer(
-                text=f"Мастер настройки «{skill.title}» появится в L3.",
-                show_alert=True,
-            )
-            return
-
-        if verb in ("on", "off"):
-            entry = apply_toggle(skill_id, on=(verb == "on"))
-            if entry is None:
-                await query.answer(text="Неизвестное умение.")
-                return
-            set_skill(profile_home, skill_id, bool(entry["enabled"]), str(entry["status"]))
-
-            if verb == "on":
-                if entry["status"] == STATUS_NEEDS_SETUP:
-                    await query.answer(
-                        text=f"{skill.title}: включено, нужна настройка (L3).",
-                        show_alert=True,
-                    )
-                else:
-                    await query.answer(text=f"{skill.title}: включено ✅")
+        if verb == "choice":
+            if choice in field.choice_map:
+                state["draft"][field.key] = field.choice_map[choice]
+                state["field_index"] = idx + 1
+                state["await_text"] = False
             else:
-                await query.answer(text=f"{skill.title}: выключено")
-        else:
-            await query.answer(text="Неизвестное действие.")
-            return
+                # "other" — ask for the custom value as free text.
+                state["await_text"] = True
+        elif verb == "keep":
+            state["field_index"] = idx + 1
+            state["await_text"] = False
+        elif verb == "replace":
+            state["await_text"] = True
 
-        # Re-render the skills screen in place.
+        set_pref(caller_id, "awaiting_skill_setup", state)
+        await query.answer()
+
+        if state["field_index"] >= len(manifest):
+            text, markup = self._setup_finish(caller_id, state, profile_home)
+        else:
+            text, markup = self._setup_step_view(state, profile_home)
+        try:
+            await query.edit_message_text(text=text, reply_markup=markup)
+        except Exception as e:
+            logger.debug("Failed to edit setup step: %s", e)
+
+    async def _edit_skills_screen(self, query, caller_id: str) -> None:
         text, reply_markup = self._skill_view(caller_id)
         try:
             await query.edit_message_text(text=text, reply_markup=reply_markup)
         except Exception as e:
             logger.debug("Failed to edit skills screen: %s", e)
+
+    async def _handle_skill_setup_text(self, msg, text: str) -> bool:
+        """Intercept text input during a skill setup wizard (no LLM).
+
+        Returns True if consumed, False to continue to normal agent processing.
+        """
+        user_id = str(getattr(msg.from_user, "id", ""))
+        if not user_id:
+            return False
+
+        from gateway.secretary_router import get_active_profile_path
+        from gateway.secretary_skills_registry import get_manifest
+        from gateway.secretary_user_store import get_pref, set_pref
+
+        state = get_pref(user_id, "awaiting_skill_setup")
+        if not isinstance(state, dict):
+            return False
+
+        # Commands pass through.
+        if text.startswith("/"):
+            return False
+
+        manifest = get_manifest(state.get("skill_id", ""))
+        idx = int(state.get("field_index", 0))
+        if idx >= len(manifest):
+            set_pref(user_id, "awaiting_skill_setup", None)
+            return False
+        field = manifest[idx]
+        value = text.strip()
+
+        if field.secret:
+            logger.info("Secretary setup: received secret for %s (value hidden)", field.key)
+        else:
+            logger.info("Secretary setup: field %s = %r", field.key, value)
+
+        state["draft"][field.key] = value
+        state["field_index"] = idx + 1
+        state["await_text"] = False
+        set_pref(user_id, "awaiting_skill_setup", state)
+
+        profile_home = get_active_profile_path(user_id)
+        chat_id = int(msg.chat.id)
+
+        if state["field_index"] >= len(manifest):
+            text, markup = self._setup_finish(user_id, state, profile_home)
+        else:
+            text, markup = self._setup_step_view(state, profile_home)
+
+        try:
+            await self._bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=markup,
+                reply_to_message_id=msg.message_id,
+                **self._link_preview_kwargs(),
+            )
+        except Exception as e:
+            logger.warning("Failed to send setup step: %s", e)
+        return True
 
     # ═══════════════════════════════════════════════════════════
     # Mail Inbox (menu:mail)

@@ -143,3 +143,47 @@ profile HERMES_HOME** (не в control db):
 
 Тесты: `tests/test_secretary_skills.py` (registry, store, экран, callbacks).
 
+## Мастер настройки (L3)
+
+При `skill:on:<id>` (или `skill:setup:<id>`) для `requires_setup`-умения открывается
+пошаговый мастер, пишущий значения в `.env` активного профиля.
+
+### Манифесты
+
+`gateway/secretary_skills_registry.py` — `SecretaryField` + `MANIFESTS`:
+
+| skill | поля |
+|-------|------|
+| mail | `SECRETARY_MAIL_EMAIL` (text), `SECRETARY_MAIL_PASSWORD` (password/secret), `SECRETARY_MAIL_IMAP_HOST` (choice gmail/mailru/yandex/other → hostname) |
+| calendar | `SECRETARY_CAL_ICS_URL` (url) |
+| tgcli | `TG_API_ID` (text), `TG_API_HASH` (password/secret) |
+| vision / groups / tasks | нет полей (валидация в L4) |
+
+`SecretaryField`: `key`, `label`, `type` (text/password/choice/url), `secret`,
+`help`, `optional`, `choices`, `choice_map` (label → env value; «other» → свободный ввод).
+
+### Поток
+
+- `skill:on` + `requires_setup` → `needs_setup` + старт мастера.
+- prefs `awaiting_skill_setup = {skill_id, field_index, draft, await_text}`.
+- Шаг выбора (`choice`) → inline-кнопки; «other» → свободный ввод хоста.
+- Секрет уже в `.env` → «уже задано» [Оставить] / [Заменить].
+- Текстовый перехват `_handle_skill_setup_text` (до LLM): значение → draft,
+  пароль в лог не пишется (`value hidden`).
+- Финал → `write_env_value` в `~/.hermes/profiles/<name>/.env` (0600),
+  clear awaiting, статус остаётся `needs_setup` до L4, кнопка [🔍 Проверить].
+- `skill:cancel` → `enabled=false, status=off`, clear awaiting.
+
+### Callbacks
+
+`skill:on/off/setup/validate/cancel`, `skill:choice:<id>:<choice>`,
+`skill:keep:<id>`, `skill:replace:<id>`.
+
+### Storage env
+
+`gateway/secretary_skills_store.py`: `write_env_value(profile_home, key, value)`
+(атомарно, 0600, с квотингом спецсимволов), `read_env_value(profile_home, key)`.
+
+Тесты: `tests/test_secretary_skills_setup.py` (манифесты, env write/read, шаги,
+choice/keep/replace, cancel, text intercept, routing).
+

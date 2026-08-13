@@ -9,7 +9,7 @@ HERMES_HOME — see :mod:`gateway.secretary_skills_store`.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 # Valid per-skill status values.
@@ -29,6 +29,29 @@ class SecretarySkill:
     requires_setup: bool = False
 
 
+@dataclass(frozen=True)
+class SecretaryField:
+    """One setup field in a skill manifest.
+
+    ``key`` is the env var name the wizard writes to the profile's ``.env``.
+    ``type`` is one of ``text | password | choice | url``. For ``choice``,
+    ``choices`` lists the button labels and ``choice_map`` maps each label to
+    the value actually written (a label absent from ``choice_map`` — e.g.
+    "other" — triggers a free-text prompt for the custom value).
+    """
+    key: str
+    label: str
+    type: str = "text"
+    secret: bool = False
+    help: str = ""
+    optional: bool = False
+    choices: tuple[str, ...] = ()
+    choice_map: dict[str, str] = field(default_factory=dict)
+
+    # Convenience type set.
+    VALID_TYPES = frozenset({"text", "password", "choice", "url"})
+
+
 SKILLS: tuple[SecretarySkill, ...] = (
     SecretarySkill("mail", "Почта", "📧", default_enabled=True, requires_setup=True),
     SecretarySkill("calendar", "Календарь", "📅", default_enabled=False, requires_setup=True),
@@ -40,10 +63,60 @@ SKILLS: tuple[SecretarySkill, ...] = (
 
 SKILL_BY_ID: dict[str, SecretarySkill] = {s.id: s for s in SKILLS}
 
+# ── Setup manifests ──────────────────────────────────────────
+
+MANIFESTS: dict[str, tuple[SecretaryField, ...]] = {
+    "mail": (
+        SecretaryField(
+            "SECRETARY_MAIL_EMAIL", "Email",
+            type="text", help="Логин (адрес почты)",
+        ),
+        SecretaryField(
+            "SECRETARY_MAIL_PASSWORD", "Пароль приложения",
+            type="password", secret=True, help="App password, не основной пароль",
+        ),
+        SecretaryField(
+            "SECRETARY_MAIL_IMAP_HOST", "Почтовый провайдер",
+            type="choice",
+            choices=("gmail", "mailru", "yandex", "other"),
+            choice_map={
+                "gmail": "imap.gmail.com",
+                "mailru": "imap.mail.ru",
+                "yandex": "imap.yandex.ru",
+            },
+            help="Выберите провайдера или «other» для своего хоста",
+        ),
+    ),
+    "calendar": (
+        SecretaryField(
+            "SECRETARY_CAL_ICS_URL", "ICS URL",
+            type="url", help="Ссылка на .ics-календарь",
+        ),
+    ),
+    "tgcli": (
+        SecretaryField(
+            "TG_API_ID", "API ID",
+            type="text", help="my.telegram.org → API ID",
+        ),
+        SecretaryField(
+            "TG_API_HASH", "API Hash",
+            type="password", secret=True, help="my.telegram.org → API Hash",
+        ),
+    ),
+    "vision": (),
+    "groups": (),
+    "tasks": (),
+}
+
 
 def get_skill(skill_id: str) -> Optional[SecretarySkill]:
     """Return the skill for ``skill_id``, or None if unknown."""
     return SKILL_BY_ID.get((skill_id or "").strip())
+
+
+def get_manifest(skill_id: str) -> tuple[SecretaryField, ...]:
+    """Return the setup manifest (tuple of fields) for a skill, or ()."""
+    return MANIFESTS.get((skill_id or "").strip(), ())
 
 
 def _initial_status(skill: SecretarySkill) -> str:

@@ -250,13 +250,19 @@ class TestSkillCallback:
         assert "выключено" in query.answer.call_args.kwargs.get("text", "")
 
     @pytest.mark.asyncio
-    async def test_setup_stub(self):
+    async def test_setup_starts_wizard(self):
         adapter = _make_adapter()
         query = _make_query()
-        await adapter._handle_skill_callback(query, "skill:setup:mail", "456", None, "Test")
-        # L2 stub — shows "L3" and does NOT edit the screen
-        assert "L3" in query.answer.call_args.kwargs.get("text", "")
-        query.edit_message_text.assert_not_awaited()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("gateway.secretary_router.get_active_profile_path", return_value=Path(tmp)), \
+                 patch("gateway.secretary_user_store.set_pref") as set_pref:
+                await adapter._handle_skill_callback(query, "skill:setup:mail", "456", None, "Test")
+        # L3: setup arms the wizard and edits to its first step
+        set_pref.assert_called_once_with(
+            "123", "awaiting_skill_setup",
+            {"skill_id": "mail", "field_index": 0, "draft": {}, "await_text": False},
+        )
+        query.edit_message_text.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_unknown_skill(self):
