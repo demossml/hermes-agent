@@ -234,3 +234,30 @@ Silence не ломается: отчёт — только по явной кн�
 Тесты: `tests/test_secretary_groups.py` (view, watch/unwatch, report,
 resolve name, callback routing).
 
+## Задания + расписание (L6)
+
+Экран `/меню → [✅ Задачи] menu:tasks`.
+
+### Модель
+
+`tools/secretary/tasks.py` — SQLite `{HERMES_HOME}/secretary_tasks.db`
+(переезжает за профилем через HERMES_HOME override). Колонки L6:
+`due_at`, `recurrence`, `next_run` (миграция `_migrate` добавляет их в старую БД).
+
+API: `add_task(telegram_id, text, due_at)`, `add_schedule_task(..., recurrence)`,
+`list_tasks` (разовые), `list_schedule` (повторяющиеся),
+`advance_schedule`, `remove_schedule`, `mark_done`.
+
+### UI
+
+- «Сейчас» — разовые задачи с дедлайном; [✅] done.
+- [📅 Расписание] `task:schedule` — повторяющиеся (`daily/weekly/monthly`) с
+  `next_run`; [✅] `task:advance:<id>` сдвигает период, [🗑] `remove_schedule` убирает.
+- [➕ Добавить] `task:add` — текст-перехват `pending_task_add`, парсинг due:
+  `«текст @ завтра»`, `«@ 2026-09-01»`, `«@ 3д»`.
+- [➕ В расписание] `task:schedule_add` — перехват `pending_schedule_add`:
+  `«текст | ежедневно / еженедельно / ежемесячно»`.
+
+Тесты: `tests/test_secretary_tasks.py` (модель, миграция, due-парсинг,
+schedule-перехват, UI routing).
+

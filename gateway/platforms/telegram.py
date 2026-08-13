@@ -6226,6 +6226,10 @@ class TelegramAdapter(BasePlatformAdapter):
         if text and await self._handle_pending_task_add(msg, text):
             return
 
+        # ── Pending schedule add intercept ──
+        if text and await self._handle_pending_schedule_add(msg, text):
+            return
+
         # ── NL menu triggers — handle locally, no LLM ──
         if text and _is_menu_trigger(text):
             await self._handle_menu_command(msg)
@@ -10205,32 +10209,43 @@ class TelegramAdapter(BasePlatformAdapter):
     # ═══════════════════════════════════════════════════════════
 
     async def _handle_tasks_show(self, chat_id: int, user_id: str) -> None:
-        """Show task list with add/done buttons."""
+        """Show task list (now) with add/done buttons + schedule link."""
         try:
-            from tools.secretary.tasks import list_tasks
+            from tools.secretary.tasks import list_tasks, list_schedule
             tasks = list_tasks(user_id, limit=10)
+            schedule = list_schedule(user_id, limit=20)
         except Exception:
             tasks = []
+            schedule = []
 
-        if not tasks:
-            text = "\u2705 Нет открытых задач."
+        if not tasks and not schedule:
+            text = "✅ Нет открытых задач."
         else:
-            lines = [f"\u0001f4cb Задачи ({len(tasks)}):", ""]
-            for t in tasks:
-                lines.append(f"  \u25cb {t['text']}")
-            text = "\n".join(lines)
+            lines = []
+            if tasks:
+                lines.append(f"📋 Сейчас ({len(tasks)}):")
+                for t in tasks:
+                    due = f" · до {t['due_at']}" if t.get("due_at") else ""
+                    lines.append(f"  ○ {t['text']}{due}")
+                lines.append("")
+            if schedule:
+                lines.append(f"📅 В расписании: {len(schedule)}")
+            text = "\n".join(lines).rstrip() or "✅ Нет открытых задач."
 
         keyboard = [
-            [InlineKeyboardButton("\u2795 Добавить", callback_data="task:add")],
+            [InlineKeyboardButton("➕ Добавить", callback_data="task:add")],
         ]
         if tasks:
             for t in tasks[:5]:
                 txt = t["text"][:30]
                 keyboard.append([
-                    InlineKeyboardButton(f"\u2705 {txt}", callback_data=f"task:done:{t['id']}"),
+                    InlineKeyboardButton(f"✅ {txt}", callback_data=f"task:done:{t['id']}"),
                 ])
         keyboard.append([
-            InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+            InlineKeyboardButton("📅 Расписание", callback_data="task:schedule"),
+        ])
+        keyboard.append([
+            InlineKeyboardButton("⬅️ Меню", callback_data="menu:home"),
         ])
 
         try:
@@ -10241,6 +10256,48 @@ class TelegramAdapter(BasePlatformAdapter):
             )
         except Exception as e:
             logger.warning("Tasks show failed: %s", e)
+
+    async def _render_schedule(self, chat_id: int, user_id: str) -> None:
+        """Show the recurring-task schedule."""
+        try:
+            from tools.secretary.tasks import list_schedule
+            schedule = list_schedule(user_id, limit=20)
+        except Exception:
+            schedule = []
+
+        if not schedule:
+            text = "📅 Расписание пусто.\n\nДобавьте регулярную задачу: «текст | ежедневно / еженедельно / ежемесячно»."
+        else:
+            lines = [f"📅 Расписание ({len(schedule)}):", ""]
+            for t in schedule:
+                rec = t.get("recurrence", "")
+                nr = (t.get("next_run") or "")[:10]
+                lines.append(f"  🔁 {t['text']} — {rec}" + (f" (след. {nr})" if nr else ""))
+            lines.append("")
+            lines.append("«✅» — сдвинуть на следующий период, «🗑» — убрать.")
+            text = "\n".join(lines)
+
+        keyboard = [[
+            InlineKeyboardButton("➕ Добавить", callback_data="task:schedule_add"),
+        ]]
+        for t in schedule[:10]:
+            txt = t["text"][:24]
+            keyboard.append([
+                InlineKeyboardButton(f"✅ {txt}", callback_data=f"task:advance:{t['id']}"),
+                InlineKeyboardButton(f"🗑 {txt}", callback_data=f"task:remove_schedule:{t['id']}"),
+            ])
+        keyboard.append([
+            InlineKeyboardButton("⬅️ Назад", callback_data="menu:tasks"),
+        ])
+
+        try:
+            await self._bot.send_message(
+                chat_id=chat_id, text=text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                **self._link_preview_kwargs(),
+            )
+        except Exception as e:
+            logger.warning("Schedule show failed: %s", e)
 
     async def _handle_task_callback(
         self, query, data: str, chat_id, thread_id, user_name
@@ -10262,7 +10319,7 @@ class TelegramAdapter(BasePlatformAdapter):
         action = parts[1] if len(parts) >= 2 else ""
 
         if action == "add":
-            await query.answer(text="\u270f\ufe0f Напишите задачу текстом")
+            await query.answer(text="✏️ Напишите задачу текстом")
             try:
                 from gateway.secretary_user_store import upsert_user, get_user
                 u = get_user(caller_id) or {}
@@ -10273,9 +10330,39 @@ class TelegramAdapter(BasePlatformAdapter):
                 pass
             try:
                 await query.edit_message_text(
-                    text="\u270f\ufe0f Напишите текст задачи.\nДля отмены — «отмена» или /menu.",
+                    text="✏️ Напишите текст задачи.\n\nМожно с дедлайном: «текст @ завтра» или «текст @ 2026-09-01».\nДля отмены — «отмена» или /menu.",
                     reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+                        InlineKeyboardButton("⬅️ Меню", callback_data="menu:home"),
+                    ]]),
+                )
+            except Exception:
+                pass
+            return
+
+        if action == "schedule":
+            await query.answer()
+            await self._render_schedule(cid, caller_id)
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+            return
+
+        if action == "schedule_add":
+            await query.answer(text="✏️ Напишите регулярную задачу")
+            try:
+                from gateway.secretary_user_store import upsert_user, get_user
+                u = get_user(caller_id) or {}
+                prefs = u.get("prefs", {}) or {}
+                prefs["pending_schedule_add"] = True
+                upsert_user(caller_id, prefs_json=prefs)
+            except Exception:
+                pass
+            try:
+                await query.edit_message_text(
+                    text="✏️ Напишите: «текст | ежедневно / еженедельно / ежемесячно».\nДля отмены — «отмена» или /menu.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("⬅️ Меню", callback_data="menu:home"),
                     ]]),
                 )
             except Exception:
@@ -10287,12 +10374,46 @@ class TelegramAdapter(BasePlatformAdapter):
                 tid = int(parts[2])
                 from tools.secretary.tasks import mark_done
                 if mark_done(caller_id, tid):
-                    await query.answer(text="\u2705 Готово")
+                    await query.answer(text="✅ Готово")
                 else:
-                    await query.answer(text="\u274c Не найдена")
+                    await query.answer(text="❌ Не найдена")
             except (ValueError, IndexError, Exception):
-                await query.answer(text="\u274c Ошибка")
+                await query.answer(text="❌ Ошибка")
             await self._handle_tasks_show(cid, caller_id)
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+            return
+
+        if action == "advance":
+            try:
+                tid = int(parts[2])
+                from tools.secretary.tasks import advance_schedule
+                if advance_schedule(caller_id, tid):
+                    await query.answer(text="✅ Сдвинуто")
+                else:
+                    await query.answer(text="❌ Не найдена")
+            except (ValueError, IndexError, Exception):
+                await query.answer(text="❌ Ошибка")
+            await self._render_schedule(cid, caller_id)
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+            return
+
+        if action == "remove_schedule":
+            try:
+                tid = int(parts[2])
+                from tools.secretary.tasks import remove_schedule
+                if remove_schedule(caller_id, tid):
+                    await query.answer(text="🗑 Убрано")
+                else:
+                    await query.answer(text="❌ Не найдена")
+            except (ValueError, IndexError, Exception):
+                await query.answer(text="❌ Ошибка")
+            await self._render_schedule(cid, caller_id)
             try:
                 await query.delete_message()
             except Exception:
@@ -10333,16 +10454,120 @@ class TelegramAdapter(BasePlatformAdapter):
         task_text = text.strip()
         if not task_text or task_text.startswith("/"):
             return False
+        title, due_at = self._parse_task_due(task_text)
         try:
             from tools.secretary.tasks import add_task
-            add_task(user_id, task_text)
+            add_task(user_id, title, due_at)
+            label = f"{title}" + (f" · до {due_at}" if due_at else "")
             await self._bot.send_message(
-                chat_id=int(msg.chat.id), text=f"\u2705 Добавлено: {task_text}",
+                chat_id=int(msg.chat.id), text=f"✅ Добавлено: {label}",
                 reply_to_message_id=msg.message_id, **self._link_preview_kwargs(),
             )
         except Exception as e:
             await self._bot.send_message(
-                chat_id=int(msg.chat.id), text=f"\u274c Ошибка: {e}",
+                chat_id=int(msg.chat.id), text=f"❌ Ошибка: {e}",
+                reply_to_message_id=msg.message_id, **self._link_preview_kwargs(),
+            )
+        return True
+
+    def _parse_task_due(self, text: str) -> tuple[str, str]:
+        """Split 'title @ when' into (title, due_at ISO date or '')."""
+        t = text.strip()
+        if " @ " in t:
+            title, _, when = t.rpartition(" @ ")
+            due = self._resolve_due(when.strip())
+            if due:
+                return title.strip(), due
+        return t, ""
+
+    def _resolve_due(self, when: str) -> str:
+        from datetime import datetime, timedelta, timezone
+
+        w = when.strip().lower()
+        today = datetime.now(timezone.utc).date()
+        if w in ("завтра", "tomorrow"):
+            return (today + timedelta(days=1)).isoformat()
+        if w in ("сегодня", "today"):
+            return today.isoformat()
+        # YYYY-MM-DD
+        if len(w) == 10 and w[4] == "-" and w[7] == "-":
+            try:
+                datetime.strptime(w, "%Y-%m-%d")
+                return w
+            except ValueError:
+                return ""
+        # Nд / Nдн / N дней
+        days = None
+        for suffix in ("дней", "дня", "дн", "д"):
+            if w.endswith(suffix) and w[: -len(suffix)].strip().isdigit():
+                days = int(w[: -len(suffix)].strip())
+                break
+        if days is not None and days > 0:
+            return (today + timedelta(days=days)).isoformat()
+        return ""
+
+    async def _handle_pending_schedule_add(self, msg, text: str) -> bool:
+        """Intercept text when pending_schedule_add flag is set."""
+        user_id = str(getattr(msg.from_user, "id", ""))
+        if not user_id:
+            return False
+        if text.strip().lower() in ("отмена", "cancel", "/menu"):
+            try:
+                from gateway.secretary_user_store import upsert_user, get_user
+                u = get_user(user_id) or {}
+                prefs = u.get("prefs", {}) or {}
+                prefs.pop("pending_schedule_add", None)
+                upsert_user(user_id, prefs_json=prefs)
+            except Exception:
+                pass
+            await self._bot.send_message(
+                chat_id=int(msg.chat.id), text="❌ Отменено.",
+                reply_to_message_id=msg.message_id, **self._link_preview_kwargs(),
+            )
+            return True
+        try:
+            from gateway.secretary_user_store import get_user, upsert_user
+            u = get_user(user_id) or {}
+            prefs = u.get("prefs", {}) or {}
+            if not prefs.get("pending_schedule_add"):
+                return False
+            prefs.pop("pending_schedule_add", None)
+            upsert_user(user_id, prefs_json=prefs)
+        except Exception:
+            return False
+
+        rec_map = {
+            "ежедневно": "daily", "еженедельно": "weekly", "ежемесячно": "monthly",
+            "daily": "daily", "weekly": "weekly", "monthly": "monthly",
+            "день": "daily", "неделя": "weekly", "месяц": "monthly",
+        }
+        raw = text.strip()
+        if raw.startswith("/"):
+            return False
+        if " | " in raw:
+            title, _, rec = raw.rpartition(" | ")
+        elif "|" in raw:
+            title, _, rec = raw.rpartition("|")
+        else:
+            title, rec = raw, ""
+        rec = rec_map.get(rec.strip().lower(), "")
+        if not rec:
+            await self._bot.send_message(
+                chat_id=int(msg.chat.id),
+                text="❌ Укажите период: «текст | ежедневно / еженедельно / ежемесячно».",
+                reply_to_message_id=msg.message_id, **self._link_preview_kwargs(),
+            )
+            return True
+        try:
+            from tools.secretary.tasks import add_schedule_task
+            add_schedule_task(user_id, title.strip(), rec)
+            await self._bot.send_message(
+                chat_id=int(msg.chat.id), text=f"🔁 В расписание: {title.strip()} ({rec})",
+                reply_to_message_id=msg.message_id, **self._link_preview_kwargs(),
+            )
+        except Exception as e:
+            await self._bot.send_message(
+                chat_id=int(msg.chat.id), text=f"❌ Ошибка: {e}",
                 reply_to_message_id=msg.message_id, **self._link_preview_kwargs(),
             )
         return True
