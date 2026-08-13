@@ -215,3 +215,22 @@ UI:
 Тесты: `tests/test_secretary_skill_validate.py` (dispatch, binary checks, IMAP
 mock, result view, callback, кнопка [Проверить]).
 
+## Группы (L5)
+
+Экран `/меню → [👥 Группы] menu:groups`.
+
+- `_groups_view` — если умение `groups` не `ready`, предлагает [⚙️ Включить].
+- Список чатов = известные боту группы (`channel_directory`) ∪ архивный
+  allowlist. Статус «следит / не следит» по `archive_admin list_chats`.
+- `groups:watch:<chat_id>` → `archive_admin add_chat` (при all→allowlist —
+  confirm `groups:watch_yes`). `groups:unwatch:<chat_id>` → `remove_chat`.
+- `groups:how` — инструкция «добавь бота в группу → нажми Следить».
+- `groups:report` → подменю [Сутки / 3 дня / Неделя] → `groups:report:<hours>`.
+- `_archive_summary(hours)` — сводка из `message_archive` DB: всего сообщений,
+  по типу, по чатам. Отправляется **в ЛС** (`int(caller_id)`), не в группу.
+
+Silence не ломается: отчёт — только по явной кнопке и в личку.
+
+Тесты: `tests/test_secretary_groups.py` (view, watch/unwatch, report,
+resolve name, callback routing).
+

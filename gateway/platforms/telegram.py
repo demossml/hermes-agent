@@ -4197,6 +4197,11 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._handle_skill_callback(query, data, query_chat_id, query_thread_id, query_user_name)
             return
 
+        # --- Groups screen callbacks (groups:watch / unwatch / how / report) ---
+        if data.startswith("groups:"):
+            await self._handle_groups_callback(query, data, query_chat_id, query_thread_id, query_user_name)
+            return
+
         # --- Main menu callbacks (menu:home | menu:mail | menu:tasks | menu:cal | menu:mode | menu:project | menu:secretary | menu:settings | menu:who | set:*) ---
         if data.startswith("menu:") or data.startswith("set:"):
             await self._handle_menu_callback(query, data, query_chat_id, query_thread_id, query_user_name)
@@ -8421,6 +8426,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 InlineKeyboardButton("\u2139\ufe0f Кто я", callback_data="menu:who"),
             ],
             [
+                InlineKeyboardButton("👥 Группы", callback_data="menu:groups"),
                 InlineKeyboardButton("📋 Что умеет", callback_data="menu:skills"),
             ],
         ]
@@ -8504,6 +8510,16 @@ class TelegramAdapter(BasePlatformAdapter):
         if data == "menu:skills":
             await query.answer()
             await self._render_skills(cid, caller_id)
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+            return
+
+        # ── menu:groups — groups screen ──
+        if data == "menu:groups":
+            await query.answer()
+            await self._render_groups(cid, caller_id)
             try:
                 await query.delete_message()
             except Exception:
@@ -9084,6 +9100,290 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("Failed to send setup step: %s", e)
         return True
+
+    # ═══════════════════════════════════════════════════════════
+    # Groups screen (menu:groups)
+    # ═══════════════════════════════════════════════════════════
+
+    def _resolve_chat_name(self, chat_id: str) -> str:
+        """Resolve a chat_id to a friendly name (falls back to the id)."""
+        try:
+            from gateway.channel_directory import load_directory
+            directory = load_directory()
+            for ch in directory.get("platforms", {}).get("telegram", []):
+                if str(ch.get("id")) == str(chat_id):
+                    name = ch.get("name")
+                    return str(name) if name else str(chat_id)
+        except Exception:
+            pass
+        return str(chat_id)
+
+    def _known_group_chats(self) -> list[str]:
+        """Return known telegram group chat ids (negative) from the directory."""
+        try:
+            from gateway.channel_directory import load_directory
+            directory = load_directory()
+            chats: list[str] = []
+            for ch in directory.get("platforms", {}).get("telegram", []):
+                cid = str(ch.get("id", ""))
+                if cid.startswith("-") and cid not in chats:
+                    chats.append(cid)
+            return chats
+        except Exception:
+            return []
+
+    def _archive_chat_state(self) -> tuple[str, list[str]]:
+        """Return (mode, chats) from archive config: mode is 'all' or 'allowlist'."""
+        import json
+
+        from tools.archive_admin import archive_admin_tool
+
+        try:
+            result = json.loads(archive_admin_tool("list_chats"))
+        except Exception:
+            return "all", []
+        mode = result.get("mode")
+        chats = result.get("chats")
+        if mode == "allowlist" and isinstance(chats, list):
+            return "allowlist", [str(c) for c in chats]
+        return "all", []
+
+    def _groups_view(self, user_id: str):
+        """Build the groups screen (text, InlineKeyboardMarkup)."""
+        from gateway.secretary_router import get_active_profile_path
+        from gateway.secretary_skills_registry import STATUS_READY
+        from gateway.secretary_skills_store import load_state
+
+        try:
+            profile_home = get_active_profile_path(user_id)
+            state = load_state(profile_home)
+            groups = state.get("groups", {"enabled": False, "status": "off"})
+            groups_ready = bool(groups.get("enabled")) and groups.get("status") == STATUS_READY
+        except Exception:
+            groups_ready = False
+
+        if not groups_ready:
+            return (
+                "👥 Группы не включены.\n\nВключите умение «Группы», чтобы следить за чатами.",
+                InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⚙️ Включить", callback_data="skill:on:groups"),
+                    InlineKeyboardButton("⬅️ Меню", callback_data="menu:home"),
+                ]]),
+            )
+
+        mode, watched = self._archive_chat_state()
+        known = self._known_group_chats()
+        all_chats = sorted(set(known) | set(watched))
+
+        lines = ["👥 Группы", ""]
+        if mode == "all":
+            lines.append("Сейчас архивируются все чаты.")
+        else:
+            lines.append(f"Отслеживается: {len(watched)}")
+        lines.append("")
+
+        keyboard = []
+        for cid in all_chats:
+            name = self._resolve_chat_name(cid)
+            if mode == "all":
+                watching = True
+            else:
+                watching = cid in watched
+            status = "следит" if watching else "не следит"
+            action = ("Не следить", f"groups:unwatch:{cid}") if watching else ("Следить", f"groups:watch:{cid}")
+            keyboard.append([
+                InlineKeyboardButton(f"{name} ({status})", callback_data="mx:noop"),
+                InlineKeyboardButton(action[0], callback_data=action[1]),
+            ])
+
+        if not all_chats:
+            lines.append("Пока нет известных групп — добавьте бота в группу.")
+
+        keyboard.append([
+            InlineKeyboardButton("➕ Как добавить", callback_data="groups:how"),
+            InlineKeyboardButton("📊 Что было", callback_data="groups:report"),
+        ])
+        keyboard.append([InlineKeyboardButton("⬅️ Меню", callback_data="menu:home")])
+        return "\n".join(lines), InlineKeyboardMarkup(keyboard)
+
+    async def _render_groups(self, chat_id: int, user_id: str) -> None:
+        text, reply_markup = self._groups_view(user_id)
+        try:
+            await self._bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=reply_markup,
+                **self._link_preview_kwargs(),
+            )
+        except Exception as e:
+            logger.warning("Failed to render groups: %s", e)
+
+    async def _handle_groups_callback(self, query, data: str, chat_id, thread_id, user_name) -> None:
+        """Handle groups:watch / unwatch / how / report / report:<hours>."""
+        import json
+
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=chat_id,
+            chat_type=str(getattr(getattr(query.message, "chat", None), "type", "")),
+            thread_id=str(thread_id) if thread_id is not None else None,
+            user_name=user_name,
+        ):
+            await query.answer(text="⛔ Not authorized.")
+            return
+
+        parts = data.split(":")
+        action = parts[1] if len(parts) >= 2 else ""
+
+        if action == "how":
+            text = (
+                "➕ Как добавить группу:\n\n"
+                "1. Добавьте бота в группу (как участника).\n"
+                "2. Бот начнёт видеть сообщения группы.\n"
+                "3. Группа появится здесь — нажмите «Следить».\n"
+                "4. Для архивного поиска — перешлите сообщение боту в ЛС."
+            )
+            try:
+                await query.edit_message_text(
+                    text=text,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("⬅️ Назад", callback_data="menu:groups"),
+                    ]]),
+                )
+            except Exception as e:
+                logger.debug("Failed to edit groups how: %s", e)
+            await query.answer()
+            return
+
+        if action == "report" and len(parts) < 3:
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🕐 Сутки", callback_data="groups:report:24")],
+                [InlineKeyboardButton("📅 3 дня", callback_data="groups:report:72")],
+                [InlineKeyboardButton("🗓 Неделя", callback_data="groups:report:168")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="menu:groups")],
+            ])
+            try:
+                await query.edit_message_text(text="📊 Что было за период?", reply_markup=markup)
+            except Exception as e:
+                logger.debug("Failed to edit report submenu: %s", e)
+            await query.answer()
+            return
+
+        if action == "watch" or action == "unwatch":
+            target = parts[2] if len(parts) >= 3 else ""
+            if not target:
+                await query.answer(text="Неизвестный чат.")
+                return
+            from tools.archive_admin import archive_admin_tool
+            if action == "watch":
+                result = json.loads(archive_admin_tool("add_chat", target, confirmed=True))
+                status = result.get("status")
+                if status == "needs_confirmation":
+                    # all→allowlist transition; confirm explicitly
+                    markup = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅ Да, следить только за ним", callback_data=f"groups:watch_yes:{target}")],
+                        [InlineKeyboardButton("❌ Отмена", callback_data="menu:groups")],
+                    ])
+                    await query.edit_message_text(
+                        text=f"Сейчас архивируются все чаты. Перейти на слежение только за «{self._resolve_chat_name(target)}»?",
+                        reply_markup=markup,
+                    )
+                    await query.answer()
+                    return
+                await query.answer(text="✅ Теперь следит")
+            else:
+                json.loads(archive_admin_tool("remove_chat", target))
+                await query.answer(text="✅ Больше не следит")
+            text, reply_markup = self._groups_view(caller_id)
+            try:
+                await query.edit_message_text(text=text, reply_markup=reply_markup)
+            except Exception as e:
+                logger.debug("Failed to edit groups after watch/unwatch: %s", e)
+            return
+
+        if action == "watch_yes":
+            target = parts[2] if len(parts) >= 3 else ""
+            from tools.archive_admin import archive_admin_tool
+            json.loads(archive_admin_tool("add_chat", target, confirmed=True))
+            await query.answer(text="✅ Теперь следит")
+            text, reply_markup = self._groups_view(caller_id)
+            try:
+                await query.edit_message_text(text=text, reply_markup=reply_markup)
+            except Exception as e:
+                logger.debug("Failed to edit groups after watch_yes: %s", e)
+            return
+
+        # groups:report:<hours> — generate the report.
+        if action == "report":
+            try:
+                hours = int(parts[2])
+            except (ValueError, IndexError):
+                await query.answer(text="Неверный период.")
+                return
+
+            await query.answer(text="Готовлю отчёт...")
+            summary = await asyncio.to_thread(self._archive_summary, hours)
+            # Send to the user's private chat (ЛС), not the group.
+            try:
+                await self._bot.send_message(
+                    chat_id=int(caller_id),
+                    text=summary,
+                    **self._link_preview_kwargs(),
+                )
+                try:
+                    await query.edit_message_text(
+                        text="📊 Отчёт отправлен в личные сообщения.",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("⬅️ Назад", callback_data="menu:groups"),
+                        ]]),
+                    )
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning("Failed to send report to DM: %s", e)
+                await query.edit_message_text(text=summary)
+            return
+
+        await query.answer(text="Неизвестное действие.")
+        return
+
+    def _archive_summary(self, hours: int) -> str:
+        """Build a short summary of archived messages in the last `hours`."""
+        from datetime import datetime, timedelta, timezone
+
+        from plugins.message_archive import get_archive_db
+
+        until = datetime.now(timezone.utc)
+        since = until - timedelta(hours=hours)
+        try:
+            db = get_archive_db()
+            rows = db.query(since=since.isoformat(), until=until.isoformat(), limit=500)
+        except Exception as e:
+            return f"⚠️ Не удалось прочитать архив: {e}"
+
+        if not rows:
+            return f"📊 За {hours} ч — ничего не найдено (0 сообщений)."
+
+        total = len(rows)
+        by_type: dict = {}
+        by_chat: dict = {}
+        for r in rows:
+            t = r.get("msg_type") or "other"
+            by_type[t] = by_type.get(t, 0) + 1
+            c = str(r.get("chat_id") or "?")
+            by_chat[c] = by_chat.get(c, 0) + 1
+
+        lines = [f"📊 Архив за {hours} ч — {total} сообщений", ""]
+        lines.append("По типу:")
+        for t, n in sorted(by_type.items(), key=lambda x: -x[1]):
+            lines.append(f"  • {t}: {n}")
+        if by_chat:
+            lines.append("")
+            lines.append("По чатам:")
+            for c, n in sorted(by_chat.items(), key=lambda x: -x[1])[:5]:
+                lines.append(f"  • {self._resolve_chat_name(c)}: {n}")
+        return "\n".join(lines)
 
     # ═══════════════════════════════════════════════════════════
     # Mail Inbox (menu:mail)
