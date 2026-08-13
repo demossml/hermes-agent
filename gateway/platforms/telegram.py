@@ -8724,10 +8724,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 glyph, status_word, action_label, action_cb = "⚠️", "ошибка", "Настроить", f"skill:setup:{skill.id}"
 
             label = f"{glyph} {skill.emoji} {skill.title} ({status_word})"
-            keyboard.append([
+            row = [
                 InlineKeyboardButton(label, callback_data="mx:noop"),
                 InlineKeyboardButton(action_label, callback_data=action_cb),
-            ])
+            ]
+            if enabled:
+                row.append(InlineKeyboardButton("Проверить", callback_data=f"skill:validate:{skill.id}"))
+            keyboard.append(row)
 
         keyboard.append([InlineKeyboardButton("⬅️ Меню", callback_data="menu:home")])
         return "\n".join(lines), InlineKeyboardMarkup(keyboard)
@@ -8790,9 +8793,9 @@ class TelegramAdapter(BasePlatformAdapter):
             await query.answer(text="Неизвестное умение.")
             return
 
-        # ── validate (L4 stub) ──
+        # ── validate ──
         if verb == "validate":
-            await query.answer(text=f"Проверка «{skill.title}» появится в L4.", show_alert=True)
+            await self._validate_skill_callback(query, caller_id, skill, profile_home)
             return
 
         # ── off ──
@@ -8971,6 +8974,58 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("Failed to edit skills screen: %s", e)
 
+    def _validate_result_view(self, skill, status: str, message: str) -> tuple:
+        from gateway.secretary_skills_registry import STATUS_NEEDS_SETUP, STATUS_READY
+
+        menu_btn = InlineKeyboardButton("⬅️ Меню", callback_data="menu:home")
+        if status == STATUS_READY:
+            text = f"✅ {skill.title}: готово"
+            if message:
+                text += f"\n{message}"
+            markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔍 Проверить снова", callback_data=f"skill:validate:{skill.id}"),
+                menu_btn,
+            ]])
+        elif status == STATUS_NEEDS_SETUP:
+            text = f"🟡 {skill.title}: нужна настройка"
+            if message:
+                text += f"\n{message}"
+            markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton("⚙️ Настроить", callback_data=f"skill:setup:{skill.id}"),
+                menu_btn,
+            ]])
+        else:
+            text = f"⚠️ {skill.title}: ошибка"
+            if message:
+                text += f"\n{message}"
+            markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔧 Повторить настройку", callback_data=f"skill:setup:{skill.id}"),
+                menu_btn,
+            ]])
+        return text, markup
+
+    async def _validate_skill_callback(self, query, caller_id: str, skill, profile_home) -> None:
+        """Run a skill's validation off the event loop and persist ready/error/needs_setup."""
+        import asyncio
+
+        from gateway.secretary_skill_validate import validate_skill
+        from gateway.secretary_skills_store import set_skill
+
+        await query.answer(text=f"Проверяю {skill.title}...")
+        try:
+            status, message = await asyncio.to_thread(validate_skill, skill.id, profile_home)
+        except Exception as e:
+            status, message = "error", str(e)
+
+        set_skill(profile_home, skill.id, True, status)
+        logger.info("Secretary validate: user=%s skill=%s -> %s", caller_id, skill.id, status)
+
+        text, markup = self._validate_result_view(skill, status, message)
+        try:
+            await query.edit_message_text(text=text, reply_markup=markup)
+        except Exception as e:
+            logger.debug("Failed to edit validate result: %s", e)
+
     async def _handle_skill_setup_text(self, msg, text: str) -> bool:
         """Intercept text input during a skill setup wizard (no LLM).
 
@@ -9035,36 +9090,41 @@ class TelegramAdapter(BasePlatformAdapter):
     # ═══════════════════════════════════════════════════════════
 
     async def _render_mail_menu(self, chat_id: int, user_id: str) -> None:
-        """Show mail submenu with list buttons."""
-        from tools.secretary.mail_inbox import is_configured
+        """Show mail submenu — list buttons only when the mail skill is ready."""
+        from gateway.secretary_router import get_active_profile_path
+        from gateway.secretary_skills_registry import STATUS_READY
+        from gateway.secretary_skills_store import load_state
 
-        configured = is_configured()
+        ready = False
+        try:
+            state = load_state(get_active_profile_path(user_id))
+            mail = state.get("mail", {})
+            ready = bool(mail.get("enabled")) and mail.get("status") == STATUS_READY
+        except Exception:
+            ready = False
 
-        if not configured:
+        if not ready:
             text = (
-                "\u0001f4e7 Почта не настроена.\n\n"
-                "Добавьте в .env:\n"
-                "  SECRETARY_MAIL_BACKEND=imap\n"
-                "  SECRETARY_MAIL_IMAP_HOST=...\n"
-                "  SECRETARY_MAIL_EMAIL=...\n"
-                "  SECRETARY_MAIL_PASSWORD=..."
+                "📧 Почта не настроена.\n\n"
+                "Включите и настройте умение «Почта» в «Что умеет»."
             )
             keyboard = [
-                [InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home")],
+                [InlineKeyboardButton("⚙️ Настроить", callback_data="skill:setup:mail")],
+                [InlineKeyboardButton("⬅️ Меню", callback_data="menu:home")],
             ]
         else:
-            text = "\u0001f4e7 Почта"
+            text = "📧 Почта"
             keyboard = [
                 [
-                    InlineKeyboardButton("\u0001f319 За ночь (12ч)", callback_data="mail:list:12"),
-                    InlineKeyboardButton("\u0001f4c6 За 48ч", callback_data="mail:list:48"),
+                    InlineKeyboardButton("🌙 За ночь (12ч)", callback_data="mail:list:12"),
+                    InlineKeyboardButton("📆 За 48ч", callback_data="mail:list:48"),
                 ],
                 [
-                    InlineKeyboardButton("\u0001f4ec Без ответа", callback_data="mail:followup"),
-                    InlineKeyboardButton("\u0001f504 Обновить", callback_data="mail:list:12"),
+                    InlineKeyboardButton("📬 Без ответа", callback_data="mail:followup"),
+                    InlineKeyboardButton("🔄 Обновить", callback_data="mail:list:12"),
                 ],
                 [
-                    InlineKeyboardButton("\u2b05\ufe0f Меню", callback_data="menu:home"),
+                    InlineKeyboardButton("⬅️ Меню", callback_data="menu:home"),
                 ],
             ]
 
@@ -9682,6 +9742,23 @@ class TelegramAdapter(BasePlatformAdapter):
             ob = False
         ob_icon = "\u2705 done" if ob else "\u274c нет"
         lines.append(f"\u0001f3d7\ufe0f Онбординг: {ob_icon}")
+
+        # Per-skill status (ready / needs_setup / off / error) for the active profile.
+        try:
+            from gateway.secretary_router import get_active_profile_path
+            from gateway.secretary_skills_registry import SKILLS, STATUS_NEEDS_SETUP, STATUS_READY
+            from gateway.secretary_skills_store import load_state
+            state = load_state(get_active_profile_path(user_id))
+            lines.append("")
+            lines.append("\u0001f4cb Умения:")
+            glyph_map = {STATUS_READY: "\u2705", STATUS_NEEDS_SETUP: "\u0001f7e1", "error": "\u26a0\ufe0f", "off": "\u2b1c"}
+            for skill in SKILLS:
+                entry = state.get(skill.id, {"enabled": False, "status": "off"})
+                status = entry["status"] if entry["enabled"] else "off"
+                glyph = glyph_map.get(status, "\u2b1c")
+                lines.append(f"  {glyph} {skill.title}: {status}")
+        except Exception as e:
+            logger.debug("Health skills section failed: %s", e)
 
         try:
             await self._bot.send_message(

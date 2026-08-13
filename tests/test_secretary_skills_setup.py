@@ -348,11 +348,15 @@ class TestSkillCallbackRouting:
         query.edit_message_text.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_validate_is_stub(self):
+    async def test_validate_runs_and_persists(self):
         adapter = _make_adapter()
         query = _make_query()
-        await adapter._handle_skill_callback(query, "skill:validate:mail", "456", None, "Test")
-        assert "L4" in query.answer.call_args.kwargs.get("text", "")
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("gateway.secretary_router.get_active_profile_path", return_value=Path(tmp)), \
+                 patch("gateway.secretary_skill_validate.validate_skill", return_value=("ready", "ok")) as vs:
+                await adapter._handle_skill_callback(query, "skill:validate:mail", "456", None, "Test")
+        vs.assert_called_once_with("mail", Path(tmp))
+        query.edit_message_text.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_cancel_routes(self):

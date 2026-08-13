@@ -183,7 +183,8 @@ class TestSkillView:
 
         by_label = {}
         for row in rows[:-1]:
-            (label_text, _label_cb), (action_text, action_cb) = row
+            label_text, _ = row[0]
+            action_text, action_cb = row[1]
             by_label[label_text] = (action_text, action_cb)
 
         # mail — needs_setup → [Настроить]

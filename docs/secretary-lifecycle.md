@@ -187,3 +187,31 @@ profile HERMES_HOME** (не в control db):
 Тесты: `tests/test_secretary_skills_setup.py` (манифесты, env write/read, шаги,
 choice/keep/replace, cancel, text intercept, routing).
 
+## Проверка умений (L4)
+
+`gateway/secretary_skill_validate.py` — `validate_skill(skill_id, profile_home)`
+→ `(status, message)`, статусы `ready | error | needs_setup`:
+
+| skill | проверка |
+|-------|----------|
+| groups / tasks | всегда `ready` |
+| mail | IMAP-логин (host/email/пароль из profile `.env`) |
+| calendar | fetch ICS URL (urllib, 10с) |
+| vision | `shutil.which("vision-cli")` |
+| tgcli | `which tg`; без сессии → `needs_setup` «выполните tg auth» |
+
+UI:
+- `skill:validate:<id>` — из дерева умений ([Проверить]) и из мастера
+  ([🔍 Проверить]).
+- `_validate_skill_callback` гоняет проверку через `asyncio.to_thread`
+  (не блокирует event loop) и пишет статус `set_skill(...)`.
+- Результат: ✅ готово / 🟡 нужна настройка / ⚠️ ошибка (+ текст);
+  после fail — [🔧 Повторить настройку] `skill:setup:<id>`.
+- Дерево умений: у включённых умений добавлена кнопка [Проверить].
+- `/secretary_health` — блок «Умения» с ready/needs_setup/off/error для
+  активного профиля.
+- `menu:mail` — список писем только при `mail == ready`, иначе [⚙️ Настроить].
+
+Тесты: `tests/test_secretary_skill_validate.py` (dispatch, binary checks, IMAP
+mock, result view, callback, кнопка [Проверить]).
+
