@@ -4192,6 +4192,11 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._handle_calendar_callback(query, data, query_chat_id, query_thread_id, query_user_name)
             return
 
+        # --- Secretary skill tree callbacks (skill:on:<id> | skill:off:<id> | skill:setup:<id>) ---
+        if data.startswith("skill:"):
+            await self._handle_skill_callback(query, data, query_chat_id, query_thread_id, query_user_name)
+            return
+
         # --- Main menu callbacks (menu:home | menu:mail | menu:tasks | menu:cal | menu:mode | menu:project | menu:secretary | menu:settings | menu:who | set:*) ---
         if data.startswith("menu:") or data.startswith("set:"):
             await self._handle_menu_callback(query, data, query_chat_id, query_thread_id, query_user_name)
@@ -6287,6 +6292,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
+        await self._cache_replied_media(msg, event)
+        event = self._apply_telegram_group_observe_attribution(event)
+        await self.handle_message(event)
+
     async def _handle_rule_command_locally(
         self, msg, text: str,
     ) -> None:
@@ -8407,6 +8416,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 InlineKeyboardButton("\u2699\ufe0f Настройки", callback_data="menu:settings"),
                 InlineKeyboardButton("\u2139\ufe0f Кто я", callback_data="menu:who"),
             ],
+            [
+                InlineKeyboardButton("📋 Что умеет", callback_data="menu:skills"),
+            ],
         ]
 
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -8482,6 +8494,16 @@ class TelegramAdapter(BasePlatformAdapter):
         if data == "menu:who":
             await query.answer()
             await self._handle_who_locally(query.message)
+            return
+
+        # ── menu:skills — secretary skill tree ──
+        if data == "menu:skills":
+            await query.answer()
+            await self._render_skills(cid, caller_id)
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
             return
 
         # ── menu:mail — show mail submenu ──
@@ -8653,6 +8675,142 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         await query.answer(text="Unknown setting.")
+
+    # ═══════════════════════════════════════════════════════════
+    # Secretary skill tree (menu:skills)
+    # ═══════════════════════════════════════════════════════════
+
+    def _skill_view(self, user_id: str):
+        """Build the skills screen (text, InlineKeyboardMarkup) for a user.
+
+        Reads per-profile state from the active secretary profile's HERMES_HOME.
+        """
+        from gateway.secretary_router import get_active, get_active_profile_path
+        from gateway.secretary_skills_registry import (
+            SKILLS,
+            STATUS_ERROR,
+            STATUS_NEEDS_SETUP,
+            STATUS_READY,
+        )
+        from gateway.secretary_skills_store import load_state
+
+        active = get_active(user_id)
+        profile_home = get_active_profile_path(user_id)
+        state = load_state(profile_home)
+
+        lines = [
+            "📋 Что умеет секретарь",
+            f"Профиль: {active}",
+            "",
+            "⬜ выкл · ✅ готов · 🟡 настроить · ⚠️ ошибка",
+        ]
+        keyboard = []
+        for skill in SKILLS:
+            entry = state.get(skill.id, {"enabled": False, "status": "off"})
+            enabled = entry["enabled"]
+            status = entry["status"]
+
+            if not enabled:
+                glyph, status_word, action_label, action_cb = "⬜", "выкл", "Вкл", f"skill:on:{skill.id}"
+            elif status == STATUS_READY:
+                glyph, status_word, action_label, action_cb = "✅", "готов", "Выкл", f"skill:off:{skill.id}"
+            elif status == STATUS_NEEDS_SETUP:
+                glyph, status_word, action_label, action_cb = "🟡", "настроить", "Настроить", f"skill:setup:{skill.id}"
+            else:  # STATUS_ERROR or unknown
+                glyph, status_word, action_label, action_cb = "⚠️", "ошибка", "Настроить", f"skill:setup:{skill.id}"
+
+            label = f"{glyph} {skill.emoji} {skill.title} ({status_word})"
+            keyboard.append([
+                InlineKeyboardButton(label, callback_data="mx:noop"),
+                InlineKeyboardButton(action_label, callback_data=action_cb),
+            ])
+
+        keyboard.append([InlineKeyboardButton("⬅️ Меню", callback_data="menu:home")])
+        return "\n".join(lines), InlineKeyboardMarkup(keyboard)
+
+    async def _render_skills(self, chat_id: int, user_id: str) -> None:
+        """Send the skills screen as a new message."""
+        text, reply_markup = self._skill_view(user_id)
+        try:
+            await self._bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=reply_markup,
+                **self._link_preview_kwargs(),
+            )
+        except Exception as e:
+            logger.warning("Failed to render skills: %s", e)
+
+    async def _handle_skill_callback(
+        self, query, data: str, chat_id, thread_id, user_name
+    ) -> None:
+        """Handle skill:on:<id> | skill:off:<id> | skill:setup:<id>."""
+        parts = data.split(":")
+        verb = parts[1] if len(parts) >= 2 else ""
+        skill_id = parts[2] if len(parts) >= 3 else ""
+
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=chat_id,
+            chat_type=str(getattr(getattr(query.message, "chat", None), "type", "")),
+            thread_id=str(thread_id) if thread_id is not None else None,
+            user_name=user_name,
+        ):
+            await query.answer(text="⛔ Not authorized.")
+            return
+
+        from gateway.secretary_router import get_active_profile_path
+        from gateway.secretary_skills_registry import (
+            STATUS_NEEDS_SETUP,
+            STATUS_READY,
+            apply_toggle,
+            get_skill,
+        )
+        from gateway.secretary_skills_store import set_skill
+
+        skill = get_skill(skill_id)
+        if skill is None:
+            await query.answer(text="Неизвестное умение.")
+            return
+
+        profile_home = get_active_profile_path(caller_id)
+
+        if verb == "setup":
+            # L2 stub — the per-skill setup wizard arrives in L3.
+            await query.answer(
+                text=f"Мастер настройки «{skill.title}» появится в L3.",
+                show_alert=True,
+            )
+            return
+
+        if verb in ("on", "off"):
+            entry = apply_toggle(skill_id, on=(verb == "on"))
+            if entry is None:
+                await query.answer(text="Неизвестное умение.")
+                return
+            set_skill(profile_home, skill_id, bool(entry["enabled"]), str(entry["status"]))
+
+            if verb == "on":
+                if entry["status"] == STATUS_NEEDS_SETUP:
+                    await query.answer(
+                        text=f"{skill.title}: включено, нужна настройка (L3).",
+                        show_alert=True,
+                    )
+                else:
+                    await query.answer(text=f"{skill.title}: включено ✅")
+            else:
+                await query.answer(text=f"{skill.title}: выключено")
+        else:
+            await query.answer(text="Неизвестное действие.")
+            return
+
+        # Re-render the skills screen in place.
+        text, reply_markup = self._skill_view(caller_id)
+        try:
+            await query.edit_message_text(text=text, reply_markup=reply_markup)
+        except Exception as e:
+            logger.debug("Failed to edit skills screen: %s", e)
 
     # ═══════════════════════════════════════════════════════════
     # Mail Inbox (menu:mail)

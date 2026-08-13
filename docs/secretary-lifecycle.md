@@ -89,3 +89,57 @@
 `unset_active_for_profile`, построение пикера, routing create/delete/del/
 confirm_del/cancel, блок удаления active, перехват slug (success/duplicate/
 bad slug), cancel сбрасывает флаг, group-guard для create.
+
+## Дерево умений (L2)
+
+Экран «Что умеет» для активного секретаря: `/меню → [📋 Что умеет] menu:skills`.
+
+### Реестр
+
+`gateway/secretary_skills_registry.py` — фиксированный каталог:
+
+| id | title | emoji | default_enabled | requires_setup |
+|----|-------|-------|-----------------|----------------|
+| mail | Почта | 📧 | ✅ | ✅ |
+| calendar | Календарь | 📅 | — | ✅ |
+| groups | Группы | 📁 | ✅ | — |
+| tasks | Задачи | 📝 | ✅ | — |
+| vision | Зрение | 👁 | — | ✅ |
+| tgcli | Telegram CLI | ✈️ | — | ✅ |
+
+Поля `SecretarySkill`: `id`, `title`, `emoji`, `default_enabled`, `requires_setup`.
+
+### Статусы
+
+`off | needs_setup | ready | error` (константы в registry).
+
+`apply_toggle(id, on)`:
+- `on` + `requires_setup` → `needs_setup`
+- `on` без `requires_setup` → `ready`
+- `off` → `off`
+
+### Storage
+
+`gateway/secretary_skills_store.py` — JSON `secretary_skills.json` **в активном
+profile HERMES_HOME** (не в control db):
+
+- `load_state(profile_home)` — слияние с defaults (новые умения появляются,
+  неизвестные id отбрасываются, битый файл → defaults).
+- `set_skill(profile_home, id, enabled, status)` — атомарная запись.
+- Путь резолвится через `secretary_router.get_active_profile_path(uid)`.
+
+### UI / callbacks
+
+- `menu:skills` → `_render_skills` (отправляет экран).
+- `skill:on:<id>` / `skill:off:<id>` — toggle + `query.answer` + перерисовка.
+- `skill:setup:<id>` — заглушка «мастер появится в L3» (не меняет state).
+- Строка умения: `[<глиф> <emoji> <title> (<status>)] [Вкл/Выкл/Настроить]`.
+- Глифы: ⬜ выкл · ✅ готов · 🟡 настроить · ⚠️ ошибка.
+
+### Persistence / изоляция
+
+Стейт лежит в каталоге профиля — переключение секретаря (`sec:<profile>`)
+даёт другой набор флагов; переживает рестарт гейтвея.
+
+Тесты: `tests/test_secretary_skills.py` (registry, store, экран, callbacks).
+
