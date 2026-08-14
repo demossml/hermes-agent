@@ -23,7 +23,12 @@ END:VCALENDAR"""
 class TestCalendarParser:
     def test_parse_basic(self):
         from tools.secretary.calendar import _parse_ics
-        events = _parse_ics(SAMPLE_ICS, days_ahead=7)
+        import tools.secretary.calendar as cal
+        # Freeze "now" to match the SAMPLE_ICS dates so the events fall inside
+        # the [now, now+days_ahead] window regardless of when the suite runs.
+        fixed_now = datetime(2026, 8, 10, 0, 0, tzinfo=timezone.utc)
+        with patch.object(cal, "_now_utc", return_value=fixed_now):
+            events = _parse_ics(SAMPLE_ICS, days_ahead=7)
         assert len(events) >= 1
         titles = {e["title"] for e in events}
         assert "Test Meeting" in titles or "All-hands" in titles

@@ -64,22 +64,24 @@ class TestFormatMailList:
 class TestDateDisplay:
     """_format_date_display tests."""
 
-    def test_today(self):
+    def _format(self, dt):
+        import tools.secretary.mail_inbox as mi
         from tools.secretary.mail_inbox import _format_date_display
-        dt = _now()
-        result = _format_date_display(dt)
+        # Freeze "now" to the fixed test date so Сегодня/Вчера are deterministic
+        # regardless of when the suite runs.
+        with patch.object(mi, "_now_utc", return_value=_now()):
+            return _format_date_display(dt)
+
+    def test_today(self):
+        result = self._format(_now())
         assert "Сегодня" in result
 
     def test_yesterday(self):
-        from tools.secretary.mail_inbox import _format_date_display
-        dt = _now() - timedelta(days=1)
-        result = _format_date_display(dt)
+        result = self._format(_now() - timedelta(days=1))
         assert "Вчера" in result
 
     def test_older(self):
-        from tools.secretary.mail_inbox import _format_date_display
-        dt = _now() - timedelta(days=5)
-        result = _format_date_display(dt)
+        result = self._format(_now() - timedelta(days=5))
         assert "авг" in result  # August in Russian
 
 
