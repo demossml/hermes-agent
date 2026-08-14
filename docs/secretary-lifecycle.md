@@ -261,3 +261,25 @@ API: `add_task(telegram_id, text, due_at)`, `add_schedule_task(..., recurrence)`
 Тесты: `tests/test_secretary_tasks.py` (модель, миграция, due-парсинг,
 schedule-перехват, UI routing).
 
+## Привязка optional-умений к рантайму (L7)
+
+`gateway/secretary_skill_policy.py` — связывает ready-умения с тулсетами:
+
+| ready-умение | тулсет | эффект |
+|--------------|--------|--------|
+| vision | `vision` | `vision_analyze` доступен секретарю |
+| tgcli | `terminal` | можно запускать `tg` (Telegram CLI) на хосте |
+
+Хуки:
+- `gateway/run.py` — после mode-filter добавляет `vision`/`terminal` тулсеты
+  для secretary-пользователя с ready-умением; после individual-filter
+  разблокирует `terminal` (обычно заблокирован в secretary) при `tgcli` ready.
+- `agent/system_prompt.py` — инъекция строки «Активные умения…» в
+  secretary-промпт, чтобы модель знала про vision/tgcli.
+
+Безопасность: `terminal` в secretary остаётся заблокированным по умолчанию;
+он выдаётся только при явно включённом и провалидированном `tgcli`.
+
+Тесты: `tests/test_secretary_skill_policy.py` (ready-ids, маппинг тулсетов,
+guidance-строка).
+

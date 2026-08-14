@@ -13799,6 +13799,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception:
                 pass
+        # ── L7: grant extra toolsets from ready optional secretary skills ──
+        if _active_mode == "secretary" and _uid_val:
+            try:
+                from gateway.secretary_skill_policy import extra_toolsets_for as _extra_ts
+                _extra = _extra_ts(_uid_val)
+                if _extra:
+                    enabled_toolsets = sorted(set(enabled_toolsets) | set(_extra))
+                    logger.info("Secretary skills: +toolsets %s", sorted(_extra))
+            except Exception:
+                pass
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
@@ -14830,6 +14840,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Mode filter [%s]: blocked individual tools: %s",
                             _active_mode, sorted(_removed),
                         )
+                except Exception:
+                    pass
+            # ── L7: unblock terminal for secretary users with tgcli ready ──
+            if _active_mode == "secretary" and _uid_val:
+                try:
+                    from gateway.secretary_skill_policy import extra_toolsets_for as _extra_ts
+                    if "terminal" in _extra_ts(_uid_val):
+                        agent.valid_tool_names = set(agent.valid_tool_names) | {"terminal"}
                 except Exception:
                     pass
 

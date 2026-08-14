@@ -319,6 +319,17 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         except Exception:
             pass
 
+    # ── Secretary skill binding (L7) ─────────────────────────────
+    # Surface ready optional skills (vision/tgcli) in the secretary prompt.
+    if _agent_mode == "secretary":
+        try:
+            from gateway.secretary_skill_policy import skill_guidance_line
+            _skill_line = skill_guidance_line(getattr(agent, "user_id", None))
+            if _skill_line:
+                stable_parts.append(_skill_line)
+        except Exception:
+            pass
+
     # Local Python toolchain probe — names python/pip/uv/PEP-668 state when
     # something is non-default so the model can pick the right install
     # strategy without discovering by failure.  Emits a single line; emits
