@@ -10164,16 +10164,18 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _handle_help_command(self, msg) -> None:
         text = (
-            "\u0001f4cb Hermes Secretary\n\n"
-            "\u0001f4e7 Почта — чтение, ответы, дайджест\n"
-            "\u0001f4c5 Календарь — события на сегодня/неделю\n"
-            "\u0001f500 Режимы — разработка / секретарь\n"
-            "\u0001f4c1 Проекты — переключение контекста\n"
-            "\u0001f464 Профили — изоляция предприятий\n\n"
-            "/меню /who /secretary_health /help"
+            "📋 Hermes Secretary\n\n"
+            "Всё — в главном меню:\n"
+            "• 📧 Почта — письма и дайджест\n"
+            "• 📅 Календарь — события\n"
+            "• ✅ Задачи — список + расписание\n"
+            "• 👥 Группы — следить за чатами, отчёты\n"
+            "• 📋 Что умеет — включить умения (зрение, tgcli)\n"
+            "• 🔀 Режим · 📁 Проект · 👤 Секретарь\n\n"
+            "/меню — меню · /who — статус · /secretary_health — проверка"
         )
         keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("\u0001f4cb Меню", callback_data="menu:home"),
+            InlineKeyboardButton("📋 Меню", callback_data="menu:home"),
         ]])
         try:
             await self._bot.send_message(
